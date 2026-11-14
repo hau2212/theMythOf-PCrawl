@@ -2685,6 +2685,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         ui_panel = None
         try:
+            callbacks.printOutput("[theMythOfCrawl] Starting UI initialization...")
             self._build_ui()
             ui_panel = self.main_panel
         except Throwable as t:
