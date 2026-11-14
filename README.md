@@ -112,11 +112,21 @@ When you click a button or perform a workflow step in the web application, multi
 5. Right-clicking messages in Proxy/Target/Repeater also offers **`Clone to NEW Feature (Tạo Tên chức năng mới...)`** so you can group manually selected APIs into a new named feature on the spot.
 6. Enable **Dedup riêng theo từng Chức năng** in **Capture Filters & Options** if you want the same endpoint to be captured again whenever you switch to a new Feature (`Tên 2`, `Tên 3`, …).
 
-### 2.5 Master-Detail view (tab **API Groups**) & Audit History (tab **History & Features**)
+### 2.5 Master-Detail view (tab **API Groups**), Color Highlighting & Audit History (tab **History & Features**)
 
-- **Top-left table (Features / Chức năng):** Lists `[Tất cả: M chức năng]` plus each `Tên 1`, `Tên 2`, …, showing how many APIs belong to each feature and its API range (`API 1, API 2`, `API 3 .. API 6`). Click any feature row to filter the API table on the right, double-click the name cell to rename it inline, or use **Gửi Chức năng -> Repeater** / **Replay Chức năng** to dispatch all APIs of that feature at once.
-- **Top-right table (API Groups):** Sequential `API #` (`API 1`, `API 2`, …), `Group` (`G01`, `G02`, …), `Chức năng (Feature)` (`Tên 1: ...`), source (Proxy/Manual), time, method, host, path, original status and length, **Role Count**, and replay progress.
-- **Middle table (roles of the selected group):** role, state, status (color-coded), body length, Δ vs original, time, sends, and the Repeater tab name or error.
+Every row in the **Features**, **API Groups**, and **Role Results** tables is automatically color-highlighted based on the role replay outcomes:
+
+| Color / Level | Meaning |
+|---|---|
+| **Yellow `INFO` (`Vàng INFO: Có Role lỗi / Lệch quyền`)** | Highlighted in soft yellow whenever **any role call in the API fails** (`401 Unauthorized`, `403 Forbidden`, `4xx`, `5xx`, or connection timeout) or when roles return different response body lengths (`2xx lệch Body`). Shows exact counts such as `INFO: 1 OK / 9 Lỗi (403,401)` on the API row and `INFO: Không đủ quyền (403)` / `INFO: Chưa xác thực (401)` on each failing role row. |
+| **Orange `WARN` (`Cam WARN: Nghi vấn Bypass`)** | Highlighted in soft orange on a role row when an unauthenticated / stripped-auth profile (`Guest` or `[REMOVE]` on `Authorization`/`Cookie`) unexpectedly returns `2xx OK` while another role in the same API was denied (`401`/`403`). |
+| **Green `OK` (`Xanh OK: Cả N Role 2xx`)** | Highlighted in soft green when all replayed roles succeeded with `2xx` and consistent body length. |
+| **Red `ERR` (`Đỏ ERR: Lỗi 5xx / Mạng`)** | Status cell / filter for server `5xx` errors or connection failures. |
+| **Blue `REDIRECT` (`3xx`)** | Highlighted in soft blue for `3xx` redirect responses. |
+
+- **Top-left table (Features / Chức năng):** Lists `[Tất cả: M chức năng]` plus each `Tên 1`, `Tên 2`, …, showing how many APIs belong to each feature, its role audit status (`INFO: X/Y API có Role lỗi/lệch`), and its API range (`API 1, API 2`, `API 3 .. API 6`).
+- **Top-right table (API Groups):** Sequential `API #` (`API 1`, `API 2`, …), `Group` (`G01`, `G02`, …), `Chức năng`, `Đánh giá / Màu (Info)`, method, host, path, original status and length, **Roles**, replay progress, source, and time. Includes a **`Lọc màu Audit`** dropdown on the toolbar to filter APIs by `Vàng INFO`, `Cam WARN`, `Đỏ ERROR`, `Xanh OK`, or `Chưa Replay`.
+- **Middle table (roles of the selected group):** `#`, `Role`, `Đánh giá Role (Màu)`, state, status, body length, Δ vs original, time, sends, and the Repeater tab name or error.
 - **Bottom:** read-only Burp request/response viewers for the selected role.
 - **Tab `History & Features (Lịch sử Chức năng & API)`:**
   - **Left:** Interactive `JTree` hierarchy (`Root → Tên 1 (API 1, API 2) → Roles`, `Tên 2 (API 3, API 4) → Roles`) with one-click Repeater dispatch, replay, or jump-to-group.

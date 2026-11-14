@@ -611,6 +611,60 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(self.cb.repeater), 20)
         self.assertEqual(self.cb.repeater[10][4], "[F02-G02:POST /v1/transfer] 01_Admin")
 
+    def test_unicode_mojibake_healing(self):
+        # Simulate UTF-8 bytes decoded as Latin-1 (as happened in Jython when str was passed to Java String)
+        garbled = "Chức năng 1".encode("utf-8").decode("latin-1")
+        self.assertEqual(tm.u_text(garbled), "Chức năng 1")
+        self.assertEqual(tm.u_text("Đang bắt vào Tên 1:"), "Đang bắt vào Tên 1:")
+
+    def test_role_audit_color_highlighting(self):
+        captured = []
+        orig = self.ext._clone_for_roles
+
+        def spy(group, info, roles, cfg):
+            res = orig(group, info, roles, cfg)
+            captured.append(group)
+            return res
+        self.ext._clone_for_roles = spy
+
+        # Capture & auto-replay: Admin gets 200, User2..User9 get 403, Guest gets 401
+        self.capture(BASE_REQ)
+        g = captured[0]
+
+        # Because roles 2..10 failed (403/401) while Admin succeeded (200), group must be AUDIT_INFO (Yellow Info)
+        g_lvl, g_sum = tm.evaluate_group_audit(g)
+        self.assertEqual(g_lvl, tm.AUDIT_INFO)
+        self.assertIn("INFO: 1 OK / 9 Lỗi", g_sum)
+
+        # Check individual role assessments
+        r0_lvl, r0_badge = tm.evaluate_role_result(g, g.results[0])
+        self.assertEqual(r0_lvl, tm.AUDIT_OK)
+        self.assertIn("OK: Thành công (200)", r0_badge)
+
+        r1_lvl, r1_badge = tm.evaluate_role_result(g, g.results[1])
+        self.assertEqual(r1_lvl, tm.AUDIT_INFO)
+        self.assertIn("INFO: Không đủ quyền (403)", r1_badge)
+
+        r9_lvl, r9_badge = tm.evaluate_role_result(g, g.results[9])
+        self.assertEqual(r9_lvl, tm.AUDIT_INFO)
+        self.assertIn("INFO: Chưa xác thực (401)", r9_badge)
+
+        # If Guest unexpectedly gets 200 OK while User2..9 get 403 -> Guest row is flagged AUDIT_WARN
+        g.results[9].status = 200
+        g.results[9].length = g.orig_length
+        rw_lvl, rw_badge = tm.evaluate_role_result(g, g.results[9])
+        self.assertEqual(rw_lvl, tm.AUDIT_WARN)
+        self.assertIn("WARN: Guest trả về 200!", rw_badge)
+
+        # If all roles get 200 OK with the same length -> group is AUDIT_OK (Green)
+        for r in g.results:
+            r.status = 200
+            r.length = 21
+            r.state = tm.STATE_DONE
+        g_ok_lvl, g_ok_sum = tm.evaluate_group_audit(g)
+        self.assertEqual(g_ok_lvl, tm.AUDIT_OK)
+        self.assertIn("OK: Cả 10 Role 2xx", g_ok_sum)
+
 
 if __name__ == "__main__":
     unittest.main()

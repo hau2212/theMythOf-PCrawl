@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
+from __future__ import unicode_literals
 """
 theMythOfCrawl - Burp Suite extension (Jython 2.7, legacy Extender API)
 
 Multi-role API request cloning and grouped Repeater dispatching for
 authorization / access-control testing of applications you are permitted to test.
 
-  * N role profiles, each with header rules (REPLACE / ADD / REMOVE or value [REMOVE])
+  * N role profiles, each with header/cookie/JWT rules (REPLACE / ADD / REMOVE / COOKIE_SET / COOKIE_REMOVE)
   * Proxy capture with scope, static-extension, API-regex, method and dedup filters
   * Manual trigger via context menu (Proxy, Target, Repeater, Logger, ...)
   * 1-to-N cloning: one request per enabled role, method/URL/params/body preserved
   * Optional background replay recording status, length, time and full req/resp
   * Grouped Repeater tabs: "[G01:POST /v1/transfer] 01_Admin"
-  * Master/Detail grouped view with group and role actions
+  * Feature / Button Action Batching (Tên 1: API 1, API 2... | Tên 2: API 3, API 4...)
+  * Color-coded permission & error highlighting (Yellow INFO when any role call fails or differs)
 
 Threading model
   * Burp listener threads only copy bytes and enqueue work (never block).
@@ -34,7 +36,8 @@ from burp import IContextMenuFactory
 from burp import IExtensionStateListener
 from burp import IMessageEditorController
 
-from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font
+from java.awt import (BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, GridLayout,
+                      Insets, Dimension, Color, Font)
 from java.awt.event import MouseAdapter
 from java.lang import Runnable, Boolean, Integer, String, Throwable
 from java.util import ArrayList, Arrays
@@ -52,15 +55,50 @@ from javax.swing.filechooser import FileNameExtensionFilter
 
 try:
     basestring
+    _UNICODE_TYPE = unicode
+    _BYTES_TYPE = str
 except NameError:  # CPython 3 (offline unit tests only)
     basestring = str
+    _UNICODE_TYPE = str
+    _BYTES_TYPE = bytes
+
+
+def u_text(val):
+    """
+    Convert any value (Python 2 str/unicode, Python 3 str/bytes, or Java String)
+    into a clean Unicode string, automatically healing UTF-8-as-Latin-1 mojibake.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, _BYTES_TYPE):
+        try:
+            s = val.decode("utf-8")
+        except Exception:
+            s = val.decode("latin-1", "replace")
+    elif isinstance(val, _UNICODE_TYPE):
+        s = val
+    else:
+        try:
+            s = _UNICODE_TYPE(val)
+        except Exception:
+            s = "%s" % val
+    # Heal UTF-8 bytes that were previously decoded as Latin-1 (e.g. "Chá»©c nÄƒng")
+    if any(0x80 <= ord(ch) <= 0xFF for ch in s):
+        try:
+            healed = s.encode("latin-1").decode("utf-8")
+            if healed != s:
+                return healed
+        except Exception:
+            pass
+    return s
+
 
 # =============================================================================
 # Constants
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.1.0"
+EXT_VERSION = "1.2.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_CONFIG = "tmoc.config.v1"
 
@@ -71,6 +109,24 @@ MODE_REMOVE = "REMOVE"                # strip every occurrence of the header
 MODE_COOKIE_SET = "COOKIE_SET"        # set/replace a single cookie key=value inside Cookie header
 MODE_COOKIE_REMOVE = "COOKIE_REMOVE"  # remove a single cookie key from Cookie header
 HEADER_MODES = [MODE_REPLACE, MODE_ADD, MODE_REMOVE, MODE_COOKIE_SET, MODE_COOKIE_REMOVE]
+
+# Audit / Color Highlighting Levels
+AUDIT_NONE = "NONE"          # Not replayed yet
+AUDIT_OK = "OK"              # Green: All roles 2xx OK with consistent response
+AUDIT_INFO = "INFO"          # Yellow INFO: Role call failed (401/403/4xx/5xx/Error) or permission diff across roles
+AUDIT_WARN = "WARN"          # Orange WARN: Guest/unauthenticated role returned 2xx (suspected auth bypass)
+AUDIT_ERROR = "ERROR"        # Red ERROR: Server 5xx / connection timeout across roles
+AUDIT_REDIRECT = "REDIRECT"  # Blue: 3xx Redirect
+
+AUDIT_FILTER_ALL = "ALL"
+AUDIT_FILTER_OPTIONS = [
+    ("Tất cả API (All)", AUDIT_FILTER_ALL),
+    ("Vàng INFO: Có Role lỗi / Lệch quyền", AUDIT_INFO),
+    ("Cam WARN: Nghi vấn Bypass (Guest 2xx)", AUDIT_WARN),
+    ("Đỏ ERROR: Có lỗi 5xx / Mất kết nối", AUDIT_ERROR),
+    ("Xanh OK: Tất cả Role 2xx", AUDIT_OK),
+    ("Chưa Replay (Pending)", AUDIT_NONE),
+]
 
 DEFAULT_STATIC_EXT = ("js,mjs,css,map,png,jpg,jpeg,gif,bmp,ico,svg,webp,avif,tif,tiff,"
                       "woff,woff2,ttf,otf,eot,mp3,mp4,m4a,webm,wav,ogg,avi,mov,flv,swf")
@@ -375,14 +431,14 @@ def format_api_label(gid):
 
 
 def format_feature_label(fid, name):
-    clean = ("%s" % (name or "")).strip()
+    clean = u_text(name).strip()
     if not clean or clean == ("%d" % fid):
         return "Tên %d" % fid
     return "Tên %d: %s" % (fid, clean)
 
 
 def display_role_name(role_name, index, number_roles):
-    name = role_name or ("role%d" % (index + 1))
+    name = u_text(role_name) or ("role%d" % (index + 1))
     if number_roles and not _ROLE_NUM_PREFIX_RE.match(name):
         return "%02d_%s" % (index + 1, name)
     return name
@@ -393,7 +449,146 @@ def repeater_tab_name(gid, method, path, role_display, max_len=40, fid=None, inc
     if include_feature and fid is not None:
         grp_tag = "F%02d-%s" % (fid, grp_tag)
     return "[%s:%s %s] %s" % (grp_tag, (method or "").upper(),
-                              short_path(path, max_len), role_display)
+                              short_path(path, max_len), u_text(role_display))
+
+
+def is_stripped_auth_role(role_dict):
+    """
+    True if a role represents an unauthenticated / stripped-credentials profile
+    (e.g. Guest / Anon or removes Authorization/Cookie without setting any token).
+    """
+    if not isinstance(role_dict, dict):
+        return False
+    rname = u_text(role_dict.get("name", "")).lower()
+    if any(tag in rname for tag in ("guest", "anon", "unauth", "noauth", "public", "khach")):
+        return True
+    rules = role_dict.get("headers", []) or []
+    if not rules:
+        return False
+    auth_removed = False
+    auth_added = False
+    for r in rules:
+        hn = u_text(r.get("name", "")).lower()
+        mode = r.get("mode", MODE_REPLACE)
+        if hn in ("authorization", "cookie", "x-auth-token", "x-api-key") or mode in (MODE_COOKIE_SET, MODE_COOKIE_REMOVE):
+            if mode in (MODE_REMOVE, MODE_COOKIE_REMOVE):
+                auth_removed = True
+            else:
+                auth_added = True
+    return auth_removed and not auth_added
+
+
+def evaluate_role_result(group, res):
+    """
+    Classify a single role's replay result for color highlighting:
+      - AUDIT_INFO (Yellow Info): Role call failed (401/403/4xx/5xx/Connection error) or body length differs
+      - AUDIT_WARN (Orange Warn): Guest / stripped-auth role returned 2xx when other roles failed or matched Admin
+      - AUDIT_OK (Green OK)     : Role call succeeded (2xx) with normal body length
+      - AUDIT_REDIRECT (Blue)   : Role call returned 3xx redirect
+      - AUDIT_NONE              : Not replayed yet
+    Returns (audit_level, badge_text).
+    """
+    if res is None:
+        return AUDIT_NONE, "-"
+    if res.state == STATE_ERROR:
+        err_msg = u_text(res.error or "Timeout / Connection Error")
+        if len(err_msg) > 34:
+            err_msg = err_msg[:31] + "..."
+        return AUDIT_INFO, "INFO: Lỗi gọi API (%s)" % err_msg
+    if res.status is None:
+        return AUDIT_NONE, u_text(res.state)
+    code = int(res.status)
+    if code == 401:
+        return AUDIT_INFO, "INFO: Chưa xác thực (401)"
+    if code == 403:
+        return AUDIT_INFO, "INFO: Không đủ quyền (403)"
+    if 400 <= code < 500:
+        return AUDIT_INFO, "INFO: Role gọi lỗi (%d)" % code
+    if code >= 500:
+        return AUDIT_INFO, "INFO: Lỗi Server (%d)" % code
+    if 300 <= code < 400:
+        return AUDIT_REDIRECT, "INFO: Chuyển hướng (%d)" % code
+    if 200 <= code < 300:
+        # Check if Guest/stripped-auth role got 2xx while another role in the same group was denied (401/403)
+        results = getattr(group, "results", []) if group is not None else []
+        any_denied = any(r.status in (401, 403) for r in results if r is not res and r.status is not None)
+        if getattr(res, "is_stripped_auth", False) and any_denied:
+            return AUDIT_WARN, "WARN: Guest trả về %d!" % code
+        base_len = None
+        if results:
+            for r in results:
+                if r.status is not None and 200 <= r.status < 300 and r.length is not None:
+                    base_len = r.length
+                    break
+        if base_len is None and group is not None:
+            base_len = getattr(group, "orig_length", None)
+        if base_len is not None and res.length is not None and res.length != base_len:
+            delta = res.length - base_len
+            return AUDIT_INFO, "INFO: 2xx lệch Body (%+dB)" % delta
+        return AUDIT_OK, "OK: Thành công (%d)" % code
+    return AUDIT_INFO, "INFO: Status %d" % code
+
+
+def evaluate_group_audit(group):
+    """
+    Evaluate all role results of an API Group to determine its row highlight color and summary:
+      - If ANY role in the API failed (401/403/4xx/5xx/STATE_ERROR) or roles differ in status/length
+        -> returns (AUDIT_INFO, "INFO: ...") for Yellow Info highlighting.
+      - If a stripped-auth / Guest role got 2xx while another role got 401/403 -> also notes "[Guest 2xx!]".
+      - If all replayed roles succeeded with 2xx -> returns (AUDIT_OK, "OK: ...").
+      - If not replayed yet -> returns (AUDIT_NONE, "Chưa Replay").
+    """
+    if group is None or not getattr(group, "results", None):
+        return AUDIT_NONE, "Chưa có Role"
+    done = [r for r in group.results if r.status is not None or r.state == STATE_ERROR]
+    if not done:
+        return AUDIT_NONE, "Chưa Replay (%d role)" % len(group.results)
+    ok_list = [r for r in done if r.status is not None and 200 <= r.status < 300]
+    err_list = [r for r in done if r.state == STATE_ERROR or (r.status is not None and r.status >= 400)]
+    redir_list = [r for r in done if r.status is not None and 300 <= r.status < 400]
+
+    if err_list:
+        codes = []
+        for r in err_list:
+            c_label = "ERR" if r.state == STATE_ERROR else ("%d" % r.status)
+            if c_label not in codes:
+                codes.append(c_label)
+        codes_str = ",".join(codes[:4])
+        if ok_list:
+            return AUDIT_INFO, "INFO: %d OK / %d Lỗi (%s)" % (len(ok_list), len(err_list), codes_str)
+        return AUDIT_INFO, "INFO: Cả %d Role lỗi (%s)" % (len(err_list), codes_str)
+
+    if ok_list:
+        lengths = set([r.length for r in ok_list if r.length is not None])
+        if redir_list:
+            return AUDIT_INFO, "INFO: %d OK / %d Redirect (3xx)" % (len(ok_list), len(redir_list))
+        if len(lengths) > 1:
+            return AUDIT_INFO, "INFO: Cả %d Role 2xx (Lệch Body)" % len(ok_list)
+        return AUDIT_OK, "OK: Cả %d Role 2xx" % len(ok_list)
+
+    if redir_list:
+        return AUDIT_REDIRECT, "INFO: %d Role Redirect (3xx)" % len(redir_list)
+    return AUDIT_NONE, "Đang xử lý"
+
+
+def evaluate_feature_audit(feature_groups):
+    """Summarize the audit status across all API groups belonging to a Feature."""
+    f_groups = list(feature_groups or [])
+    if not f_groups:
+        return AUDIT_NONE, "-"
+    info_count = 0
+    ok_count = 0
+    for g in f_groups:
+        lvl, _ = evaluate_group_audit(g)
+        if lvl in (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR):
+            info_count += 1
+        elif lvl == AUDIT_OK:
+            ok_count += 1
+    if info_count > 0:
+        return AUDIT_INFO, "INFO: %d/%d API có Role lỗi/lệch" % (info_count, len(f_groups))
+    if ok_count > 0:
+        return AUDIT_OK, "OK: %d/%d API 2xx" % (ok_count, len(f_groups))
+    return AUDIT_NONE, "Chưa Replay"
 
 
 def compile_api_regex(pattern):
@@ -420,32 +615,33 @@ def normalize_role(obj, index=0):
     """Accept flexible JSON role shapes and return a canonical role dict."""
     if not isinstance(obj, dict):
         raise ValueError("Role #%d is not a JSON object" % (index + 1))
-    name = ("%s" % (obj.get("name") or "")).strip() or ("Role_%02d" % (index + 1))
+    name = u_text(obj.get("name") or "").strip() or ("Role_%02d" % (index + 1))
     enabled = _as_bool(obj.get("enabled", True), True)
     raw = obj.get("headers", [])
     if isinstance(raw, dict):
         raw = [{"name": k, "value": raw[k]} for k in raw]
     headers = []
     for h in raw or []:
-        if isinstance(h, basestring):
-            if ":" not in h:
+        if isinstance(h, (basestring, _BYTES_TYPE)):
+            h_str = u_text(h)
+            if ":" not in h_str:
                 continue
-            k, v = h.split(":", 1)
+            k, v = h_str.split(":", 1)
             h = {"name": k, "value": v}
         if not isinstance(h, dict):
             continue
-        hn = sanitize_header_name(h.get("name"))
+        hn = sanitize_header_name(u_text(h.get("name")))
         if not hn:
             continue
         hv = h.get("value")
-        hv = "" if hv is None else "%s" % hv
+        hv = "" if hv is None else u_text(hv)
         headers.append({"name": hn, "value": sanitize_header_value(hv),
                         "mode": normalize_mode(h.get("mode"), hv)})
     return {"name": name, "enabled": enabled, "headers": headers}
 
 
 def roles_from_json(text):
-    data = json.loads(text)
+    data = json.loads(u_text(text))
     if isinstance(data, dict):
         data = data.get("roles", [])
     if not isinstance(data, list):
@@ -488,8 +684,10 @@ def groups_to_matrix_json(groups, features=None):
     """Serialize captured Features, API groups and per-role status/length metrics to JSON."""
     items = []
     for g in groups or []:
+        g_lvl, g_sum = evaluate_group_audit(g)
         roles_out = []
         for r in g.results:
+            r_lvl, r_badge = evaluate_role_result(g, r)
             delta = (r.length - g.orig_length) if (r.length is not None and g.orig_length is not None) else None
             roles_out.append({
                 "role": r.role_name,
@@ -497,6 +695,8 @@ def groups_to_matrix_json(groups, features=None):
                 "status": r.status,
                 "length": r.length,
                 "delta_vs_orig": delta,
+                "audit_level": r_lvl,
+                "audit_note": r_badge,
                 "elapsed_ms": r.elapsed_ms,
                 "sends": r.sent_count,
                 "repeater_tab": r.tab_name,
@@ -509,6 +709,8 @@ def groups_to_matrix_json(groups, features=None):
             "feature_id": getattr(g, "fid", 1),
             "feature_name": getattr(g, "feature_name", ""),
             "feature_label": format_feature_label(getattr(g, "fid", 1), getattr(g, "feature_name", "")),
+            "audit_level": g_lvl,
+            "audit_summary": g_sum,
             "source": g.source,
             "created": g.created,
             "method": g.method,
@@ -526,12 +728,15 @@ def groups_to_matrix_json(groups, features=None):
     if features is not None:
         for f in features:
             f_groups = [g for g in (groups or []) if getattr(g, "fid", 1) == f.fid]
+            f_lvl, f_sum = evaluate_feature_audit(f_groups)
             feat_list.append({
                 "feature_id": f.fid,
                 "name": f.name,
                 "label": format_feature_label(f.fid, f.name),
                 "created": f.created,
                 "api_count": len(f_groups),
+                "audit_level": f_lvl,
+                "audit_summary": f_sum,
                 "apis": [format_api_label(g.gid) for g in f_groups],
             })
     return json.dumps({
@@ -569,30 +774,35 @@ def build_history_summary_text(features, groups):
         f_groups = by_fid.get(f.fid, [])
         api_range = ("%s .. %s" % (format_api_label(f_groups[0].gid), format_api_label(f_groups[-1].gid))
                      if f_groups else "chưa có API")
+        _, f_audit = evaluate_feature_audit(f_groups)
         lines.append("")
-        lines.append("■ %s  (Số lượng API: %d | %s | Lúc: %s)" %
-                     (format_feature_label(f.fid, f.name), len(f_groups), api_range, f.created))
+        lines.append("[*] %s  (Số lượng API: %d | %s | Đánh giá: %s | Lúc: %s)" %
+                     (format_feature_label(f.fid, f.name), len(f_groups), api_range, f_audit, f.created))
         lines.append("-" * 70)
         if not f_groups:
             lines.append("   (Chưa có API nào trong chức năng này)")
             continue
         for idx, g in enumerate(f_groups, 1):
+            _, g_audit = evaluate_group_audit(g)
             orig_info = "Orig Status=%s, Orig Len=%s" % (
                 g.orig_status if g.orig_status is not None else "-",
                 g.orig_length if g.orig_length is not None else "-")
-            lines.append("   %d. %s [%s]  %s %s://%s:%s%s  (%s | %d roles)" % (
+            lines.append("   %d. %s [%s]  %s %s://%s:%s%s  (%s | %d roles)  --> [%s]" % (
                 idx, format_api_label(g.gid), format_group_id(g.gid),
-                g.method, g.protocol, g.host, g.port, g.path, orig_info, len(g.results)))
-            replayed = [r for r in g.results if r.status is not None]
+                g.method, g.protocol, g.host, g.port, g.path, orig_info, len(g.results), g_audit))
+            replayed = [r for r in g.results if r.status is not None or r.state == STATE_ERROR]
             if replayed:
-                status_summary = ", ".join(["%s:%s(len=%s)" % (r.role_name, r.status, r.length) for r in replayed])
+                status_summary = ", ".join([
+                    "%s:%s(len=%s)" % (r.role_name, r.status if r.status is not None else "ERR", r.length)
+                    for r in replayed
+                ])
                 lines.append("      -> Kết quả Replay: %s" % status_summary)
     for fid in sorted(by_fid.keys()):
         if fid in seen_fids:
             continue
         f_groups = by_fid[fid]
         lines.append("")
-        lines.append("■ %s  (Số lượng API: %d)" % (format_feature_label(fid, ""), len(f_groups)))
+        lines.append("[*] %s  (Số lượng API: %d)" % (format_feature_label(fid, ""), len(f_groups)))
         for idx, g in enumerate(f_groups, 1):
             lines.append("   %d. %s [%s]  %s %s" % (
                 idx, format_api_label(g.gid), format_group_id(g.gid), g.method, g.path))
@@ -704,8 +914,8 @@ class FeatureGroup(object):
 
     def __init__(self, fid, name="", created=None):
         self.fid = fid
-        clean = ("%s" % (name or "")).strip()
-        self.name = clean if clean else ("%d" % fid)
+        clean = u_text(name).strip()
+        self.name = clean if clean else ("Chức năng %d" % fid)
         self.created = created or time.strftime("%H:%M:%S")
 
     def label(self):
@@ -713,10 +923,11 @@ class FeatureGroup(object):
 
 
 class RoleResult(object):
-    def __init__(self, role_name, role_index, request_bytes):
-        self.role_name = role_name
+    def __init__(self, role_name, role_index, request_bytes, is_stripped_auth=False):
+        self.role_name = u_text(role_name)
         self.role_index = role_index
         self.request = request_bytes
+        self.is_stripped_auth = bool(is_stripped_auth)
         self.response = None
         self.status = None
         self.length = None
@@ -729,22 +940,22 @@ class RoleResult(object):
 
 class ApiGroup(object):
     def __init__(self, gid, service, method, path, url, orig_request, orig_response, source,
-                 fid=1, feature_name=""):
+                fid=1, feature_name=""):
         self.gid = gid
         self.fid = fid
-        self.feature_name = ("%s" % (feature_name or "")).strip() or ("%d" % fid)
+        self.feature_name = u_text(feature_name).strip() or ("Chức năng %d" % fid)
         self.service = service
-        self.host = service.getHost()
+        self.host = u_text(service.getHost())
         self.port = service.getPort()
-        self.protocol = service.getProtocol()
-        self.method = method
-        self.path = path
-        self.url = url
+        self.protocol = u_text(service.getProtocol())
+        self.method = u_text(method)
+        self.path = u_text(path)
+        self.url = u_text(url)
         self.orig_request = orig_request
         self.orig_response = orig_response
         self.orig_status = None
         self.orig_length = None
-        self.source = source
+        self.source = u_text(source)
         self.created = time.strftime("%H:%M:%S")
         self.results = []
 
@@ -761,7 +972,7 @@ class RoleStore(object):
 
     @staticmethod
     def _copy(r):
-        return {"name": r.get("name", ""), "enabled": bool(r.get("enabled", True)),
+        return {"name": u_text(r.get("name", "")), "enabled": bool(r.get("enabled", True)),
                 "headers": [dict(h) for h in r.get("headers", [])]}
 
     def all(self):
@@ -873,12 +1084,12 @@ class RoleTableModel(AbstractTableModel):
         if c == 1:
             return Boolean(role["enabled"])
         if c == 2:
-            return role["name"]
+            return u_text(role["name"])
         parts = []
         for h in role["headers"]:
             mode = h.get("mode", MODE_REPLACE)
-            name = h.get("name", "")
-            val = h.get("value", "")
+            name = u_text(h.get("name", ""))
+            val = u_text(h.get("value", ""))
             has_jwt = bool(_JWT_RE.search(val))
             if mode == MODE_REMOVE:
                 parts.append("-%s" % name)
@@ -898,7 +1109,7 @@ class FeatureTableModel(AbstractTableModel):
     Lists all Feature batches (Tên 1, Tên 2, ...) plus row 0 = [All Features].
     Column 1 (Tên chức năng) is directly editable for Feature rows.
     """
-    COLS = ["#", "Tên chức năng (Feature)", "Số API", "Danh sách API"]
+    COLS = ["#", "Tên chức năng", "Số API", "Trạng thái Role (Màu)", "Danh sách API"]
 
     def __init__(self, ext):
         self._ext = ext
@@ -927,15 +1138,27 @@ class FeatureTableModel(AbstractTableModel):
         idx = r - 1
         return feats[idx] if 0 <= idx < len(feats) else None
 
+    def audit_level_at(self, r):
+        all_groups = self._ext.group_model.all_groups() if self._ext.group_model else []
+        if r <= 0:
+            lvl, _ = evaluate_feature_audit(all_groups)
+            return lvl
+        f = self.feature_at_row(r)
+        if f is None:
+            return AUDIT_NONE
+        f_groups = [g for g in all_groups if g.fid == f.fid]
+        lvl, _ = evaluate_feature_audit(f_groups)
+        return lvl
+
     def setValueAt(self, value, r, c):
         f = self.feature_at_row(r)
         if f is None or c != 1:
             return
-        raw = ("%s" % (value or "")).strip()
+        raw = u_text(value or "").strip()
         m = re.match(r"^(?:T[êe]n\s*\d+\s*[:\-]\s*)(.+)$", raw, re.IGNORECASE)
         if m:
             raw = m.group(1).strip()
-        self._ext.rename_feature(f.fid, raw or ("%d" % f.fid))
+        self._ext.rename_feature(f.fid, raw or ("Chức năng %d" % f.fid))
 
     def getValueAt(self, r, c):
         all_groups = self._ext.group_model.all_groups() if self._ext.group_model else []
@@ -948,6 +1171,9 @@ class FeatureTableModel(AbstractTableModel):
             if c == 2:
                 return Integer(len(all_groups))
             if c == 3:
+                _, summary = evaluate_feature_audit(all_groups)
+                return summary
+            if c == 4:
                 if not all_groups:
                     return "-"
                 return "%s .. %s" % (format_api_label(all_groups[0].gid),
@@ -963,6 +1189,9 @@ class FeatureTableModel(AbstractTableModel):
         if c == 2:
             return Integer(len(f_groups))
         if c == 3:
+            _, summary = evaluate_feature_audit(f_groups)
+            return summary
+        if c == 4:
             if not f_groups:
                 return "(chưa có API)"
             if len(f_groups) <= 3:
@@ -973,19 +1202,31 @@ class FeatureTableModel(AbstractTableModel):
 
 
 class GroupTableModel(AbstractTableModel):
-    COLS = ["API #", "Group", "Chức năng (Feature)", "Source", "Time", "Method", "Host", "Path",
-            "Orig Status", "Orig Len", "Role Count", "Replayed"]
+    COLS = ["API #", "Group", "Chức năng", "Đánh giá / Màu (Info)", "Method", "Host", "Path",
+            "Orig", "Orig Len", "Roles", "Replayed", "Source", "Time"]
 
     def __init__(self):
         self._all_rows = []
         self._rows = []
         self._filter_fid = None
+        self._filter_audit = AUDIT_FILTER_ALL
+
+    def _matches(self, g):
+        if self._filter_fid is not None and g.fid != self._filter_fid:
+            return False
+        if self._filter_audit and self._filter_audit != AUDIT_FILTER_ALL:
+            lvl, _ = evaluate_group_audit(g)
+            if self._filter_audit == AUDIT_ERROR:
+                return any(r.state == STATE_ERROR or (r.status is not None and r.status >= 500)
+                           for r in g.results)
+            if self._filter_audit == AUDIT_WARN:
+                return any(evaluate_role_result(g, r)[0] == AUDIT_WARN for r in g.results)
+            if lvl != self._filter_audit:
+                return False
+        return True
 
     def _rebuild_view(self):
-        if self._filter_fid is None:
-            self._rows = list(self._all_rows)
-        else:
-            self._rows = [g for g in self._all_rows if g.fid == self._filter_fid]
+        self._rows = [g for g in self._all_rows if self._matches(g)]
 
     def set_feature_filter(self, fid):
         self._filter_fid = fid
@@ -995,9 +1236,21 @@ class GroupTableModel(AbstractTableModel):
     def feature_filter(self):
         return self._filter_fid
 
+    def set_audit_filter(self, audit_level):
+        self._filter_audit = audit_level or AUDIT_FILTER_ALL
+        self._rebuild_view()
+        self.fireTableDataChanged()
+
+    def audit_level_at(self, r):
+        g = self.group_at(r)
+        if g is None:
+            return AUDIT_NONE
+        lvl, _ = evaluate_group_audit(g)
+        return lvl
+
     def add(self, group):
         self._all_rows.append(group)
-        if self._filter_fid is None or group.fid == self._filter_fid:
+        if self._matches(group):
             self._rows.append(group)
             n = len(self._rows) - 1
             self.fireTableRowsInserted(n, n)
@@ -1042,7 +1295,7 @@ class GroupTableModel(AbstractTableModel):
         return self.COLS[c]
 
     def getColumnClass(self, c):
-        if c in (8, 9, 10):
+        if c in (7, 8, 9):
             return Integer
         return String
 
@@ -1055,32 +1308,35 @@ class GroupTableModel(AbstractTableModel):
         if c == 2:
             return format_feature_label(g.fid, g.feature_name)
         if c == 3:
-            return g.source
+            _, summary = evaluate_group_audit(g)
+            return summary
         if c == 4:
-            return g.created
-        if c == 5:
             return g.method
-        if c == 6:
+        if c == 5:
             default_port = ((g.protocol == "https" and g.port == 443) or
                             (g.protocol == "http" and g.port == 80))
             return g.host if default_port else "%s:%s" % (g.host, g.port)
-        if c == 7:
+        if c == 6:
             return g.path
-        if c == 8:
+        if c == 7:
             return None if g.orig_status is None else Integer(g.orig_status)
-        if c == 9:
+        if c == 8:
             return None if g.orig_length is None else Integer(g.orig_length)
-        if c == 10:
+        if c == 9:
             return Integer(len(g.results))
-        if c == 11:
+        if c == 10:
             done = len([x for x in g.results if x.state in (STATE_DONE, STATE_ERROR)])
             return "%d/%d" % (done, len(g.results))
+        if c == 11:
+            return g.source
+        if c == 12:
+            return g.created
         return ""
 
 
 class ResultTableModel(AbstractTableModel):
-    COLS = ["#", "Role", "State", "Status", "Body Len", "Delta vs Orig", "Time (ms)", "Sends",
-            "Repeater Tab / Error"]
+    COLS = ["#", "Role", "Đánh giá Role (Màu)", "State", "Status", "Body Len",
+            "Delta vs Orig", "Time (ms)", "Sends", "Repeater Tab / Error"]
 
     def __init__(self):
         self._group = None
@@ -1097,6 +1353,13 @@ class ResultTableModel(AbstractTableModel):
             return self._group.results[r]
         return None
 
+    def audit_level_at(self, r):
+        res = self.result_at(r)
+        if res is None:
+            return AUDIT_NONE
+        lvl, _ = evaluate_role_result(self._group, res)
+        return lvl
+
     def getRowCount(self):
         return len(self._group.results) if self._group is not None else 0
 
@@ -1107,7 +1370,7 @@ class ResultTableModel(AbstractTableModel):
         return self.COLS[c]
 
     def getColumnClass(self, c):
-        if c in (0, 3, 4, 5, 6, 7):
+        if c in (0, 4, 5, 6, 7, 8):
             return Integer
         return String
 
@@ -1119,44 +1382,106 @@ class ResultTableModel(AbstractTableModel):
         if c == 1:
             return res.role_name
         if c == 2:
-            return res.state
+            _, badge = evaluate_role_result(g, res)
+            return badge
         if c == 3:
-            return None if res.status is None else Integer(res.status)
+            return res.state
         if c == 4:
-            return None if res.length is None else Integer(res.length)
+            return None if res.status is None else Integer(res.status)
         if c == 5:
+            return None if res.length is None else Integer(res.length)
+        if c == 6:
             if res.length is None or g.orig_length is None:
                 return None
             return Integer(res.length - g.orig_length)
-        if c == 6:
-            return None if res.elapsed_ms is None else Integer(res.elapsed_ms)
         if c == 7:
-            return Integer(res.sent_count)
+            return None if res.elapsed_ms is None else Integer(res.elapsed_ms)
         if c == 8:
+            return Integer(res.sent_count)
+        if c == 9:
             return res.error if res.error else res.tab_name
         return ""
 
 
-class StatusRenderer(DefaultTableCellRenderer):
-    """Colors HTTP status cells: 2xx green, 3xx blue, 4xx orange, 5xx red."""
+class AuditTableRenderer(DefaultTableCellRenderer):
+    """
+    Row & cell color renderer for FeatureTable, GroupTable, and ResultTable:
+      - Yellow INFO (Color(255, 247, 195)): Any role call failed (401/403/4xx/5xx/Error) or permission diff
+      - Green OK    (Color(228, 248, 232)): All roles 2xx OK
+      - Orange WARN (Color(255, 230, 195)): Suspected auth bypass (Guest role got 2xx)
+      - Red ERROR   (Color(255, 222, 222)): Server 5xx / timeout
+      - Blue REDIR  (Color(225, 239, 255)): 3xx redirect
+    """
+    BG_INFO = Color(255, 247, 195)
+    BG_OK = Color(228, 248, 232)
+    BG_WARN = Color(255, 230, 195)
+    BG_ERR = Color(255, 222, 222)
+    BG_REDIR = Color(225, 239, 255)
+    BG_EVEN = Color(255, 255, 255)
+    BG_ODD = Color(248, 249, 252)
+
+    FG_DEFAULT = Color(25, 25, 25)
+    FG_INFO = Color(155, 85, 0)
+    FG_OK = Color(0, 125, 40)
+    FG_WARN = Color(190, 65, 0)
+    FG_ERR = Color(190, 15, 15)
+    FG_REDIR = Color(10, 80, 180)
+
+    def __init__(self, model, status_col=None, audit_col=None):
+        DefaultTableCellRenderer.__init__(self)
+        self._model = model
+        self._status_col = status_col
+        self._audit_col = audit_col
 
     def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
         comp = DefaultTableCellRenderer.getTableCellRendererComponent(
             self, table, value, isSelected, hasFocus, row, column)
-        if not isSelected:
-            comp.setForeground(table.getForeground())
+        if isSelected:
+            return comp
+
+        model_row = table.convertRowIndexToModel(row)
+        model_col = table.convertColumnIndexToModel(column)
+        lvl = self._model.audit_level_at(model_row) if hasattr(self._model, "audit_level_at") else AUDIT_NONE
+
+        if lvl == AUDIT_INFO:
+            comp.setBackground(self.BG_INFO)
+        elif lvl == AUDIT_OK:
+            comp.setBackground(self.BG_OK)
+        elif lvl == AUDIT_WARN:
+            comp.setBackground(self.BG_WARN)
+        elif lvl == AUDIT_ERROR:
+            comp.setBackground(self.BG_ERR)
+        elif lvl == AUDIT_REDIRECT:
+            comp.setBackground(self.BG_REDIR)
+        else:
+            comp.setBackground(self.BG_EVEN if (row % 2 == 0) else self.BG_ODD)
+
+        comp.setForeground(self.FG_DEFAULT)
+
+        if model_col == self._audit_col:
+            if lvl == AUDIT_INFO:
+                comp.setForeground(self.FG_INFO)
+            elif lvl == AUDIT_OK:
+                comp.setForeground(self.FG_OK)
+            elif lvl == AUDIT_WARN:
+                comp.setForeground(self.FG_WARN)
+            elif lvl == AUDIT_ERROR:
+                comp.setForeground(self.FG_ERR)
+            elif lvl == AUDIT_REDIRECT:
+                comp.setForeground(self.FG_REDIR)
+        elif model_col == self._status_col and value is not None:
             try:
-                code = int("%s" % value) if value is not None else 0
+                code = int("%s" % value)
             except Exception:
                 code = 0
             if 200 <= code < 300:
-                comp.setForeground(Color(0, 140, 0))
+                comp.setForeground(self.FG_OK)
             elif 300 <= code < 400:
-                comp.setForeground(Color(0, 90, 200))
+                comp.setForeground(self.FG_REDIR)
             elif 400 <= code < 500:
-                comp.setForeground(Color(210, 110, 0))
+                comp.setForeground(self.FG_INFO)
             elif code >= 500:
-                comp.setForeground(Color(200, 0, 0))
+                comp.setForeground(self.FG_ERR)
         return comp
 
 
@@ -1979,7 +2304,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _clone_for_roles(self, group, info, roles, cfg):
         """Build exactly one request per enabled role; method/URL/params/body preserved."""
         req = group.orig_request
-        base_headers = [("%s" % h) for h in info.getHeaders()]
+        base_headers = [u_text(h) for h in info.getHeaders()]
         body = Arrays.copyOfRange(req, info.getBodyOffset(), len(req))
         results = []
         for idx, role in enumerate(roles):
@@ -1989,7 +2314,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 jlist.add(h)
             new_req = self.helpers.buildHttpMessage(jlist, body)
             display = display_role_name(role["name"], idx, cfg["number_roles_in_tab"])
-            res = RoleResult(display, idx, new_req)
+            res = RoleResult(display, idx, new_req, is_stripped_auth=is_stripped_auth_role(role))
             res.tab_name = repeater_tab_name(group.gid, group.method, group.path, display,
                                              cfg["short_path_len"], group.fid,
                                              cfg.get("include_feature_in_tab", False))
@@ -2088,6 +2413,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             if self.group_model is None:
                 return
             self.group_model.refresh_group(group)
+            if self.feature_model is not None and self.feature_table is not None:
+                sel_feat = self.feature_table.getSelectedRow()
+                self.feature_model.fireTableDataChanged()
+                if 0 <= sel_feat < self.feature_model.getRowCount():
+                    self.feature_table.setRowSelectionInterval(sel_feat, sel_feat)
             if self.result_model.group() is group:
                 if res is None:
                     self.result_model.fireTableRowsUpdated(0, max(len(group.results) - 1, 0))
@@ -2101,14 +2431,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     self._show_result(sel)
             if self.history_summary_area is not None:
                 self._refresh_history_summary_only()
+            self.update_status()
         ui_call(refresh)
+
+    @staticmethod
+    def _make_color_badge(text, bg_color, fg_color):
+        lbl = JLabel(" " + text + " ")
+        lbl.setOpaque(True)
+        lbl.setBackground(bg_color)
+        lbl.setForeground(fg_color)
+        lbl.setFont(Font("Dialog", Font.BOLD, 11))
+        lbl.setBorder(BorderFactory.createLineBorder(Color(190, 190, 190)))
+        return lbl
 
     # ===================================================================== UI
     def _build_ui(self):
         self.main_panel = JPanel(BorderLayout())
         cfg = self.get_config()
 
-        # ---- top control bar (capture toggles + Active Feature switcher)
+        # ---- top control bar (capture toggles + Active Feature switcher + Color Legend)
         top_container = JPanel(BorderLayout())
         bar1 = JPanel(FlowLayout(FlowLayout.LEFT, 8, 3))
         self.cb_capture = JCheckBox("Capture Proxy traffic", cfg["capture_enabled"],
@@ -2120,25 +2461,35 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.status_label = JLabel("")
         for comp in (self.cb_capture, self.cb_auto_repeater, self.cb_auto_send):
             bar1.add(comp)
-        bar1.add(Box.createHorizontalStrut(14))
+        bar1.add(Box.createHorizontalStrut(12))
         bar1.add(self.status_label)
 
         bar2 = JPanel(FlowLayout(FlowLayout.LEFT, 6, 3))
-        bar2.setBorder(BorderFactory.createTitledBorder("Bộ gom Chức năng (Feature / Button Action Batching)"))
+        bar2.setBorder(BorderFactory.createTitledBorder(
+            "Bộ gom Chức năng (Feature / Button Action Batching) & Chú thích Màu Audit"))
         self.lbl_active_feature = JLabel("Đang bắt vào Tên 1:")
         self.lbl_active_feature.setFont(Font("Dialog", Font.BOLD, 12))
-        self.tf_feature_name = JTextField(self.active_feature().name, 22,
+        self.tf_feature_name = JTextField(self.active_feature().name, 18,
                                           actionPerformed=self._on_apply_active_feature_name)
         btn_rename_feat = JButton("Cập nhật Tên", actionPerformed=self._on_apply_active_feature_name)
-        btn_next_feat = JButton("+ Qua Chức Năng Mới (Bấm nút tiếp theo -> Tên mới)",
+        btn_next_feat = JButton("+ Qua Chức Năng Mới (Nút tiếp theo -> Tên mới)",
                                 actionPerformed=self._on_next_feature)
         self.lbl_feature_counter = JLabel("")
         bar2.add(self.lbl_active_feature)
         bar2.add(self.tf_feature_name)
         bar2.add(btn_rename_feat)
         bar2.add(btn_next_feat)
-        bar2.add(Box.createHorizontalStrut(10))
+        bar2.add(Box.createHorizontalStrut(6))
         bar2.add(self.lbl_feature_counter)
+        bar2.add(Box.createHorizontalStrut(12))
+        bar2.add(self._make_color_badge("Vàng INFO: Có Role lỗi / Lệch quyền",
+                                        AuditTableRenderer.BG_INFO, AuditTableRenderer.FG_INFO))
+        bar2.add(self._make_color_badge("Cam WARN: Nghi vấn Bypass",
+                                        AuditTableRenderer.BG_WARN, AuditTableRenderer.FG_WARN))
+        bar2.add(self._make_color_badge("Xanh OK: Cả N Role 2xx",
+                                        AuditTableRenderer.BG_OK, AuditTableRenderer.FG_OK))
+        bar2.add(self._make_color_badge("Đỏ ERR: Lỗi 5xx / Mạng",
+                                        AuditTableRenderer.BG_ERR, AuditTableRenderer.FG_ERR))
 
         top_container.add(bar1, BorderLayout.NORTH)
         top_container.add(bar2, BorderLayout.CENTER)
@@ -2159,80 +2510,106 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _build_groups_tab(self):
         panel = JPanel(BorderLayout())
 
-        actions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 4))
+        # Two-row compact toolbar so no buttons are ever cut off on any screen width
+        actions_container = JPanel(GridLayout(2, 1, 0, 1))
+        row1 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
         self.btn_send_group = JButton("Send Entire Group to Repeater", actionPerformed=self._on_send_group)
         self.btn_send_role = JButton("Send Selected Role to Repeater", actionPerformed=self._on_send_role)
         self.btn_replay_all = JButton("Replay All Roles to Server", actionPerformed=self._on_replay_all)
         self.btn_replay_sel = JButton("Replay Selected Role(s)", actionPerformed=self._on_replay_selected)
-        actions.add(self.btn_send_group)
-        actions.add(self.btn_send_role)
-        actions.add(self.btn_replay_all)
-        actions.add(self.btn_replay_sel)
-        actions.add(JButton("Chuyển API -> Chức năng...", actionPerformed=self._on_move_groups_feature))
-        actions.add(JButton("Rebuild with Current Roles", actionPerformed=self._on_rebuild))
-        actions.add(JButton("Show Original Req/Resp", actionPerformed=self._on_show_original))
-        actions.add(JButton("Export Matrix JSON...", actionPerformed=self._on_export_matrix))
-        actions.add(JButton("Delete Group(s)", actionPerformed=self._on_delete_groups))
-        actions.add(JButton("Clear All", actionPerformed=self._on_clear_groups))
-        actions.add(JButton("Reset Dedup Cache", actionPerformed=self._on_reset_dedup))
-        panel.add(actions, BorderLayout.NORTH)
+        row1.add(self.btn_send_group)
+        row1.add(self.btn_send_role)
+        row1.add(self.btn_replay_all)
+        row1.add(self.btn_replay_sel)
+        row1.add(JButton("Show Original Req/Resp", actionPerformed=self._on_show_original))
+        row1.add(JButton("Rebuild with Current Roles", actionPerformed=self._on_rebuild))
 
-        status_renderer = StatusRenderer()
+        row2 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        row2.add(JLabel("Lọc màu Audit:"))
+        self.cb_audit_filter = JComboBox([label for label, _ in AUDIT_FILTER_OPTIONS])
+        self.cb_audit_filter.addActionListener(self._on_audit_filter_changed)
+        row2.add(self.cb_audit_filter)
+        row2.add(Box.createHorizontalStrut(6))
+        row2.add(JButton("Chuyển API -> Chức năng...", actionPerformed=self._on_move_groups_feature))
+        row2.add(JButton("Export Matrix JSON...", actionPerformed=self._on_export_matrix))
+        row2.add(JButton("Delete Group(s)", actionPerformed=self._on_delete_groups))
+        row2.add(JButton("Clear All", actionPerformed=self._on_clear_groups))
+        row2.add(JButton("Reset Dedup Cache", actionPerformed=self._on_reset_dedup))
+
+        actions_container.add(row1)
+        actions_container.add(row2)
+        panel.add(actions_container, BorderLayout.NORTH)
 
         # Left side of top master area: Feature (Chức năng) selector & batch actions
         self.feature_model = FeatureTableModel(self)
         self.feature_table = JTable(self.feature_model)
+        self.feature_table.setRowHeight(22)
         self.feature_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         self.feature_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_feature_filter_selected))
-        for col, width in ((0, 50), (1, 185), (2, 55), (3, 140)):
-            self.feature_table.getColumnModel().getColumn(col).setPreferredWidth(width)
+        feat_renderer = AuditTableRenderer(self.feature_model, status_col=None, audit_col=3)
+        for col, width in ((0, 42), (1, 165), (2, 50), (3, 155), (4, 115)):
+            column = self.feature_table.getColumnModel().getColumn(col)
+            column.setPreferredWidth(width)
+            column.setCellRenderer(feat_renderer)
 
         feat_panel = JPanel(BorderLayout(2, 2))
         feat_panel.setBorder(BorderFactory.createTitledBorder(
-            "Danh sách Chức năng (Click để lọc API | Double-click cột Tên để sửa)"))
+            "Danh sách Chức năng (Click lọc API | Double-click cột Tên để sửa)"))
         feat_panel.add(JScrollPane(self.feature_table), BorderLayout.CENTER)
-        feat_btns = JPanel(FlowLayout(FlowLayout.LEFT, 3, 2))
-        feat_btns.add(JButton("+ Mới", actionPerformed=self._on_next_feature))
-        feat_btns.add(JButton("Đặt làm đang bắt", actionPerformed=self._on_set_selected_feature_active))
+        feat_btns = JPanel(GridLayout(2, 3, 3, 3))
+        feat_btns.add(JButton("+ Chức năng mới", actionPerformed=self._on_next_feature))
+        feat_btns.add(JButton("Đặt đang bắt", actionPerformed=self._on_set_selected_feature_active))
         feat_btns.add(JButton("Đổi tên...", actionPerformed=self._on_rename_selected_feature))
-        feat_btns.add(JButton("Gửi Chức năng -> Repeater", actionPerformed=self._on_send_feature_repeater))
+        feat_btns.add(JButton("Gửi -> Repeater", actionPerformed=self._on_send_feature_repeater))
         feat_btns.add(JButton("Replay Chức năng", actionPerformed=self._on_replay_feature))
+        feat_btns.add(JButton("Xem tất cả API", actionPerformed=self._on_show_all_features))
         feat_panel.add(feat_btns, BorderLayout.SOUTH)
 
         # Right side of top master area: Sequentially numbered API Groups table
         self.group_model = GroupTableModel()
         self.group_table = JTable(self.group_model)
+        self.group_table.setRowHeight(22)
         self.group_table.setAutoCreateRowSorter(True)
         self.group_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.group_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_group_selected))
         self.group_table.addMouseListener(_DoubleClick(lambda: self._on_send_group(None)))
-        self.group_table.getColumnModel().getColumn(8).setCellRenderer(status_renderer)
-        for col, width in ((0, 65), (1, 55), (2, 165), (3, 60), (4, 65), (5, 65),
-                           (6, 170), (7, 360), (8, 75), (9, 75), (10, 75), (11, 70)):
-            self.group_table.getColumnModel().getColumn(col).setPreferredWidth(width)
+        grp_renderer = AuditTableRenderer(self.group_model, status_col=7, audit_col=3)
+        for col, width in ((0, 58), (1, 48), (2, 135), (3, 195), (4, 58), (5, 140),
+                           (6, 260), (7, 52), (8, 65), (9, 50), (10, 62), (11, 55), (12, 62)):
+            column = self.group_table.getColumnModel().getColumn(col)
+            column.setPreferredWidth(width)
+            column.setCellRenderer(grp_renderer)
 
         group_panel = JPanel(BorderLayout())
         group_panel.setBorder(BorderFactory.createTitledBorder(
-            "Danh sách API đã đi qua (API 1, API 2, API 3... theo thứ tự thời gian)"))
+            "Danh sách API đã đi qua (API 1, API 2... | Tô màu Vàng INFO khi có bất kỳ Role nào gọi lỗi / lệch quyền)"))
         group_panel.add(JScrollPane(self.group_table), BorderLayout.CENTER)
 
         top_master_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, feat_panel, group_panel)
-        top_master_split.setResizeWeight(0.28)
+        top_master_split.setResizeWeight(0.30)
 
         # Bottom detail area: Role results table + Request/Response viewers
         self.result_model = ResultTableModel()
         self.result_table = JTable(self.result_model)
+        self.result_table.setRowHeight(22)
         self.result_table.setAutoCreateRowSorter(True)
         self.result_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.result_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_result_selected))
         self.result_table.addMouseListener(_DoubleClick(lambda: self._on_send_role(None)))
-        self.result_table.getColumnModel().getColumn(3).setCellRenderer(status_renderer)
-        for col, width in ((0, 35), (1, 160), (2, 80), (3, 60), (4, 80), (5, 90), (6, 75), (7, 50),
-                           (8, 420)):
-            self.result_table.getColumnModel().getColumn(col).setPreferredWidth(width)
+        res_renderer = AuditTableRenderer(self.result_model, status_col=4, audit_col=2)
+        for col, width in ((0, 35), (1, 145), (2, 210), (3, 70), (4, 55), (5, 75),
+                           (6, 85), (7, 70), (8, 50), (9, 360)):
+            column = self.result_table.getColumnModel().getColumn(col)
+            column.setPreferredWidth(width)
+            column.setCellRenderer(res_renderer)
+
+        res_panel = JPanel(BorderLayout())
+        res_panel.setBorder(BorderFactory.createTitledBorder(
+            "Kết quả chi tiết từng Role trên API đang chọn (Màu Vàng INFO = Role bị chặn 401/403/4xx/5xx hoặc lệch Body)"))
+        res_panel.add(JScrollPane(self.result_table), BorderLayout.CENTER)
 
         controller = _EditorController(self)
         self.req_viewer = self.callbacks.createMessageEditor(controller, False)
@@ -2246,10 +2623,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         viewers = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, req_panel, resp_panel)
         viewers.setResizeWeight(0.5)
 
-        detail_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.result_table), viewers)
-        detail_split.setResizeWeight(0.35)
+        detail_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, res_panel, viewers)
+        detail_split.setResizeWeight(0.38)
         master_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, top_master_split, detail_split)
-        master_split.setResizeWeight(0.38)
+        master_split.setResizeWeight(0.40)
         panel.add(master_split, BorderLayout.CENTER)
         return panel
 
@@ -2487,19 +2864,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             with self._state_lock:
                 seen = len(self._seen_keys)
             all_groups = self.group_model.all_groups() if getattr(self, "group_model", None) is not None else []
+            info_apis = len([g for g in all_groups if evaluate_group_audit(g)[0] == AUDIT_INFO])
             feats = self.features_list()
             act = self.active_feature()
             self.status_label.setText(
-                "Capture: %s  |  Roles: %d/%d  |  Chức năng: %d  |  Tổng API: %d  |  Dedup: %d"
+                "Capture: %s  |  Roles: %d/%d  |  Chức năng: %d  |  Tổng API: %d (Vàng INFO: %d)  |  Dedup: %d"
                 % ("ON" if cfg["capture_enabled"] else "OFF", self.roles.enabled_count(),
-                   self.roles.count(), len(feats), len(all_groups), seen))
+                   self.roles.count(), len(feats), len(all_groups), info_apis, seen))
             if getattr(self, "lbl_active_feature", None) is not None:
                 self.lbl_active_feature.setText("Đang bắt vào Tên %d:" % act.fid)
                 if not self.tf_feature_name.hasFocus():
                     self.tf_feature_name.setText(act.name)
                 act_count = len([x for x in all_groups if x.fid == act.fid])
                 self.lbl_feature_counter.setText(
-                    "(Hiện có %d chức năng | %s đang có %d API)"
+                    "(%d chức năng | %s: %d API)"
                     % (len(feats), format_feature_label(act.fid, act.name), act_count))
             n = self.roles.enabled_count()
             g, _ = self.current_selection()
@@ -2531,22 +2909,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     "Tổng cộng: %d Chức năng | %d API đã đi qua" % (len(feats), len(all_groups)))
                 for f in feats:
                     f_groups = [g for g in all_groups if g.fid == f.fid]
+                    _, f_audit = evaluate_feature_audit(f_groups)
                     f_node = DefaultMutableTreeNode(_TreeNodeItem(
                         "FEATURE", f,
-                        "%s  (%d API)" % (format_feature_label(f.fid, f.name), len(f_groups))
+                        "%s  (%d API | %s)" % (format_feature_label(f.fid, f.name), len(f_groups), f_audit)
                     ))
                     for g in f_groups:
+                        _, g_audit = evaluate_group_audit(g)
                         g_node = DefaultMutableTreeNode(_TreeNodeItem(
                             "GROUP", g,
-                            "%s [%s]: %s %s (Orig: %s) -> %d Roles"
+                            "%s [%s]: %s %s (Orig: %s) -> [%s]"
                             % (format_api_label(g.gid), format_group_id(g.gid), g.method, g.path,
-                               g.orig_status if g.orig_status is not None else "-", len(g.results))
+                               g.orig_status if g.orig_status is not None else "-", g_audit)
                         ))
                         for r in g.results:
+                            _, r_badge = evaluate_role_result(g, r)
                             r_node = DefaultMutableTreeNode(_TreeNodeItem(
                                 "ROLE", (g, r),
-                                "%s -> Status: %s | Len: %s | Tab: %s"
+                                "%s -> [%s] | Status: %s | Len: %s | Tab: %s"
                                 % (r.role_name,
+                                   r_badge,
                                    r.status if r.status is not None else r.state,
                                    r.length if r.length is not None else "-",
                                    r.tab_name)
@@ -2563,14 +2945,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def _on_apply_active_feature_name(self, event):
         act = self.active_feature()
-        new_name = self.tf_feature_name.getText().strip()
+        new_name = u_text(self.tf_feature_name.getText()).strip()
         if new_name:
             self.rename_feature(act.fid, new_name)
 
     def _on_next_feature(self, event):
         # Save any pending name change on current active feature first if user edited the text box
         cur = self.active_feature()
-        typed = self.tf_feature_name.getText().strip() if getattr(self, "tf_feature_name", None) else ""
+        typed = u_text(self.tf_feature_name.getText()).strip() if getattr(self, "tf_feature_name", None) else ""
         if typed and typed != cur.name:
             self.rename_feature(cur.fid, typed)
         next_num = len(self.features_list()) + 1
@@ -2581,7 +2963,28 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "Chức năng %d" % next_num)
         if name is None:
             return
-        self.start_new_feature(name)
+        self.start_new_feature(u_text(name))
+
+    def _on_audit_filter_changed(self, event):
+        if self.group_model is None or getattr(self, "cb_audit_filter", None) is None:
+            return
+        idx = self.cb_audit_filter.getSelectedIndex()
+        level = AUDIT_FILTER_OPTIONS[idx][1] if 0 <= idx < len(AUDIT_FILTER_OPTIONS) else AUDIT_FILTER_ALL
+        self.group_model.set_audit_filter(level)
+        if self.group_model.getRowCount() > 0:
+            self.group_table.setRowSelectionInterval(0, 0)
+        else:
+            self.result_model.set_group(None)
+            self._show_result(None)
+
+    def _on_show_all_features(self, event):
+        if self.feature_table is not None and self.feature_model.getRowCount() > 0:
+            self.feature_table.setRowSelectionInterval(0, 0)
+        if getattr(self, "cb_audit_filter", None) is not None:
+            self.cb_audit_filter.setSelectedIndex(0)
+        if self.group_model is not None:
+            self.group_model.set_feature_filter(None)
+            self.group_model.set_audit_filter(AUDIT_FILTER_ALL)
 
     def _on_feature_filter_selected(self):
         if self.feature_table is None or self.group_model is None:
