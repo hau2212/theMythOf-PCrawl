@@ -304,6 +304,70 @@ def roles_to_json(roles):
     return json.dumps({"extension": EXT_NAME, "version": 1, "roles": roles}, indent=2)
 
 
+def default_role_templates():
+    """Return 10 starter role profiles (01_Admin .. 10_Guest) for quick setup."""
+    specs = [
+        ("01_Admin", [{"name": "Authorization", "value": "Bearer ADMIN_TOKEN", "mode": MODE_REPLACE},
+                      {"name": "X-Role", "value": "admin", "mode": MODE_REPLACE}]),
+        ("02_Manager", [{"name": "Authorization", "value": "Bearer MANAGER_TOKEN", "mode": MODE_REPLACE},
+                        {"name": "X-Role", "value": "manager", "mode": MODE_REPLACE}]),
+        ("03_Auditor", [{"name": "Authorization", "value": "Bearer AUDITOR_TOKEN", "mode": MODE_REPLACE}]),
+        ("04_Support", [{"name": "Cookie", "value": "session=SUPPORT_SESSION", "mode": MODE_REPLACE},
+                        {"name": "Authorization", "value": REMOVE_TOKEN, "mode": MODE_REMOVE}]),
+        ("05_UserA_TenantA", [{"name": "Authorization", "value": "Bearer USER_A_TOKEN", "mode": MODE_REPLACE},
+                              {"name": "X-Tenant-ID", "value": "tenant-a", "mode": MODE_REPLACE}]),
+        ("06_UserB_TenantA", [{"name": "Authorization", "value": "Bearer USER_B_TOKEN", "mode": MODE_REPLACE},
+                              {"name": "X-Tenant-ID", "value": "tenant-a", "mode": MODE_REPLACE}]),
+        ("07_UserC_TenantB", [{"name": "Authorization", "value": "Bearer USER_C_TOKEN", "mode": MODE_REPLACE},
+                              {"name": "X-Tenant-ID", "value": "tenant-b", "mode": MODE_REPLACE}]),
+        ("08_TenantSwap", [{"name": "X-Tenant-ID", "value": "tenant-b", "mode": MODE_REPLACE}]),
+        ("09_ExpiredToken", [{"name": "Authorization", "value": "Bearer EXPIRED_TOKEN", "mode": MODE_REPLACE}]),
+        ("10_Guest", [{"name": "Authorization", "value": REMOVE_TOKEN, "mode": MODE_REMOVE},
+                      {"name": "Cookie", "value": REMOVE_TOKEN, "mode": MODE_REMOVE},
+                      {"name": "X-Role", "value": REMOVE_TOKEN, "mode": MODE_REMOVE},
+                      {"name": "X-Tenant-ID", "value": REMOVE_TOKEN, "mode": MODE_REMOVE}]),
+    ]
+    return [normalize_role({"name": n, "enabled": True, "headers": hs}, i)
+            for i, (n, hs) in enumerate(specs)]
+
+
+def groups_to_matrix_json(groups):
+    """Serialize captured API groups and per-role status/length metrics to JSON."""
+    items = []
+    for g in groups or []:
+        roles_out = []
+        for r in g.results:
+            delta = (r.length - g.orig_length) if (r.length is not None and g.orig_length is not None) else None
+            roles_out.append({
+                "role": r.role_name,
+                "state": r.state,
+                "status": r.status,
+                "length": r.length,
+                "delta_vs_orig": delta,
+                "elapsed_ms": r.elapsed_ms,
+                "sends": r.sent_count,
+                "repeater_tab": r.tab_name,
+                "error": r.error or None,
+            })
+        items.append({
+            "group_id": format_group_id(g.gid),
+            "source": g.source,
+            "created": g.created,
+            "method": g.method,
+            "url": g.url,
+            "host": g.host,
+            "port": g.port,
+            "protocol": g.protocol,
+            "path": g.path,
+            "orig_status": g.orig_status,
+            "orig_length": g.orig_length,
+            "role_count": len(g.results),
+            "roles": roles_out,
+        })
+    return json.dumps({"extension": EXT_NAME, "version": 1, "groups": items}, indent=2)
+
+
+
 def parse_bulk_headers(text):
     """Parse pasted 'Name: value' lines into rule dicts."""
     out = []
@@ -568,6 +632,9 @@ class GroupTableModel(AbstractTableModel):
         if 0 <= r < len(self._rows):
             return self._rows[r]
         return None
+
+    def all_groups(self):
+        return list(self._rows)
 
     def refresh_group(self, group):
         for i, g in enumerate(self._rows):
@@ -1322,6 +1389,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         actions.add(self.btn_replay_all)
         actions.add(self.btn_replay_sel)
         actions.add(JButton("Rebuild with Current Roles", actionPerformed=self._on_rebuild))
+        actions.add(JButton("Show Original Req/Resp", actionPerformed=self._on_show_original))
+        actions.add(JButton("Export Matrix JSON...", actionPerformed=self._on_export_matrix))
         actions.add(JButton("Delete Group(s)", actionPerformed=self._on_delete_groups))
         actions.add(JButton("Clear All", actionPerformed=self._on_clear_groups))
         actions.add(JButton("Reset Dedup Cache", actionPerformed=self._on_reset_dedup))
@@ -1397,6 +1466,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             ("Disable All", lambda e: self._on_enable_all(False)),
             (None, None),
             ("Import JSON...", self._on_import_roles), ("Export JSON...", self._on_export_roles),
+            (None, None),
+            ("Load 10-Role Template", self._on_load_template),
         ]
         for label, handler in buttons:
             if label is None:
@@ -1652,6 +1723,40 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for g in self._selected_groups():
             self.rebuild_group(g)
 
+    def _on_show_original(self, event):
+        g = self._require_group()
+        if g is None:
+            return
+        empty = self.helpers.stringToBytes("")
+        self.req_viewer.setMessage(g.orig_request if g.orig_request is not None else empty, True)
+        self.resp_viewer.setMessage(g.orig_response if g.orig_response is not None else empty, False)
+
+    def _on_export_matrix(self, event):
+        groups = self.group_model.all_groups()
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "No captured API groups to export.", EXT_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
+        chooser = JFileChooser()
+        chooser.setSelectedFile(File("theMythOfCrawl_matrix.json"))
+        chooser.setFileFilter(FileNameExtensionFilter("JSON files", "json"))
+        if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
+            return
+        f = chooser.getSelectedFile()
+        if not f.getName().lower().endswith(".json"):
+            f = File(f.getAbsolutePath() + ".json")
+        if f.exists() and JOptionPane.showConfirmDialog(
+                self.main_panel, "Overwrite %s?" % f.getName(), EXT_NAME,
+                JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+            return
+        try:
+            data = String(groups_to_matrix_json(groups)).getBytes("UTF-8")
+            Files.write(f.toPath(), data)
+            self.log("Exported %d group(s) matrix to %s" % (len(groups), f.getAbsolutePath()))
+        except Throwable as t:
+            JOptionPane.showMessageDialog(self.main_panel, "Export failed: %s" % t, EXT_NAME,
+                                          JOptionPane.ERROR_MESSAGE)
+
     def _on_delete_groups(self, event):
         groups = self._selected_groups()
         if not groups:
@@ -1798,3 +1903,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except Throwable as t:
             JOptionPane.showMessageDialog(self.main_panel, "Export failed: %s" % t, EXT_NAME,
                                           JOptionPane.ERROR_MESSAGE)
+
+    def _on_load_template(self, event):
+        templates = default_role_templates()
+        choice = 0
+        if self.roles.count() > 0:
+            choice = JOptionPane.showOptionDialog(
+                self.main_panel, "Load 10 starter roles (01_Admin .. 10_Guest). Replace existing %d role(s) or append?"
+                % self.roles.count(), EXT_NAME, JOptionPane.DEFAULT_OPTION,
+                JOptionPane.QUESTION_MESSAGE, None, ["Replace", "Append", "Cancel"], "Replace")
+        if choice == 0:
+            self.roles.set_all(templates)
+        elif choice == 1:
+            for r in templates:
+                self.roles.add(r)
+        else:
+            return
+        self._roles_changed()
+        self.log("Loaded 10 starter role profiles.")

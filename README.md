@@ -34,6 +34,7 @@ For every API endpoint it matches, the extension makes **one copy of the request
 | Move Up / Down | The order sets the clone order, the `01_`, `02_` … numbers, and the Repeater tab order |
 | Enable All / Disable All | Bulk toggle |
 | Import JSON / Export JSON | Import lets you **Replace** or **Append** |
+| Load 10-Role Template | Instantly populates 10 starter roles (`01_Admin` … `10_Guest`) with Replace or Append |
 
 Each role holds a list of **header rules**, applied in order:
 
@@ -108,6 +109,8 @@ Tuning: **Replay worker threads** (1–64, resized live) and **Throttle per requ
 | **Replay All N Roles to Server** | Re-sends every role of each selected group in the background and updates the results |
 | Replay Selected Role(s) | Re-sends only the selected rows |
 | Rebuild with Current Roles | Re-clones the group's original request using the roles as they are now (after you edit tokens) |
+| Show Original Req/Resp | Displays the captured baseline request and response in the bottom viewers |
+| Export Matrix JSON... | Exports all captured API groups and per-role status/length metrics to a JSON file |
 | Delete Group(s) / Clear All / Reset Dedup Cache | Housekeeping |
 
 How to read results: a low-privilege role that gets a `2xx` with a body length close to the admin's (small Δ) on a privileged endpoint is a candidate authorization flaw. Check it by hand in the Repeater tab group.

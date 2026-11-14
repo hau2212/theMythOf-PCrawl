@@ -365,6 +365,10 @@ class RoleJsonTests(unittest.TestCase):
         with open(os.path.join(ROOT, "roles.example.json"), "r") as f:
             roles = tm.roles_from_json(f.read())
         self.assertEqual(len(roles), 10)
+        templates = tm.default_role_templates()
+        self.assertEqual(len(templates), 10)
+        self.assertEqual(templates[0]["name"], "01_Admin")
+        self.assertEqual(templates[-1]["name"], "10_Guest")
 
     def test_bulk_and_config(self):
         rules = tm.parse_bulk_headers("Authorization: Bearer x\nnot a header\nX-Old: [REMOVE]\n")
@@ -439,6 +443,10 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(r.response is not None and r.elapsed_ms is not None for r in g.results))
         self.ext.replay(g, g.results[:2])
         self.assertEqual([r.sent_count for r in g.results[:3]], [2, 2, 1])
+        matrix = json.loads(tm.groups_to_matrix_json([g]))
+        self.assertEqual(matrix["groups"][0]["group_id"], "G01")
+        self.assertEqual(matrix["groups"][0]["role_count"], 10)
+        self.assertEqual(matrix["groups"][0]["roles"][0]["status"], 200)
 
     def test_dedup_and_filters(self):
         self.capture()
