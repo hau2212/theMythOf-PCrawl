@@ -1,0 +1,36 @@
+{
+  "extension": "theMythOfCrawl",
+  "version": 1,
+  "roles": [
+    {"name": "01_Admin", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_ADMIN_TOKEN", "mode": "REPLACE"},
+      {"name": "X-Role", "value": "admin", "mode": "REPLACE"}]},
+    {"name": "02_Manager", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_MANAGER_TOKEN", "mode": "REPLACE"},
+      {"name": "X-Role", "value": "manager", "mode": "REPLACE"}]},
+    {"name": "03_Auditor", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_AUDITOR_TOKEN", "mode": "REPLACE"}]},
+    {"name": "04_Support", "enabled": true, "headers": [
+      {"name": "Cookie", "value": "session=REPLACE_WITH_SUPPORT_SESSION", "mode": "REPLACE"},
+      {"name": "Authorization", "value": "[REMOVE]", "mode": "REMOVE"}]},
+    {"name": "05_UserA_TenantA", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_USER_A_TOKEN", "mode": "REPLACE"},
+      {"name": "X-Tenant-ID", "value": "tenant-a", "mode": "REPLACE"}]},
+    {"name": "06_UserB_TenantA", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_USER_B_TOKEN", "mode": "REPLACE"},
+      {"name": "X-Tenant-ID", "value": "tenant-a", "mode": "REPLACE"}]},
+    {"name": "07_UserC_TenantB", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_USER_C_TOKEN", "mode": "REPLACE"},
+      {"name": "X-Tenant-ID", "value": "tenant-b", "mode": "REPLACE"}]},
+    {"name": "08_TenantSwap", "enabled": true, "headers": [
+      {"name": "X-Tenant-ID", "value": "tenant-b", "mode": "REPLACE"}]},
+    {"name": "09_ExpiredToken", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "Bearer REPLACE_WITH_EXPIRED_TOKEN", "mode": "REPLACE"}]},
+    {"name": "10_Guest", "enabled": true, "headers": [
+      {"name": "Authorization", "value": "[REMOVE]", "mode": "REMOVE"},
+      {"name": "Cookie", "value": "[REMOVE]", "mode": "REMOVE"},
+      {"name": "X-Role", "value": "[REMOVE]", "mode": "REMOVE"},
+      {"name": "X-Tenant-ID", "value": "[REMOVE]", "mode": "REMOVE"}]}
+  ]
+}
+
