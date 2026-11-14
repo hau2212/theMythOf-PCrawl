@@ -2663,7 +2663,34 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.send_executor = Executors.newFixedThreadPool(self.config["threads"])
 
         callbacks.registerExtensionStateListener(self)
-        SwingUtilities.invokeLater(_Task(self._init_ui, self.log))
+        # Build UI synchronously to avoid race condition where getUiComponent() is called before _build_ui() completes
+        try:
+            callbacks.printOutput("[theMythOfCrawl] Starting UI initialization...")
+            self._build_ui()
+            callbacks.printOutput("[theMythOfCrawl] UI built successfully, adding tab to Burp...")
+            callbacks.addSuiteTab(self)
+            callbacks.printOutput("[theMythOfCrawl] Tab added successfully.")
+            callbacks.registerHttpListener(self)
+            callbacks.registerContextMenuFactory(self)
+            self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+            SwingUtilities.invokeLater(_Task(self._refresh_feature_views, self.log))
+            SwingUtilities.invokeLater(_Task(self.update_status, self.log))
+        except Throwable as t:
+            tb = u_text(traceback.format_exc())
+            err_msg = "Error building UI (Java): %s\n%s" % (u_text(t), tb)
+            callbacks.printError("[theMythOfCrawl] " + err_msg)
+            if self.main_panel is None:
+                self.main_panel = JPanel(BorderLayout())
+            self.main_panel.add(JScrollPane(JTextArea(err_msg)), BorderLayout.CENTER)
+            callbacks.addSuiteTab(self)
+        except Exception as e:
+            tb = u_text(traceback.format_exc())
+            err_msg = "Error building UI: %s" % tb
+            callbacks.printError("[theMythOfCrawl] " + err_msg)
+            if self.main_panel is None:
+                self.main_panel = JPanel(BorderLayout())
+            self.main_panel.add(JScrollPane(JTextArea(err_msg)), BorderLayout.CENTER)
+            callbacks.addSuiteTab(self)
 
         if regex_err:
             self.log("Stored API regex is invalid: %s" % u_text(regex_err))
@@ -2674,68 +2701,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         area.setEditable(False)
         panel.add(JScrollPane(area), BorderLayout.CENTER)
         return panel
-
-    def _init_ui(self):
-        if self._unloaded:
-            return
-        try:
-            self.callbacks.printOutput("%s: initializing UI on Swing EDT..." % EXT_NAME)
-        except (Throwable, Exception):
-            pass
-
-        ui_panel = None
-        try:
-            callbacks.printOutput("[theMythOfCrawl] Starting UI initialization...")
-            self._build_ui()
-            ui_panel = self.main_panel
-        except Throwable as t:
-            tb = u_text(traceback.format_exc())
-            msg = "Error building UI (Java): %s\n%s" % (u_text(t), tb)
-            try:
-                self.callbacks.printError(msg)
-            except (Throwable, Exception):
-                pass
-            ui_panel = self._build_error_fallback_panel(msg)
-        except Exception:
-            tb = u_text(traceback.format_exc())
-            msg = "Error building UI:\n%s" % tb
-            try:
-                self.callbacks.printError(msg)
-            except (Throwable, Exception):
-                pass
-            ui_panel = self._build_error_fallback_panel(msg)
-
-        if ui_panel is None:
-            ui_panel = self._build_error_fallback_panel("Error building UI: main_panel was None.")
-        self.main_panel = ui_panel
-
-        try:
-            self.callbacks.addSuiteTab(self)
-            self.callbacks.printOutput("%s: tab '%s' registered." % (EXT_NAME, EXT_NAME))
-        except Throwable as t:
-            self.callbacks.printError("Error calling addSuiteTab (Java): %s\n%s" % (
-                u_text(t), u_text(traceback.format_exc())))
-        except Exception:
-            self.callbacks.printError("Error calling addSuiteTab:\n%s" % u_text(traceback.format_exc()))
-
-        try:
-            self.callbacks.registerHttpListener(self)
-            self.callbacks.registerContextMenuFactory(self)
-        except Throwable as t:
-            self.callbacks.printError("Error registering listeners (Java): %s\n%s" % (
-                u_text(t), u_text(traceback.format_exc())))
-        except Exception:
-            self.callbacks.printError("Error registering listeners:\n%s" % u_text(traceback.format_exc()))
-
-        self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
-        try:
-            self._refresh_feature_views()
-            self.update_status()
-        except (Throwable, Exception):
-            try:
-                self.callbacks.printError("Error refreshing initial views:\n%s" % u_text(traceback.format_exc()))
-            except (Throwable, Exception):
-                pass
 
     def extensionUnloaded(self):
         self._unloaded = True
