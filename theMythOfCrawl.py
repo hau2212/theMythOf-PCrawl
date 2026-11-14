@@ -98,9 +98,9 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.2.0"
+EXT_VERSION = "1.3.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
-SETTINGS_KEY_CONFIG = "tmoc.config.v1"
+SETTINGS_KEY_CONFIG = "tmoc.config.v2"
 
 REMOVE_TOKEN = "[REMOVE]"
 MODE_REPLACE = "REPLACE"              # overwrite first occurrence (drop duplicates) or add if missing
@@ -109,6 +109,11 @@ MODE_REMOVE = "REMOVE"                # strip every occurrence of the header
 MODE_COOKIE_SET = "COOKIE_SET"        # set/replace a single cookie key=value inside Cookie header
 MODE_COOKIE_REMOVE = "COOKIE_REMOVE"  # remove a single cookie key from Cookie header
 HEADER_MODES = [MODE_REPLACE, MODE_ADD, MODE_REMOVE, MODE_COOKIE_SET, MODE_COOKIE_REMOVE]
+
+# Grouping / View Modes (Default: Per-API Grouping, switchable to Hierarchical Tree)
+GROUP_MODE_PER_API = "PER_API"
+GROUP_MODE_HIERARCHY = "HIERARCHY"
+DEFAULT_HIERARCHY_PATH = 'Toppage > menu > button "Search"'
 
 # Audit / Color Highlighting Levels
 AUDIT_NONE = "NONE"          # Not replayed yet
@@ -125,13 +130,14 @@ AUDIT_FILTER_OPTIONS = [
     ("Cam WARN: Nghi vấn Bypass (Guest 2xx)", AUDIT_WARN),
     ("Đỏ ERROR: Có lỗi 5xx / Mất kết nối", AUDIT_ERROR),
     ("Xanh OK: Tất cả Role 2xx", AUDIT_OK),
-    ("Chưa Replay (Pending)", AUDIT_NONE),
+    ("Chưa Gửi / Chưa Replay (Pending)", AUDIT_NONE),
 ]
 
 DEFAULT_STATIC_EXT = ("js,mjs,css,map,png,jpg,jpeg,gif,bmp,ico,svg,webp,avif,tif,tiff,"
                       "woff,woff2,ttf,otf,eot,mp3,mp4,m4a,webm,wav,ogg,avi,mov,flv,swf")
 DEFAULT_API_REGEX = r"(?i)(/api/|/v[0-9]+(/|$)|/graphql|/rest/|/rpc/|/services?/|\.json$)"
 
+# Strict manual-by-default: neither auto_send nor auto_repeater is active unless user explicitly allows
 DEFAULT_CONFIG = {
     "capture_enabled": False,
     "in_scope_only": True,
@@ -143,7 +149,7 @@ DEFAULT_CONFIG = {
     "dedup": True,
     "dedup_normalize_ids": False,
     "dedup_per_feature": False,
-    "auto_repeater": True,
+    "auto_repeater": False,
     "auto_send": False,
     "number_roles_in_tab": True,
     "include_feature_in_tab": False,
@@ -152,6 +158,7 @@ DEFAULT_CONFIG = {
     "short_path_len": 40,
 }
 
+STATE_ORIGIN = "GỐC (Proxy)"
 STATE_NOT_SENT = "Not sent"
 STATE_QUEUED = "Queued"
 STATE_SENDING = "Sending"
@@ -430,6 +437,103 @@ def format_api_label(gid):
     return "API %d" % gid
 
 
+def split_hierarchy_path(path_text):
+    """
+    Split a hierarchical group path like 'Toppage > menu > button "Search"' into
+    clean non-empty hierarchy segments: ['Toppage', 'menu', 'button "Search"'].
+    """
+    raw = u_text(path_text or "").strip()
+    if not raw:
+        return ["Toppage"]
+    parts = [p.strip() for p in raw.split(">") if p.strip()]
+    return parts if parts else [raw]
+
+
+def normalize_hierarchy_path(parts_or_text):
+    """Return canonical 'Level1 > Level2 > Level3' string."""
+    if isinstance(parts_or_text, (list, tuple)):
+        parts = [u_text(p).strip() for p in parts_or_text if u_text(p).strip()]
+    else:
+        parts = split_hierarchy_path(parts_or_text)
+    return " > ".join(parts) if parts else "Toppage"
+
+
+def hierarchy_matches_prefix(group_path, prefix_path):
+    """
+    True if group_path is inside prefix_path in the hierarchy tree.
+    Example:
+      group_path  = 'Toppage > menu > button "Search"'
+      prefix_path = 'Toppage'               -> True
+      prefix_path = 'Toppage > menu'        -> True
+      prefix_path = 'Toppage > menu > button "Search"' -> True
+      prefix_path = 'Settings'              -> False
+    """
+    if not prefix_path:
+        return True
+    g_parts = [p.lower() for p in split_hierarchy_path(group_path)]
+    p_parts = [p.lower() for p in split_hierarchy_path(prefix_path)]
+    if len(p_parts) > len(g_parts):
+        return False
+    return g_parts[:len(p_parts)] == p_parts
+
+
+def split_hierarchy_3_boxes(path_text):
+    """Split a hierarchy path into 3 quick UI boxes: (Page, Menu, Action/Button)."""
+    parts = split_hierarchy_path(path_text)
+    p1 = parts[0] if len(parts) >= 1 else "Toppage"
+    p2 = parts[1] if len(parts) >= 2 else ""
+    p3 = " > ".join(parts[2:]) if len(parts) >= 3 else ""
+    return p1, p2, p3
+
+
+def join_hierarchy_3_boxes(p1, p2, p3):
+    """Combine the 3 quick UI boxes (Page, Menu, Action/Button) into a canonical path."""
+    parts = []
+    for seg in (p1, p2, p3):
+        for sub in u_text(seg or "").split(">"):
+            s = sub.strip()
+            if s:
+                parts.append(s)
+    return " > ".join(parts) if parts else "Toppage"
+
+
+def fast_extract_method_and_path(req_bytes):
+    """
+    Ultra-fast extraction of (method, path) from the first line of raw request bytes
+    WITHOUT copying the full request/response array or invoking Java analyzeRequest.
+    """
+    if req_bytes is None:
+        return None, None
+    try:
+        limit = min(len(req_bytes), 512)
+        if isinstance(req_bytes, _BYTES_TYPE):
+            first_chunk = req_bytes[:limit]
+            if not isinstance(first_chunk, str):
+                first_chunk = first_chunk.decode("latin-1", "replace")
+        else:
+            chars = []
+            for i in range(limit):
+                b = req_bytes[i]
+                if b == 13 or b == 10:  # CR or LF
+                    break
+                chars.append(chr(b & 0xFF))
+            first_chunk = "".join(chars)
+        line = first_chunk.split("\r", 1)[0].split("\n", 1)[0]
+        parts = line.split(" ")
+        if len(parts) >= 2:
+            method = parts[0].strip().upper()
+            target = parts[1].strip()
+            if target.startswith("http://") or target.startswith("https://"):
+                idx = target.find("/", target.find("://") + 3)
+                path = target[idx:] if idx >= 0 else "/"
+            else:
+                path = target or "/"
+            return method, path
+    except Exception:
+        pass
+    return None, None
+
+
 def format_feature_label(fid, name):
     clean = u_text(name).strip()
     if not clean or clean == ("%d" % fid):
@@ -486,47 +590,70 @@ def evaluate_role_result(group, res):
       - AUDIT_OK (Green OK)     : Role call succeeded (2xx) with normal body length
       - AUDIT_REDIRECT (Blue)   : Role call returned 3xx redirect
       - AUDIT_NONE              : Not replayed yet
-    Returns (audit_level, badge_text).
+    Returns (audit_level, badge_text) and caches on res for O(1) table rendering.
     """
     if res is None:
         return AUDIT_NONE, "-"
+    if getattr(res, "is_original", False):
+        if res.status is None:
+            lvl, badge = AUDIT_NONE, "API GỐC (Chưa có Response)"
+        elif 200 <= int(res.status) < 300:
+            lvl, badge = AUDIT_OK, "API GỐC (Acc Crawl: %d)" % int(res.status)
+        elif 300 <= int(res.status) < 400:
+            lvl, badge = AUDIT_REDIRECT, "API GỐC (Redirect: %d)" % int(res.status)
+        else:
+            lvl, badge = AUDIT_INFO, "API GỐC (Status: %d)" % int(res.status)
+        res._audit_level = lvl
+        res._audit_badge = badge
+        return lvl, badge
     if res.state == STATE_ERROR:
         err_msg = u_text(res.error or "Timeout / Connection Error")
         if len(err_msg) > 34:
             err_msg = err_msg[:31] + "..."
-        return AUDIT_INFO, "INFO: Lỗi gọi API (%s)" % err_msg
+        lvl, badge = AUDIT_INFO, "INFO: Lỗi gọi API (%s)" % err_msg
+        res._audit_level = lvl
+        res._audit_badge = badge
+        return lvl, badge
     if res.status is None:
-        return AUDIT_NONE, u_text(res.state)
+        lvl, badge = AUDIT_NONE, u_text(res.state)
+        res._audit_level = lvl
+        res._audit_badge = badge
+        return lvl, badge
     code = int(res.status)
     if code == 401:
-        return AUDIT_INFO, "INFO: Chưa xác thực (401)"
-    if code == 403:
-        return AUDIT_INFO, "INFO: Không đủ quyền (403)"
-    if 400 <= code < 500:
-        return AUDIT_INFO, "INFO: Role gọi lỗi (%d)" % code
-    if code >= 500:
-        return AUDIT_INFO, "INFO: Lỗi Server (%d)" % code
-    if 300 <= code < 400:
-        return AUDIT_REDIRECT, "INFO: Chuyển hướng (%d)" % code
-    if 200 <= code < 300:
-        # Check if Guest/stripped-auth role got 2xx while another role in the same group was denied (401/403)
+        lvl, badge = AUDIT_INFO, "INFO: Chưa xác thực (401)"
+    elif code == 403:
+        lvl, badge = AUDIT_INFO, "INFO: Không đủ quyền (403)"
+    elif 400 <= code < 500:
+        lvl, badge = AUDIT_INFO, "INFO: Role gọi lỗi (%d)" % code
+    elif code >= 500:
+        lvl, badge = AUDIT_INFO, "INFO: Lỗi Server (%d)" % code
+    elif 300 <= code < 400:
+        lvl, badge = AUDIT_REDIRECT, "INFO: Chuyển hướng (%d)" % code
+    elif 200 <= code < 300:
         results = getattr(group, "results", []) if group is not None else []
         any_denied = any(r.status in (401, 403) for r in results if r is not res and r.status is not None)
         if getattr(res, "is_stripped_auth", False) and any_denied:
-            return AUDIT_WARN, "WARN: Guest trả về %d!" % code
-        base_len = None
-        if results:
-            for r in results:
-                if r.status is not None and 200 <= r.status < 300 and r.length is not None:
-                    base_len = r.length
-                    break
-        if base_len is None and group is not None:
-            base_len = getattr(group, "orig_length", None)
-        if base_len is not None and res.length is not None and res.length != base_len:
-            delta = res.length - base_len
-            return AUDIT_INFO, "INFO: 2xx lệch Body (%+dB)" % delta
-        return AUDIT_OK, "OK: Thành công (%d)" % code
-    return AUDIT_INFO, "INFO: Status %d" % code
+            lvl, badge = AUDIT_WARN, "WARN: Guest trả về %d!" % code
+        else:
+            base_len = None
+            if results:
+                for r in results:
+                    if r.status is not None and 200 <= r.status < 300 and r.length is not None:
+                        base_len = r.length
+                        break
+            if base_len is None and group is not None:
+                base_len = getattr(group, "orig_length", None)
+            if base_len is not None and res.length is not None and res.length != base_len:
+                delta = res.length - base_len
+                lvl, badge = AUDIT_INFO, "INFO: 2xx lệch Body (%+dB)" % delta
+            else:
+                lvl, badge = AUDIT_OK, "OK: Thành công (%d)" % code
+    else:
+        lvl, badge = AUDIT_INFO, "INFO: Status %d" % code
+    res._audit_level = lvl
+    res._audit_badge = badge
+    return lvl, badge
 
 
 def evaluate_group_audit(group):
@@ -534,15 +661,18 @@ def evaluate_group_audit(group):
     Evaluate all role results of an API Group to determine its row highlight color and summary:
       - If ANY role in the API failed (401/403/4xx/5xx/STATE_ERROR) or roles differ in status/length
         -> returns (AUDIT_INFO, "INFO: ...") for Yellow Info highlighting.
-      - If a stripped-auth / Guest role got 2xx while another role got 401/403 -> also notes "[Guest 2xx!]".
       - If all replayed roles succeeded with 2xx -> returns (AUDIT_OK, "OK: ...").
-      - If not replayed yet -> returns (AUDIT_NONE, "Chưa Replay").
+      - If not replayed yet -> returns (AUDIT_NONE, "Chưa Gửi (1 Gốc + N Role)").
+    Caches on group._audit_level / group._audit_summary for O(1) Swing table rendering.
     """
     if group is None or not getattr(group, "results", None):
         return AUDIT_NONE, "Chưa có Role"
     done = [r for r in group.results if r.status is not None or r.state == STATE_ERROR]
     if not done:
-        return AUDIT_NONE, "Chưa Replay (%d role)" % len(group.results)
+        lvl, summary = AUDIT_NONE, "Chưa Gửi (1 Gốc + %d Role)" % len(group.results)
+        group._audit_level = lvl
+        group._audit_summary = summary
+        return lvl, summary
     ok_list = [r for r in done if r.status is not None and 200 <= r.status < 300]
     err_list = [r for r in done if r.state == STATE_ERROR or (r.status is not None and r.status >= 400)]
     redir_list = [r for r in done if r.status is not None and 300 <= r.status < 400]
@@ -555,31 +685,38 @@ def evaluate_group_audit(group):
                 codes.append(c_label)
         codes_str = ",".join(codes[:4])
         if ok_list:
-            return AUDIT_INFO, "INFO: %d OK / %d Lỗi (%s)" % (len(ok_list), len(err_list), codes_str)
-        return AUDIT_INFO, "INFO: Cả %d Role lỗi (%s)" % (len(err_list), codes_str)
-
-    if ok_list:
+            lvl, summary = AUDIT_INFO, "INFO: %d OK / %d Lỗi (%s)" % (len(ok_list), len(err_list), codes_str)
+        else:
+            lvl, summary = AUDIT_INFO, "INFO: Cả %d Role lỗi (%s)" % (len(err_list), codes_str)
+    elif ok_list:
         lengths = set([r.length for r in ok_list if r.length is not None])
         if redir_list:
-            return AUDIT_INFO, "INFO: %d OK / %d Redirect (3xx)" % (len(ok_list), len(redir_list))
-        if len(lengths) > 1:
-            return AUDIT_INFO, "INFO: Cả %d Role 2xx (Lệch Body)" % len(ok_list)
-        return AUDIT_OK, "OK: Cả %d Role 2xx" % len(ok_list)
+            lvl, summary = AUDIT_INFO, "INFO: %d OK / %d Redirect (3xx)" % (len(ok_list), len(redir_list))
+        elif len(lengths) > 1:
+            lvl, summary = AUDIT_INFO, "INFO: Cả %d Role 2xx (Lệch Body)" % len(ok_list)
+        else:
+            lvl, summary = AUDIT_OK, "OK: Cả %d Role 2xx" % len(ok_list)
+    elif redir_list:
+        lvl, summary = AUDIT_REDIRECT, "INFO: %d Role Redirect (3xx)" % len(redir_list)
+    else:
+        lvl, summary = AUDIT_NONE, "Đang xử lý"
 
-    if redir_list:
-        return AUDIT_REDIRECT, "INFO: %d Role Redirect (3xx)" % len(redir_list)
-    return AUDIT_NONE, "Đang xử lý"
+    group._audit_level = lvl
+    group._audit_summary = summary
+    return lvl, summary
 
 
 def evaluate_feature_audit(feature_groups):
-    """Summarize the audit status across all API groups belonging to a Feature."""
+    """Summarize the audit status across all API groups belonging to a Feature/Hierarchy node."""
     f_groups = list(feature_groups or [])
     if not f_groups:
         return AUDIT_NONE, "-"
     info_count = 0
     ok_count = 0
     for g in f_groups:
-        lvl, _ = evaluate_group_audit(g)
+        lvl = getattr(g, "_audit_level", None)
+        if lvl is None:
+            lvl, _ = evaluate_group_audit(g)
         if lvl in (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR):
             info_count += 1
         elif lvl == AUDIT_OK:
@@ -588,7 +725,7 @@ def evaluate_feature_audit(feature_groups):
         return AUDIT_INFO, "INFO: %d/%d API có Role lỗi/lệch" % (info_count, len(f_groups))
     if ok_count > 0:
         return AUDIT_OK, "OK: %d/%d API 2xx" % (ok_count, len(f_groups))
-    return AUDIT_NONE, "Chưa Replay"
+    return AUDIT_NONE, "Chưa Gửi (%d API)" % len(f_groups)
 
 
 def compile_api_regex(pattern):
@@ -910,32 +1047,40 @@ def ui_call(fn):
 
 
 class FeatureGroup(object):
-    """Represents a user-named feature / button click batch (e.g. Tên 1, Tên 2)."""
+    """Represents a user-named feature / hierarchical action path (e.g. Toppage > menu > button "Search")."""
 
     def __init__(self, fid, name="", created=None):
         self.fid = fid
         clean = u_text(name).strip()
         self.name = clean if clean else ("Chức năng %d" % fid)
         self.created = created or time.strftime("%H:%M:%S")
+        self._audit_level = None
+        self._audit_summary = None
+
+    def hierarchy_parts(self):
+        return split_hierarchy_path(self.name)
 
     def label(self):
         return format_feature_label(self.fid, self.name)
 
 
 class RoleResult(object):
-    def __init__(self, role_name, role_index, request_bytes, is_stripped_auth=False):
+    def __init__(self, role_name, role_index, request_bytes, is_stripped_auth=False, is_original=False):
         self.role_name = u_text(role_name)
         self.role_index = role_index
         self.request = request_bytes
         self.is_stripped_auth = bool(is_stripped_auth)
+        self.is_original = bool(is_original)
         self.response = None
         self.status = None
         self.length = None
         self.elapsed_ms = None
-        self.state = STATE_NOT_SENT
+        self.state = STATE_ORIGIN if is_original else STATE_NOT_SENT
         self.error = ""
         self.sent_count = 0
         self.tab_name = ""
+        self._audit_level = None
+        self._audit_badge = None
 
 
 class ApiGroup(object):
@@ -957,7 +1102,39 @@ class ApiGroup(object):
         self.orig_length = None
         self.source = u_text(source)
         self.created = time.strftime("%H:%M:%S")
+        self.orig_result = RoleResult(
+            "[API GỐC] 00_Original (Acc Crawl)", -1, orig_request,
+            is_stripped_auth=False, is_original=True
+        )
+        self.orig_result.response = orig_response
+        self.orig_result.state = STATE_ORIGIN if orig_response is not None else STATE_NOT_SENT
+        self.orig_result.tab_name = repeater_tab_name(gid, method, path, "00_Original_Crawl")
         self.results = []
+        self._audit_level = None
+        self._audit_summary = None
+
+    def sync_original_meta(self, short_path_len=40, include_feature=False):
+        self.orig_result.request = self.orig_request
+        self.orig_result.response = self.orig_response
+        self.orig_result.status = self.orig_status
+        self.orig_result.length = self.orig_length
+        self.orig_result.state = STATE_ORIGIN if self.orig_response is not None else STATE_NOT_SENT
+        self.orig_result.tab_name = repeater_tab_name(
+            self.gid, self.method, self.path, "00_Original_Crawl",
+            short_path_len, self.fid, include_feature
+        )
+        evaluate_role_result(self, self.orig_result)
+
+    def all_entries(self):
+        """Return [1 API gốc] + [N API roles thêm]."""
+        return [self.orig_result] + list(self.results)
+
+    def recalc_audit(self):
+        """Pre-compute and cache audit status for O(1) Swing table rendering."""
+        evaluate_role_result(self, self.orig_result)
+        for r in self.results:
+            evaluate_role_result(self, r)
+        return evaluate_group_audit(self)
 
     def use_https(self):
         return (self.protocol or "").lower() == "https"
@@ -1202,25 +1379,29 @@ class FeatureTableModel(AbstractTableModel):
 
 
 class GroupTableModel(AbstractTableModel):
-    COLS = ["API #", "Group", "Chức năng", "Đánh giá / Màu (Info)", "Method", "Host", "Path",
-            "Orig", "Orig Len", "Roles", "Replayed", "Source", "Time"]
+    COLS = ["API #", "Group", "Group Path (Click đúp để chọn/đổi)", "Đánh giá / Màu (Info)", "Method", "Host", "Path",
+            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time"]
 
-    def __init__(self):
+    def __init__(self, ext=None):
+        self._ext = ext
         self._all_rows = []
         self._rows = []
         self._filter_fid = None
+        self._filter_prefix = None
         self._filter_audit = AUDIT_FILTER_ALL
 
     def _matches(self, g):
         if self._filter_fid is not None and g.fid != self._filter_fid:
             return False
+        if self._filter_prefix and not hierarchy_matches_prefix(g.feature_name, self._filter_prefix):
+            return False
         if self._filter_audit and self._filter_audit != AUDIT_FILTER_ALL:
-            lvl, _ = evaluate_group_audit(g)
+            lvl = g._audit_level if g._audit_level is not None else evaluate_group_audit(g)[0]
             if self._filter_audit == AUDIT_ERROR:
                 return any(r.state == STATE_ERROR or (r.status is not None and r.status >= 500)
                            for r in g.results)
             if self._filter_audit == AUDIT_WARN:
-                return any(evaluate_role_result(g, r)[0] == AUDIT_WARN for r in g.results)
+                return any((r._audit_level or evaluate_role_result(g, r)[0]) == AUDIT_WARN for r in g.results)
             if lvl != self._filter_audit:
                 return False
         return True
@@ -1230,8 +1411,18 @@ class GroupTableModel(AbstractTableModel):
 
     def set_feature_filter(self, fid):
         self._filter_fid = fid
+        self._filter_prefix = None
         self._rebuild_view()
         self.fireTableDataChanged()
+
+    def set_hierarchy_filter(self, prefix_path):
+        self._filter_fid = None
+        self._filter_prefix = u_text(prefix_path).strip() if prefix_path else None
+        self._rebuild_view()
+        self.fireTableDataChanged()
+
+    def hierarchy_filter(self):
+        return self._filter_prefix
 
     def feature_filter(self):
         return self._filter_fid
@@ -1245,8 +1436,27 @@ class GroupTableModel(AbstractTableModel):
         g = self.group_at(r)
         if g is None:
             return AUDIT_NONE
+        if g._audit_level is not None:
+            return g._audit_level
         lvl, _ = evaluate_group_audit(g)
         return lvl
+
+    def isCellEditable(self, r, c):
+        # Allow per-API Group Path selection directly on Column 2
+        return c == 2 and 0 <= r < len(self._rows)
+
+    def setValueAt(self, value, r, c):
+        if c != 2 or not (0 <= r < len(self._rows)):
+            return
+        g = self._rows[r]
+        raw = u_text(value or "").strip()
+        if not raw:
+            return
+        m = re.match(r"^(?:T[êe]n\s*\d+\s*[:\-]\s*)(.+)$", raw, re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+        if self._ext is not None:
+            self._ext.assign_group_to_path(g, raw)
 
     def add(self, group):
         self._all_rows.append(group)
@@ -1277,12 +1487,19 @@ class GroupTableModel(AbstractTableModel):
     def groups_for_feature(self, fid):
         return [g for g in self._all_rows if g.fid == fid]
 
+    def groups_for_hierarchy_prefix(self, prefix_path):
+        if not prefix_path:
+            return list(self._all_rows)
+        return [g for g in self._all_rows if hierarchy_matches_prefix(g.feature_name, prefix_path)]
+
     def refresh_group(self, group):
-        self._rebuild_view()
         for i, g in enumerate(self._rows):
             if g is group:
-                self.fireTableRowsUpdated(i, i)
-                return
+                if self._matches(group):
+                    self.fireTableRowsUpdated(i, i)
+                    return
+                break
+        self._rebuild_view()
         self.fireTableDataChanged()
 
     def getRowCount(self):
@@ -1295,7 +1512,7 @@ class GroupTableModel(AbstractTableModel):
         return self.COLS[c]
 
     def getColumnClass(self, c):
-        if c in (7, 8, 9):
+        if c in (7, 8):
             return Integer
         return String
 
@@ -1306,8 +1523,10 @@ class GroupTableModel(AbstractTableModel):
         if c == 1:
             return format_group_id(g.gid)
         if c == 2:
-            return format_feature_label(g.fid, g.feature_name)
+            return g.feature_name
         if c == 3:
+            if g._audit_summary is not None:
+                return g._audit_summary
             _, summary = evaluate_group_audit(g)
             return summary
         if c == 4:
@@ -1323,7 +1542,7 @@ class GroupTableModel(AbstractTableModel):
         if c == 8:
             return None if g.orig_length is None else Integer(g.orig_length)
         if c == 9:
-            return Integer(len(g.results))
+            return "1 Gốc + %d Role" % len(g.results)
         if c == 10:
             done = len([x for x in g.results if x.state in (STATE_DONE, STATE_ERROR)])
             return "%d/%d" % (done, len(g.results))
@@ -1335,7 +1554,12 @@ class GroupTableModel(AbstractTableModel):
 
 
 class ResultTableModel(AbstractTableModel):
-    COLS = ["#", "Role", "Đánh giá Role (Màu)", "State", "Status", "Body Len",
+    """
+    Displays:
+      Row 0     : [API GỐC] 00_Original (Acc Crawl) - original Proxy request/response
+      Rows 1..N : Cloned Role requests (01_Admin .. N_Role)
+    """
+    COLS = ["#", "Loại / Role", "Đánh giá Role (Màu)", "State", "Status", "Body Len",
             "Delta vs Orig", "Time (ms)", "Sends", "Repeater Tab / Error"]
 
     def __init__(self):
@@ -1348,20 +1572,30 @@ class ResultTableModel(AbstractTableModel):
     def group(self):
         return self._group
 
+    def _entries(self):
+        if self._group is None:
+            return []
+        if getattr(self._group, "orig_result", None) is not None:
+            return [self._group.orig_result] + list(self._group.results)
+        return list(self._group.results)
+
     def result_at(self, r):
-        if self._group is not None and 0 <= r < len(self._group.results):
-            return self._group.results[r]
+        entries = self._entries()
+        if 0 <= r < len(entries):
+            return entries[r]
         return None
 
     def audit_level_at(self, r):
         res = self.result_at(r)
         if res is None:
             return AUDIT_NONE
+        if res._audit_level is not None:
+            return res._audit_level
         lvl, _ = evaluate_role_result(self._group, res)
         return lvl
 
     def getRowCount(self):
-        return len(self._group.results) if self._group is not None else 0
+        return len(self._entries())
 
     def getColumnCount(self):
         return len(self.COLS)
@@ -1370,18 +1604,21 @@ class ResultTableModel(AbstractTableModel):
         return self.COLS[c]
 
     def getColumnClass(self, c):
-        if c in (0, 4, 5, 6, 7, 8):
+        if c in (4, 5, 6, 7, 8):
             return Integer
         return String
 
     def getValueAt(self, r, c):
         g = self._group
-        res = g.results[r]
+        entries = self._entries()
+        res = entries[r]
         if c == 0:
-            return Integer(r + 1)
+            return "GỐC" if getattr(res, "is_original", False) else ("Role %d" % r)
         if c == 1:
             return res.role_name
         if c == 2:
+            if res._audit_badge is not None:
+                return res._audit_badge
             _, badge = evaluate_role_result(g, res)
             return badge
         if c == 3:
@@ -1391,6 +1628,8 @@ class ResultTableModel(AbstractTableModel):
         if c == 5:
             return None if res.length is None else Integer(res.length)
         if c == 6:
+            if getattr(res, "is_original", False):
+                return Integer(0) if res.length is not None else None
             if res.length is None or g.orig_length is None:
                 return None
             return Integer(res.length - g.orig_length)
@@ -1938,29 +2177,39 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._next_gid = 1
         self._next_fid = 2
         self._active_fid = 1
-        self._features = [FeatureGroup(1, "Chức năng 1")]
+        self._features = [FeatureGroup(1, DEFAULT_HIERARCHY_PATH)]
         self._seen_keys = set()
+        self._skipped_count = 0
+        self._last_skip_reason = ""
         self._unloaded = False
         self._api_regex = None
         self._static_exts = set()
+        self._ui_dirty = False
+        self._last_ui_flush = 0.0
+        self._active_sends = 0
         self.log_area = None
         self.main_panel = None
         self.status_label = None
         self.feature_model = None
         self.group_model = None
         self.result_model = None
+        self.left_hierarchy_tree = None
+        self.left_hierarchy_tree_model = None
         self.history_tree = None
         self.history_tree_model = None
         self.history_summary_area = None
         self.inline_role_editor = None
+        self.group_path_editor_combo = None
         self._updating_feature_bar = False
 
         self.config = merge_config(self._load_json_setting(SETTINGS_KEY_CONFIG, {}))
         regex_err = self._recompile_filters(self.config)
         try:
             stored_roles = self._load_json_setting(SETTINGS_KEY_ROLES, None)
-            if isinstance(stored_roles, list):
+            if isinstance(stored_roles, list) and len(stored_roles) > 0:
                 self.roles.set_all([normalize_role(r, i) for i, r in enumerate(stored_roles)])
+            else:
+                self.roles.set_all(default_role_templates())
         except Exception as e:
             callbacks.printError("Could not load stored roles: %s" % e)
 
@@ -2048,7 +2297,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         with self._state_lock:
             fid = self._next_fid
             self._next_fid += 1
-            clean = ("%s" % (name or "")).strip() or ("Chức năng %d" % fid)
+            raw = u_text(name or "").strip()
+            clean = normalize_hierarchy_path(raw) if ">" in raw else (raw or ("Chức năng %d" % fid))
             feat = FeatureGroup(fid, clean)
             self._features.append(feat)
             self._active_fid = fid
@@ -2058,8 +2308,33 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.update_status()
         return feat
 
+    def find_or_create_feature_by_path(self, path_text, make_active=False):
+        raw = u_text(path_text or "").strip()
+        clean = normalize_hierarchy_path(raw) if ">" in raw else (raw or DEFAULT_HIERARCHY_PATH)
+        with self._state_lock:
+            for f in self._features:
+                if f.name.lower() == clean.lower():
+                    if make_active:
+                        self._active_fid = f.fid
+                    return f
+            fid = self._next_fid
+            self._next_fid += 1
+            feat = FeatureGroup(fid, clean)
+            self._features.append(feat)
+            if make_active:
+                self._active_fid = fid
+        return feat
+
+    def assign_group_to_path(self, group, new_path):
+        """Assign an individual API group to a specific Group Path (e.g. Toppage > menu > button)."""
+        if group is None:
+            return
+        feat = self.find_or_create_feature_by_path(new_path, make_active=False)
+        self.move_groups_to_feature([group], feat.fid)
+
     def rename_feature(self, fid, new_name):
-        clean = ("%s" % (new_name or "")).strip() or ("Chức năng %d" % fid)
+        raw = u_text(new_name or "").strip()
+        clean = normalize_hierarchy_path(raw) if ">" in raw else (raw or ("Chức năng %d" % fid))
         with self._state_lock:
             feat = None
             for f in self._features:
@@ -2098,6 +2373,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for g in groups:
             g.fid = feat.fid
             g.feature_name = feat.name
+            g.sync_original_meta(cfg["short_path_len"], cfg["include_feature_in_tab"])
             for r in g.results:
                 r.tab_name = repeater_tab_name(g.gid, g.method, g.path, r.role_name,
                                                cfg["short_path_len"], g.fid, cfg["include_feature_in_tab"])
@@ -2106,6 +2382,43 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.group_model.fireTableDataChanged()
         self._refresh_feature_views()
         self.update_status()
+
+    def groups_for_hierarchy_prefix(self, prefix_path, groups_override=None):
+        """
+        Return all captured API groups whose hierarchy path starts with prefix_path.
+        Example: prefix_path='Toppage' returns all APIs in 'Toppage', 'Toppage > menu',
+        'Toppage > menu > button "Search"', etc.
+        """
+        if groups_override is not None:
+            source_groups = list(groups_override)
+        elif self.group_model is not None:
+            source_groups = self.group_model.all_groups()
+        else:
+            source_groups = []
+        if not prefix_path:
+            return source_groups
+        return [g for g in source_groups if hierarchy_matches_prefix(g.feature_name, prefix_path)]
+
+    def replay_hierarchy_prefix(self, prefix_path, groups_override=None, include_original=False):
+        """
+        Manually send all APIs inside a hierarchical group prefix (e.g. 'Toppage' or 'Toppage > menu').
+        Returns the list of API groups that were queued for sending.
+        """
+        matched = self.groups_for_hierarchy_prefix(prefix_path, groups_override=groups_override)
+        for g in matched:
+            targets = ([g.orig_result] + list(g.results)) if include_original else list(g.results)
+            self.replay(g, targets)
+        if matched:
+            self.log("Manual Send Hierarchy '%s': queued %d API group(s)." % (u_text(prefix_path), len(matched)))
+        return matched
+
+    def send_hierarchy_prefix_to_repeater(self, prefix_path, groups_override=None, include_original=False):
+        """Send all APIs inside a hierarchical group prefix to Burp Repeater."""
+        matched = self.groups_for_hierarchy_prefix(prefix_path, groups_override=groups_override)
+        for g in matched:
+            targets = ([g.orig_result] + list(g.results)) if include_original else list(g.results)
+            self.send_to_repeater(g, targets)
+        return matched
 
     # -------------------------------------------------------------- settings
     def _load_json_setting(self, key, default):
@@ -2153,16 +2466,35 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     # ---------------------------------------------------------- IHttpListener
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        # Capture on the response: the final (post-intercept) request and the
-        # original response are both available. Only copies bytes here.
+        # Fast lock-free exit on non-Proxy or request phase or when capture is disabled
         if self._unloaded or messageIsRequest or toolFlag != self.callbacks.TOOL_PROXY:
             return
-        if not self.get_config()["capture_enabled"]:
+        cfg = self.config
+        if not cfg.get("capture_enabled"):
             return
         try:
             req = messageInfo.getRequest()
             if req is None:
                 return
+            # Fast zero-allocation pre-check on the first line before copying byte[] arrays!
+            fast_method, fast_path = fast_extract_method_and_path(req)
+            if fast_method and fast_path:
+                if cfg.get("ignore_options_head") and fast_method in ("OPTIONS", "HEAD"):
+                    with self._state_lock:
+                        self._skipped_count += 1
+                        self._last_skip_reason = "method %s ignored" % fast_method
+                    return
+                if cfg.get("ignore_static") and is_static_path(fast_path, self._static_exts):
+                    with self._state_lock:
+                        self._skipped_count += 1
+                        self._last_skip_reason = "static extension"
+                    return
+                rx = self._api_regex
+                if cfg.get("api_regex_enabled") and rx is not None and not rx.search(strip_query(fast_path)):
+                    with self._state_lock:
+                        self._skipped_count += 1
+                        self._last_skip_reason = "API path regex mismatch"
+                    return
             service = messageInfo.getHttpService()
             resp = messageInfo.getResponse()
             req_copy = Arrays.copyOf(req, len(req))
@@ -2197,11 +2529,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             def handler(event):
                 target_fid = cur_feat.fid
                 if prompt_new_feature:
-                    next_num = len(self.features_list()) + 1
                     name = JOptionPane.showInputDialog(
                         self.main_panel,
-                        "Nhập tên cho Chức năng mới (Tên %d):" % next_num,
-                        "Chức năng %d" % next_num)
+                        "Nhập Đường dẫn Group phân cấp (VD: Toppage > menu > button \"Search\"):",
+                        cur_feat.name)
                     if name is None:
                         return
                     feat = self.start_new_feature(name)
@@ -2219,7 +2550,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         items = ArrayList()
         items.add(JMenuItem("%s: Clone to '%s' (%d message(s))" % (EXT_NAME, cur_label, len(snapshot)),
                             actionPerformed=make_handler(False, False)))
-        items.add(JMenuItem("%s: Clone to NEW Feature (Tạo Tên chức năng mới...) (%d message(s))"
+        items.add(JMenuItem("%s: Clone to NEW Group Path (Toppage > menu > button...) (%d message(s))"
                             % (EXT_NAME, len(snapshot)),
                             actionPerformed=make_handler(False, True)))
         items.add(JMenuItem("%s: Clone to '%s' (apply capture filters + dedup)" % (EXT_NAME, cur_label),
@@ -2257,8 +2588,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if apply_filters:
             reason = self._filter_reason(cfg, url, method, path)
             if reason:
+                with self._state_lock:
+                    self._skipped_count += 1
+                    self._last_skip_reason = reason
                 if source == "Manual":
                     self.log("Skipped %s %s (%s)" % (method, url, reason))
+                self.update_status()
                 return
             if cfg["dedup"]:
                 base_key = dedup_key(method, service.getProtocol(), service.getHost(), service.getPort(),
@@ -2266,14 +2601,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 key = ("F%d|%s" % (feat.fid, base_key)) if cfg.get("dedup_per_feature") else base_key
                 with self._state_lock:
                     if key in self._seen_keys:
+                        self._skipped_count += 1
+                        self._last_skip_reason = "dedup"
                         if source == "Manual":
                             self.log("Skipped %s %s (duplicate endpoint)" % (method, url))
+                        self.update_status()
                         return
                     self._seen_keys.add(key)
 
         roles = self.roles.enabled()
         if not roles:
+            with self._state_lock:
+                self._skipped_count += 1
+                self._last_skip_reason = "0 roles"
             self.log("No enabled roles - skipped %s %s" % (method, url))
+            self.update_status()
             return
 
         with self._state_lock:
@@ -2289,10 +2631,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 group.orig_length = len(resp) - rinfo.getBodyOffset()
             except Throwable:
                 pass
+        group.sync_original_meta(cfg["short_path_len"], cfg.get("include_feature_in_tab", False))
         group.results = self._clone_for_roles(group, info, roles, cfg)
+        group.recalc_audit()
 
         ui_call(lambda: self._add_group_ui(group))
-        self.log("%s (%s) [%s]: %s %s -> %d role clone(s) [%s]" %
+        self.log("%s (%s) [%s]: %s %s -> 1 API gốc + %d role clone(s) [%s]" %
                  (format_api_label(gid), format_group_id(gid),
                   format_feature_label(feat.fid, feat.name),
                   method, url, len(group.results), source))
@@ -2318,6 +2662,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             res.tab_name = repeater_tab_name(group.gid, group.method, group.path, display,
                                              cfg["short_path_len"], group.fid,
                                              cfg.get("include_feature_in_tab", False))
+            evaluate_role_result(group, res)
             results.append(res)
         return results
 
@@ -2328,18 +2673,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             if not roles:
                 self.log("No enabled roles - cannot rebuild %s" % format_group_id(group.gid))
                 return
+            cfg = self.get_config()
             info = self.helpers.analyzeRequest(group.service, group.orig_request)
-            new_results = self._clone_for_roles(group, info, roles, self.get_config())
+            new_results = self._clone_for_roles(group, info, roles, cfg)
 
             def apply():
                 group.results = new_results
+                group.sync_original_meta(cfg["short_path_len"], cfg.get("include_feature_in_tab", False))
+                group.recalc_audit()
                 self.group_model.refresh_group(group)
                 if self.result_model.group() is group:
                     self.result_model.set_group(group)
                     self._select_first_result()
                 self._refresh_feature_views()
             ui_call(apply)
-            self.log("%s (%s) rebuilt with %d current role(s)." %
+            self.log("%s (%s) rebuilt with 1 API gốc + %d current role(s)." %
                      (format_api_label(group.gid), format_group_id(group.gid), len(new_results)))
         self.capture_executor.execute(_Task(work, self.log))
 
@@ -2363,10 +2711,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def replay(self, group, results):
         """Queue each result for background sending; never blocks the caller."""
         results = list(results)
+        if not results:
+            return
+        with self._state_lock:
+            self._active_sends += len(results)
         for res in results:
             res.state = STATE_QUEUED
             res.error = ""
-        self._notify_results(group, None)
+            evaluate_role_result(group, res)
+        group.recalc_audit()
+        self._notify_results(group, None, finished_send=False)
         for res in results:
             self.send_executor.execute(_Task(
                 (lambda r=res: self._send_one(group, r)), self.log))
@@ -2374,11 +2728,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _send_one(self, group, res):
         if self._unloaded:
             return
-        throttle = self.get_config()["throttle_ms"]
+        throttle = self.config.get("throttle_ms", 0)
         if throttle > 0:
             time.sleep(throttle / 1000.0)
         res.state = STATE_SENDING
-        self._notify_results(group, res)
+        evaluate_role_result(group, res)
         started = time.time()
         try:
             rr = self.callbacks.makeHttpRequest(group.service, res.request)
@@ -2398,6 +2752,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 res.length = len(resp) - rinfo.getBodyOffset()
                 res.state = STATE_DONE
                 res.error = ""
+                if getattr(res, "is_original", False):
+                    group.orig_response = resp
+                    group.orig_status = res.status
+                    group.orig_length = res.length
         except Throwable as t:
             res.elapsed_ms = int((time.time() - started) * 1000)
             res.state = STATE_ERROR
@@ -2406,10 +2764,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             res.elapsed_ms = int((time.time() - started) * 1000)
             res.state = STATE_ERROR
             res.error = "%s" % e
-        self._notify_results(group, res)
+        # Pre-calculate audit on the worker thread so the Swing EDT does 0 heavy work
+        group.recalc_audit()
+        with self._state_lock:
+            self._active_sends = max(0, self._active_sends - 1)
+            all_settled = (self._active_sends == 0)
+        self._notify_results(group, res, finished_send=all_settled)
 
-    def _notify_results(self, group, res):
+    def _notify_results(self, group, res, finished_send=False):
+        # Coalesce rapid background updates (~100ms window) so 200 concurrent role
+        # responses never flood the Swing Event Dispatch Thread.
+        now = time.time()
+        with self._state_lock:
+            if not finished_send and self._ui_dirty and (now - self._last_ui_flush) < 0.10:
+                return
+            self._ui_dirty = True
+            self._last_ui_flush = now
+
         def refresh():
+            with self._state_lock:
+                self._ui_dirty = False
             if self.group_model is None:
                 return
             self.group_model.refresh_group(group)
@@ -2419,18 +2793,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 if 0 <= sel_feat < self.feature_model.getRowCount():
                     self.feature_table.setRowSelectionInterval(sel_feat, sel_feat)
             if self.result_model.group() is group:
-                if res is None:
-                    self.result_model.fireTableRowsUpdated(0, max(len(group.results) - 1, 0))
-                else:
-                    for i, r in enumerate(group.results):
-                        if r is res:
-                            self.result_model.fireTableRowsUpdated(i, i)
-                            break
+                self.result_model.fireTableDataChanged()
                 _, sel = self.current_selection()
                 if sel is not None and (res is None or sel is res):
                     self._show_result(sel)
-            if self.history_summary_area is not None:
-                self._refresh_history_summary_only()
+            if finished_send:
+                self._refresh_feature_views()
             self.update_status()
         ui_call(refresh)
 
@@ -2449,47 +2817,61 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.main_panel = JPanel(BorderLayout())
         cfg = self.get_config()
 
-        # ---- top control bar (capture toggles + Active Feature switcher + Color Legend)
+        # ---- top control bar (capture toggles + Active Hierarchy Path + Color Legend)
         top_container = JPanel(BorderLayout())
-        bar1 = JPanel(FlowLayout(FlowLayout.LEFT, 8, 3))
+        bar1 = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
         self.cb_capture = JCheckBox("Capture Proxy traffic", cfg["capture_enabled"],
                                     actionPerformed=self._on_settings_changed)
-        self.cb_auto_repeater = JCheckBox("Auto-send new groups to Repeater", cfg["auto_repeater"],
-                                          actionPerformed=self._on_settings_changed)
-        self.cb_auto_send = JCheckBox("Auto-Send to Server & Record", cfg["auto_send"],
+        self.cb_auto_send = JCheckBox("Cho phép Tự động Gửi ngầm (Mặc định: TẮT)", cfg["auto_send"],
                                       actionPerformed=self._on_settings_changed)
+        self.cb_auto_repeater = JCheckBox("Tự động đẩy Repeater (Mặc định: TẮT)", cfg["auto_repeater"],
+                                          actionPerformed=self._on_settings_changed)
+        self.cb_top_scope = JCheckBox("In-Scope Only", cfg["in_scope_only"],
+                                      actionPerformed=self._on_top_filter_toggled)
+        self.cb_top_regex = JCheckBox("API Path Regex", cfg["api_regex_enabled"],
+                                      actionPerformed=self._on_top_filter_toggled)
         self.status_label = JLabel("")
-        for comp in (self.cb_capture, self.cb_auto_repeater, self.cb_auto_send):
+        for comp in (self.cb_capture, self.cb_auto_send, self.cb_auto_repeater,
+                     self.cb_top_scope, self.cb_top_regex):
             bar1.add(comp)
-        bar1.add(Box.createHorizontalStrut(12))
+        bar1.add(Box.createHorizontalStrut(8))
         bar1.add(self.status_label)
 
-        bar2 = JPanel(FlowLayout(FlowLayout.LEFT, 6, 3))
+        bar2 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
         bar2.setBorder(BorderFactory.createTitledBorder(
-            "Bộ gom Chức năng (Feature / Button Action Batching) & Chú thích Màu Audit"))
-        self.lbl_active_feature = JLabel("Đang bắt vào Tên 1:")
-        self.lbl_active_feature.setFont(Font("Dialog", Font.BOLD, 12))
-        self.tf_feature_name = JTextField(self.active_feature().name, 18,
+            "Đường dẫn Group phân cấp khi Crawl (VD: Toppage > menu > button \"Search\") & Chú thích Màu Audit"))
+        p1, p2, p3 = split_hierarchy_3_boxes(self.active_feature().name)
+        self.lbl_active_feature = JLabel("Đang bắt vào:")
+        self.lbl_active_feature.setFont(Font("Dialog", Font.BOLD, 11))
+        self.tf_hier_page = JTextField(p1, 9, actionPerformed=self._on_apply_3_boxes_hierarchy)
+        self.tf_hier_menu = JTextField(p2, 9, actionPerformed=self._on_apply_3_boxes_hierarchy)
+        self.tf_hier_btn = JTextField(p3, 12, actionPerformed=self._on_apply_3_boxes_hierarchy)
+        self.tf_feature_name = JTextField(self.active_feature().name, 22,
                                           actionPerformed=self._on_apply_active_feature_name)
-        btn_rename_feat = JButton("Cập nhật Tên", actionPerformed=self._on_apply_active_feature_name)
-        btn_next_feat = JButton("+ Qua Chức Năng Mới (Nút tiếp theo -> Tên mới)",
-                                actionPerformed=self._on_next_feature)
+        btn_apply_boxes = JButton("Gộp 3 ô -> Path", actionPerformed=self._on_apply_3_boxes_hierarchy)
+        btn_rename_feat = JButton("Cập nhật Path", actionPerformed=self._on_apply_active_feature_name)
+        btn_next_feat = JButton("+ Nút / Action Mới...", actionPerformed=self._on_next_feature)
         self.lbl_feature_counter = JLabel("")
         bar2.add(self.lbl_active_feature)
+        bar2.add(JLabel("Page:"))
+        bar2.add(self.tf_hier_page)
+        bar2.add(JLabel("> Menu:"))
+        bar2.add(self.tf_hier_menu)
+        bar2.add(JLabel("> Button:"))
+        bar2.add(self.tf_hier_btn)
+        bar2.add(btn_apply_boxes)
+        bar2.add(JLabel("| Path:"))
         bar2.add(self.tf_feature_name)
         bar2.add(btn_rename_feat)
         bar2.add(btn_next_feat)
-        bar2.add(Box.createHorizontalStrut(6))
         bar2.add(self.lbl_feature_counter)
-        bar2.add(Box.createHorizontalStrut(12))
-        bar2.add(self._make_color_badge("Vàng INFO: Có Role lỗi / Lệch quyền",
+        bar2.add(Box.createHorizontalStrut(6))
+        bar2.add(self._make_color_badge("Vàng INFO: Role lỗi/Lệch",
                                         AuditTableRenderer.BG_INFO, AuditTableRenderer.FG_INFO))
-        bar2.add(self._make_color_badge("Cam WARN: Nghi vấn Bypass",
+        bar2.add(self._make_color_badge("Cam WARN: Bypass",
                                         AuditTableRenderer.BG_WARN, AuditTableRenderer.FG_WARN))
-        bar2.add(self._make_color_badge("Xanh OK: Cả N Role 2xx",
+        bar2.add(self._make_color_badge("Xanh OK: 2xx",
                                         AuditTableRenderer.BG_OK, AuditTableRenderer.FG_OK))
-        bar2.add(self._make_color_badge("Đỏ ERR: Lỗi 5xx / Mạng",
-                                        AuditTableRenderer.BG_ERR, AuditTableRenderer.FG_ERR))
 
         top_container.add(bar1, BorderLayout.NORTH)
         top_container.add(bar2, BorderLayout.CENTER)
@@ -2497,7 +2879,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         self.tabs = JTabbedPane()
         self.tabs.addTab("API Groups (Master-Detail)", self._build_groups_tab())
-        self.tabs.addTab("History & Features (Lịch sử Chức năng & API)", self._build_history_tab())
+        self.tabs.addTab("History & Features (Cây phân cấp & Báo cáo)", self._build_history_tab())
         self.tabs.addTab("Roles (Profiles)", self._build_roles_tab())
         self.tabs.addTab("Capture Filters & Options", self._build_settings_tab(cfg))
         self.log_area = JTextArea()
@@ -2506,41 +2888,56 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
         self.callbacks.customizeUiComponent(self.main_panel)
 
-    # ---- API Groups tab (Feature table + API Group table + Role results + Viewers)
+    # ---- API Groups tab (Hierarchy Tree / Feature table + Per-API Group table + 1 Orig + N Role results)
     def _build_groups_tab(self):
         panel = JPanel(BorderLayout())
 
-        # Two-row compact toolbar so no buttons are ever cut off on any screen width
+        # Two-row compact toolbar for manual sending (Group / API / Role) & filtering
         actions_container = JPanel(GridLayout(2, 1, 0, 1))
         row1 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-        self.btn_send_group = JButton("Send Entire Group to Repeater", actionPerformed=self._on_send_group)
-        self.btn_send_role = JButton("Send Selected Role to Repeater", actionPerformed=self._on_send_role)
-        self.btn_replay_all = JButton("Replay All Roles to Server", actionPerformed=self._on_replay_all)
-        self.btn_replay_sel = JButton("Replay Selected Role(s)", actionPerformed=self._on_replay_selected)
-        row1.add(self.btn_send_group)
-        row1.add(self.btn_send_role)
+        self.btn_replay_branch = JButton("▶ Gửi Nhánh/Group đang chọn (VD: Toppage)",
+                                         actionPerformed=self._on_replay_selected_hierarchy_or_feature)
+        self.btn_replay_all = JButton("▶ Gửi API đang chọn (N Roles)", actionPerformed=self._on_replay_all)
+        self.btn_replay_sel = JButton("▶ Gửi lại Role đang chọn", actionPerformed=self._on_replay_selected)
+        self.btn_send_group = JButton("Đẩy API -> Repeater", actionPerformed=self._on_send_group)
+        self.btn_send_role = JButton("Đẩy Role -> Repeater", actionPerformed=self._on_send_role)
+        row1.add(self.btn_replay_branch)
         row1.add(self.btn_replay_all)
         row1.add(self.btn_replay_sel)
-        row1.add(JButton("Show Original Req/Resp", actionPerformed=self._on_show_original))
-        row1.add(JButton("Rebuild with Current Roles", actionPerformed=self._on_rebuild))
+        row1.add(self.btn_send_group)
+        row1.add(self.btn_send_role)
+        row1.add(JButton("Xem API Gốc (Crawl Acc)", actionPerformed=self._on_show_original))
+        row1.add(JButton("Rebuild Roles", actionPerformed=self._on_rebuild))
 
         row2 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-        row2.add(JLabel("Lọc màu Audit:"))
+        row2.add(JLabel("Chế độ xem:"))
+        self.cb_group_mode = JComboBox([
+            "Mặc định: Group theo từng API (Chọn Group riêng cho từng API)",
+            "Lọc theo Nhánh phân cấp đang chọn (Toppage > menu > button)"
+        ])
+        self.cb_group_mode.addActionListener(self._on_group_mode_changed)
+        row2.add(self.cb_group_mode)
+        row2.add(JLabel("| Lọc màu:"))
         self.cb_audit_filter = JComboBox([label for label, _ in AUDIT_FILTER_OPTIONS])
         self.cb_audit_filter.addActionListener(self._on_audit_filter_changed)
         row2.add(self.cb_audit_filter)
-        row2.add(Box.createHorizontalStrut(6))
-        row2.add(JButton("Chuyển API -> Chức năng...", actionPerformed=self._on_move_groups_feature))
-        row2.add(JButton("Export Matrix JSON...", actionPerformed=self._on_export_matrix))
-        row2.add(JButton("Delete Group(s)", actionPerformed=self._on_delete_groups))
+        row2.add(JButton("Đổi Group cho API đang chọn...", actionPerformed=self._on_move_groups_feature))
+        row2.add(JButton("Export JSON...", actionPerformed=self._on_export_matrix))
+        row2.add(JButton("Xóa API", actionPerformed=self._on_delete_groups))
         row2.add(JButton("Clear All", actionPerformed=self._on_clear_groups))
-        row2.add(JButton("Reset Dedup Cache", actionPerformed=self._on_reset_dedup))
+        row2.add(JButton("Reset Dedup", actionPerformed=self._on_reset_dedup))
 
         actions_container.add(row1)
         actions_container.add(row2)
         panel.add(actions_container, BorderLayout.NORTH)
 
-        # Left side of top master area: Feature (Chức năng) selector & batch actions
+        # Left side of top master area: Nested Hierarchy Tree (Toppage > menu > button "Search") + Feature Table
+        left_root = DefaultMutableTreeNode("Tất cả API (Mặc định: Group theo từng API)")
+        self.left_hierarchy_tree_model = DefaultTreeModel(left_root)
+        self.left_hierarchy_tree = JTree(self.left_hierarchy_tree_model)
+        self.left_hierarchy_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
+        self.left_hierarchy_tree.addTreeSelectionListener(_TreeListener(self._on_left_hierarchy_tree_selected))
+
         self.feature_model = FeatureTableModel(self)
         self.feature_table = JTable(self.feature_model)
         self.feature_table.setRowHeight(22)
@@ -2553,44 +2950,53 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             column.setPreferredWidth(width)
             column.setCellRenderer(feat_renderer)
 
+        left_tabs = JTabbedPane()
+        left_tabs.addTab("Cây Group (Toppage > menu > button)", JScrollPane(self.left_hierarchy_tree))
+        left_tabs.addTab("Bảng Group / Chức năng", JScrollPane(self.feature_table))
+        self.left_group_tabs = left_tabs
+
         feat_panel = JPanel(BorderLayout(2, 2))
         feat_panel.setBorder(BorderFactory.createTitledBorder(
-            "Danh sách Chức năng (Click lọc API | Double-click cột Tên để sửa)"))
-        feat_panel.add(JScrollPane(self.feature_table), BorderLayout.CENTER)
+            "Cây phân cấp Group (Toppage > menu > button) - Bấm Gửi ở Group cha sẽ gửi toàn bộ bên trong"))
+        feat_panel.add(left_tabs, BorderLayout.CENTER)
         feat_btns = JPanel(GridLayout(2, 3, 3, 3))
-        feat_btns.add(JButton("+ Chức năng mới", actionPerformed=self._on_next_feature))
-        feat_btns.add(JButton("Đặt đang bắt", actionPerformed=self._on_set_selected_feature_active))
-        feat_btns.add(JButton("Đổi tên...", actionPerformed=self._on_rename_selected_feature))
-        feat_btns.add(JButton("Gửi -> Repeater", actionPerformed=self._on_send_feature_repeater))
-        feat_btns.add(JButton("Replay Chức năng", actionPerformed=self._on_replay_feature))
-        feat_btns.add(JButton("Xem tất cả API", actionPerformed=self._on_show_all_features))
+        feat_btns.add(JButton("▶ Gửi Nhánh đang chọn", actionPerformed=self._on_replay_selected_hierarchy_or_feature))
+        feat_btns.add(JButton("Đẩy Nhánh -> Repeater", actionPerformed=self._on_send_selected_hierarchy_repeater))
+        feat_btns.add(JButton("Xem tất cả theo từng API", actionPerformed=self._on_show_all_features))
+        feat_btns.add(JButton("+ Nút / Action mới", actionPerformed=self._on_next_feature))
+        feat_btns.add(JButton("Đặt làm Nhánh đang bắt", actionPerformed=self._on_set_selected_feature_active))
+        feat_btns.add(JButton("Đổi tên Nhánh...", actionPerformed=self._on_rename_selected_feature))
         feat_panel.add(feat_btns, BorderLayout.SOUTH)
 
-        # Right side of top master area: Sequentially numbered API Groups table
-        self.group_model = GroupTableModel()
+        # Right side of top master area: Sequentially numbered API Groups table (Per-API Group editable on col 2)
+        self.group_model = GroupTableModel(self)
         self.group_table = JTable(self.group_model)
+        self.group_table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE)
         self.group_table.setRowHeight(22)
         self.group_table.setAutoCreateRowSorter(True)
         self.group_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.group_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_group_selected))
-        self.group_table.addMouseListener(_DoubleClick(lambda: self._on_send_group(None)))
         grp_renderer = AuditTableRenderer(self.group_model, status_col=7, audit_col=3)
-        for col, width in ((0, 58), (1, 48), (2, 135), (3, 195), (4, 58), (5, 140),
-                           (6, 260), (7, 52), (8, 65), (9, 50), (10, 62), (11, 55), (12, 62)):
+        for col, width in ((0, 55), (1, 46), (2, 210), (3, 185), (4, 55), (5, 130),
+                           (6, 235), (7, 48), (8, 62), (9, 95), (10, 58), (11, 52), (12, 60)):
             column = self.group_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(grp_renderer)
+        self.group_path_editor_combo = JComboBox([DEFAULT_HIERARCHY_PATH])
+        self.group_path_editor_combo.setEditable(True)
+        self.group_table.getColumnModel().getColumn(2).setCellEditor(
+            DefaultCellEditor(self.group_path_editor_combo))
 
         group_panel = JPanel(BorderLayout())
         group_panel.setBorder(BorderFactory.createTitledBorder(
-            "Danh sách API đã đi qua (API 1, API 2... | Tô màu Vàng INFO khi có bất kỳ Role nào gọi lỗi / lệch quyền)"))
+            "Danh sách API (Mặc định: Group theo từng API | Click đúp cột 'Group Path' để chọn Group riêng cho từng API)"))
         group_panel.add(JScrollPane(self.group_table), BorderLayout.CENTER)
 
         top_master_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, feat_panel, group_panel)
-        top_master_split.setResizeWeight(0.30)
+        top_master_split.setResizeWeight(0.32)
 
-        # Bottom detail area: Role results table + Request/Response viewers
+        # Bottom detail area: 1 API Gốc + N Role results table + Request/Response viewers
         self.result_model = ResultTableModel()
         self.result_table = JTable(self.result_model)
         self.result_table.setRowHeight(22)
@@ -2600,25 +3006,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             _SelectionListener(self._on_result_selected))
         self.result_table.addMouseListener(_DoubleClick(lambda: self._on_send_role(None)))
         res_renderer = AuditTableRenderer(self.result_model, status_col=4, audit_col=2)
-        for col, width in ((0, 35), (1, 145), (2, 210), (3, 70), (4, 55), (5, 75),
-                           (6, 85), (7, 70), (8, 50), (9, 360)):
+        for col, width in ((0, 52), (1, 185), (2, 210), (3, 80), (4, 55), (5, 75),
+                           (6, 85), (7, 70), (8, 50), (9, 340)):
             column = self.result_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(res_renderer)
 
         res_panel = JPanel(BorderLayout())
         res_panel.setBorder(BorderFactory.createTitledBorder(
-            "Kết quả chi tiết từng Role trên API đang chọn (Màu Vàng INFO = Role bị chặn 401/403/4xx/5xx hoặc lệch Body)"))
+            "Bên trong API đang chọn: 1 API GỐC (Acc Crawl chính) + N API Roles thêm (Mặc định chờ gửi thủ công)"))
         res_panel.add(JScrollPane(self.result_table), BorderLayout.CENTER)
 
         controller = _EditorController(self)
         self.req_viewer = self.callbacks.createMessageEditor(controller, False)
         self.resp_viewer = self.callbacks.createMessageEditor(controller, False)
         req_panel = JPanel(BorderLayout())
-        req_panel.add(JLabel(" Role Request"), BorderLayout.NORTH)
+        req_panel.add(JLabel(" Request (API Gốc / Role đang chọn)"), BorderLayout.NORTH)
         req_panel.add(self.req_viewer.getComponent(), BorderLayout.CENTER)
         resp_panel = JPanel(BorderLayout())
-        resp_panel.add(JLabel(" Role Response"), BorderLayout.NORTH)
+        resp_panel.add(JLabel(" Response (API Gốc / Role đang chọn)"), BorderLayout.NORTH)
         resp_panel.add(self.resp_viewer.getComponent(), BorderLayout.CENTER)
         viewers = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, req_panel, resp_panel)
         viewers.setResizeWeight(0.5)
@@ -2626,7 +3032,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         detail_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, res_panel, viewers)
         detail_split.setResizeWeight(0.38)
         master_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, top_master_split, detail_split)
-        master_split.setResizeWeight(0.40)
+        master_split.setResizeWeight(0.42)
         panel.add(master_split, BorderLayout.CENTER)
         return panel
 
@@ -2831,7 +3237,18 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "short_path_len": int(self.sp_pathlen.getValue()),
         }
 
+    def _on_top_filter_toggled(self, event):
+        if getattr(self, "cb_scope", None) is not None and getattr(self, "cb_top_scope", None) is not None:
+            self.cb_scope.setSelected(self.cb_top_scope.isSelected())
+        if getattr(self, "cb_regex", None) is not None and getattr(self, "cb_top_regex", None) is not None:
+            self.cb_regex.setSelected(self.cb_top_regex.isSelected())
+        self._on_settings_changed(event)
+
     def _on_settings_changed(self, event):
+        if getattr(self, "cb_top_scope", None) is not None and getattr(self, "cb_scope", None) is not None:
+            self.cb_top_scope.setSelected(self.cb_scope.isSelected())
+        if getattr(self, "cb_top_regex", None) is not None and getattr(self, "cb_regex", None) is not None:
+            self.cb_top_regex.setSelected(self.cb_regex.isSelected())
         err = self.apply_config(self._collect_settings())
         if err and self.cb_regex.isSelected():
             self.regex_error.setText("Invalid regex - API filter inactive: %s" % err)
@@ -2851,6 +3268,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.cb_dedup_feature.setSelected(d["dedup_per_feature"])
         self.cb_number.setSelected(d["number_roles_in_tab"])
         self.cb_feat_tab.setSelected(d["include_feature_in_tab"])
+        self.cb_auto_send.setSelected(d["auto_send"])
+        self.cb_auto_repeater.setSelected(d["auto_repeater"])
         self.sp_threads.setValue(Integer(d["threads"]))
         self.sp_throttle.setValue(Integer(d["throttle_ms"]))
         self.sp_pathlen.setValue(Integer(d["short_path_len"]))
@@ -2863,26 +3282,35 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             cfg = self.get_config()
             with self._state_lock:
                 seen = len(self._seen_keys)
+                skipped = self._skipped_count
+                skip_reason = self._last_skip_reason
             all_groups = self.group_model.all_groups() if getattr(self, "group_model", None) is not None else []
-            info_apis = len([g for g in all_groups if evaluate_group_audit(g)[0] == AUDIT_INFO])
+            info_apis = len([g for g in all_groups if getattr(g, "_audit_level", None) == AUDIT_INFO])
             feats = self.features_list()
             act = self.active_feature()
+            skip_str = ("  |  Bỏ qua: %d (%s)" % (skipped, skip_reason)) if skipped > 0 else ""
+            mode_str = "AUTO-SEND" if cfg.get("auto_send") else "THỦ CÔNG (Manual)"
             self.status_label.setText(
-                "Capture: %s  |  Roles: %d/%d  |  Chức năng: %d  |  Tổng API: %d (Vàng INFO: %d)  |  Dedup: %d"
-                % ("ON" if cfg["capture_enabled"] else "OFF", self.roles.enabled_count(),
-                   self.roles.count(), len(feats), len(all_groups), info_apis, seen))
+                "Capture: %s (%s)  |  Roles: %d/%d  |  Nhánh: %d  |  Tổng API: %d (Vàng INFO: %d)  |  Dedup: %d%s"
+                % ("ON" if cfg["capture_enabled"] else "OFF", mode_str, self.roles.enabled_count(),
+                   self.roles.count(), len(feats), len(all_groups), info_apis, seen, skip_str))
             if getattr(self, "lbl_active_feature", None) is not None:
-                self.lbl_active_feature.setText("Đang bắt vào Tên %d:" % act.fid)
+                self.lbl_active_feature.setText("Đang bắt vào [#%d]:" % act.fid)
                 if not self.tf_feature_name.hasFocus():
                     self.tf_feature_name.setText(act.name)
+                p1, p2, p3 = split_hierarchy_3_boxes(act.name)
+                if getattr(self, "tf_hier_page", None) is not None and not self.tf_hier_page.hasFocus():
+                    self.tf_hier_page.setText(p1)
+                if getattr(self, "tf_hier_menu", None) is not None and not self.tf_hier_menu.hasFocus():
+                    self.tf_hier_menu.setText(p2)
+                if getattr(self, "tf_hier_btn", None) is not None and not self.tf_hier_btn.hasFocus():
+                    self.tf_hier_btn.setText(p3)
                 act_count = len([x for x in all_groups if x.fid == act.fid])
-                self.lbl_feature_counter.setText(
-                    "(%d chức năng | %s: %d API)"
-                    % (len(feats), format_feature_label(act.fid, act.name), act_count))
+                self.lbl_feature_counter.setText("(%d API trong nhánh này)" % act_count)
             n = self.roles.enabled_count()
             g, _ = self.current_selection()
             count = len(g.results) if g is not None else n
-            self.btn_replay_all.setText("Replay All %d Roles to Server" % count)
+            self.btn_replay_all.setText("▶ Gửi API đang chọn (%d Roles)" % count)
         ui_call(refresh)
 
     # ---------------------------------------- feature & history view helpers
@@ -2893,6 +3321,111 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.history_summary_area.setText(text)
         self.history_summary_area.setCaretPosition(0)
 
+    def _build_nested_hierarchy_root(self, feats, all_groups, root_label):
+        """
+        Build a nested DefaultMutableTreeNode hierarchy where paths like
+        'Toppage > menu > button "Search"' expand as:
+          📁 Group: Toppage
+            └── 📁 Group: menu
+                  └── 📁 Group: button "Search"
+                        └── 🌐 API 1 [G01]: POST /api/search (1 Gốc + N Roles)
+                              ├── 📌 [API GỐC] 00_Original (Acc Crawl)
+                              ├── 👤 01_Admin
+                              └── ...
+        """
+        root = DefaultMutableTreeNode(_TreeNodeItem("ROOT", "", root_label))
+        folder_nodes = {}  # prefix -> DefaultMutableTreeNode
+        ordered_paths = []
+        seen_paths = set()
+        for f in feats:
+            np = normalize_hierarchy_path(f.name)
+            if np not in seen_paths:
+                seen_paths.add(np)
+                ordered_paths.append(np)
+        for g in all_groups:
+            np = normalize_hierarchy_path(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH)
+            if np not in seen_paths:
+                seen_paths.add(np)
+                ordered_paths.append(np)
+
+        def ensure_folder_chain(full_path):
+            parts = split_hierarchy_path(full_path)
+            parent_node = root
+            for idx in range(len(parts)):
+                prefix = " > ".join(parts[:idx + 1])
+                seg_name = parts[idx]
+                node = folder_nodes.get(prefix)
+                if node is None:
+                    matching_groups = [
+                        g for g in all_groups
+                        if hierarchy_matches_prefix(getattr(g, "feature_name", ""), prefix)
+                    ]
+                    _, folder_audit = evaluate_feature_audit(matching_groups)
+                    label = "Group \"%s\"  (%d API | %s)" % (seg_name, len(matching_groups), folder_audit)
+                    node = DefaultMutableTreeNode(_TreeNodeItem("FOLDER", prefix, label))
+                    folder_nodes[prefix] = node
+                    parent_node.add(node)
+                parent_node = node
+            return parent_node
+
+        for path_str in ordered_paths:
+            ensure_folder_chain(path_str)
+
+        for g in all_groups:
+            leaf_folder = ensure_folder_chain(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH)
+            g_audit = getattr(g, "_audit_summary", None) or evaluate_group_audit(g)[1]
+            g_node = DefaultMutableTreeNode(_TreeNodeItem(
+                "GROUP", g,
+                "%s [%s]: %s %s (1 API Gốc + %d Roles) -> [%s]"
+                % (format_api_label(g.gid), format_group_id(g.gid), g.method, g.path,
+                   len(g.results), g_audit)
+            ))
+            # 1 API gốc first
+            if getattr(g, "orig_result", None) is not None:
+                or_res = g.orig_result
+                or_badge = getattr(or_res, "_audit_badge", None) or evaluate_role_result(g, or_res)[1]
+                orig_node = DefaultMutableTreeNode(_TreeNodeItem(
+                    "ORIG", (g, or_res),
+                    "%s -> [%s] | Status: %s | Len: %s"
+                    % (or_res.role_name, or_badge,
+                       or_res.status if or_res.status is not None else "-",
+                       or_res.length if or_res.length is not None else "-")
+                ))
+                g_node.add(orig_node)
+            # N API roles thêm
+            for r in g.results:
+                r_badge = getattr(r, "_audit_badge", None) or evaluate_role_result(g, r)[1]
+                r_node = DefaultMutableTreeNode(_TreeNodeItem(
+                    "ROLE", (g, r),
+                    "%s -> [%s] | Status: %s | Len: %s | Tab: %s"
+                    % (r.role_name,
+                       r_badge,
+                       r.status if r.status is not None else r.state,
+                       r.length if r.length is not None else "-",
+                       r.tab_name)
+                ))
+                g_node.add(r_node)
+            leaf_folder.add(g_node)
+        return root, ordered_paths
+
+    @staticmethod
+    def _expand_folder_nodes_only(tree, expand_groups=False):
+        """
+        Expand only FOLDER (and optionally GROUP when small) nodes so JTree never lags
+        with O(N^2) row expansions when hundreds of APIs are captured.
+        """
+        i = 0
+        max_rows = 220
+        while i < tree.getRowCount() and i < max_rows:
+            path = tree.getPathForRow(i)
+            if path is not None:
+                node = path.getLastPathComponent()
+                obj = node.getUserObject() if isinstance(node, DefaultMutableTreeNode) else None
+                kind = getattr(obj, "kind", None)
+                if kind in ("ROOT", "FOLDER") or (expand_groups and kind == "GROUP"):
+                    tree.expandRow(i)
+            i += 1
+
     def _refresh_feature_views(self):
         def refresh():
             if self.feature_model is not None:
@@ -2902,50 +3435,46 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     self.feature_table.setRowSelectionInterval(sel_row, sel_row)
                 elif self.feature_model.getRowCount() > 0:
                     self.feature_table.setRowSelectionInterval(0, 0)
-            if self.history_tree_model is not None and self.group_model is not None:
+            if self.group_model is not None:
                 all_groups = self.group_model.all_groups()
                 feats = self.features_list()
-                root = DefaultMutableTreeNode(
-                    "Tổng cộng: %d Chức năng | %d API đã đi qua" % (len(feats), len(all_groups)))
-                for f in feats:
-                    f_groups = [g for g in all_groups if g.fid == f.fid]
-                    _, f_audit = evaluate_feature_audit(f_groups)
-                    f_node = DefaultMutableTreeNode(_TreeNodeItem(
-                        "FEATURE", f,
-                        "%s  (%d API | %s)" % (format_feature_label(f.fid, f.name), len(f_groups), f_audit)
-                    ))
-                    for g in f_groups:
-                        _, g_audit = evaluate_group_audit(g)
-                        g_node = DefaultMutableTreeNode(_TreeNodeItem(
-                            "GROUP", g,
-                            "%s [%s]: %s %s (Orig: %s) -> [%s]"
-                            % (format_api_label(g.gid), format_group_id(g.gid), g.method, g.path,
-                               g.orig_status if g.orig_status is not None else "-", g_audit)
-                        ))
-                        for r in g.results:
-                            _, r_badge = evaluate_role_result(g, r)
-                            r_node = DefaultMutableTreeNode(_TreeNodeItem(
-                                "ROLE", (g, r),
-                                "%s -> [%s] | Status: %s | Len: %s | Tab: %s"
-                                % (r.role_name,
-                                   r_badge,
-                                   r.status if r.status is not None else r.state,
-                                   r.length if r.length is not None else "-",
-                                   r.tab_name)
-                            ))
-                            g_node.add(r_node)
-                        f_node.add(g_node)
-                    root.add(f_node)
-                self.history_tree_model.setRoot(root)
-                self.history_tree_model.reload()
-                for i in range(self.history_tree.getRowCount()):
-                    self.history_tree.expandRow(i)
+                expand_api_nodes = (len(all_groups) <= 10)
+                if getattr(self, "left_hierarchy_tree_model", None) is not None:
+                    left_root, ordered_paths = self._build_nested_hierarchy_root(
+                        feats, all_groups,
+                        "Tất cả Group & API (%d Nhánh | %d API)" % (len(feats), len(all_groups))
+                    )
+                    self.left_hierarchy_tree_model.setRoot(left_root)
+                    self.left_hierarchy_tree_model.reload()
+                    self._expand_folder_nodes_only(self.left_hierarchy_tree, expand_groups=expand_api_nodes)
+                    if getattr(self, "group_path_editor_combo", None) is not None:
+                        self.group_path_editor_combo.removeAllItems()
+                        for p in ordered_paths:
+                            self.group_path_editor_combo.addItem(p)
+                if getattr(self, "history_tree_model", None) is not None:
+                    hist_root, _ = self._build_nested_hierarchy_root(
+                        feats, all_groups,
+                        "Tổng cộng: %d Nhánh Chức năng | %d API đã đi qua" % (len(feats), len(all_groups))
+                    )
+                    self.history_tree_model.setRoot(hist_root)
+                    self.history_tree_model.reload()
+                    self._expand_folder_nodes_only(self.history_tree, expand_groups=expand_api_nodes)
             self._refresh_history_summary_only()
         ui_call(refresh)
 
+    def _on_apply_3_boxes_hierarchy(self, event):
+        p1 = u_text(self.tf_hier_page.getText()) if getattr(self, "tf_hier_page", None) else ""
+        p2 = u_text(self.tf_hier_menu.getText()) if getattr(self, "tf_hier_menu", None) else ""
+        p3 = u_text(self.tf_hier_btn.getText()) if getattr(self, "tf_hier_btn", None) else ""
+        combined = join_hierarchy_3_boxes(p1, p2, p3)
+        if getattr(self, "tf_feature_name", None) is not None:
+            self.tf_feature_name.setText(combined)
+        act = self.active_feature()
+        self.rename_feature(act.fid, combined)
+
     def _on_apply_active_feature_name(self, event):
         act = self.active_feature()
-        new_name = u_text(self.tf_feature_name.getText()).strip()
+        new_name = normalize_hierarchy_path(self.tf_feature_name.getText())
         if new_name:
             self.rename_feature(act.fid, new_name)
 
@@ -2953,17 +3482,33 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # Save any pending name change on current active feature first if user edited the text box
         cur = self.active_feature()
         typed = u_text(self.tf_feature_name.getText()).strip() if getattr(self, "tf_feature_name", None) else ""
-        if typed and typed != cur.name:
-            self.rename_feature(cur.fid, typed)
+        if typed and normalize_hierarchy_path(typed) != cur.name:
+            self.rename_feature(cur.fid, normalize_hierarchy_path(typed))
+        p1, p2, _ = split_hierarchy_3_boxes(self.active_feature().name)
         next_num = len(self.features_list()) + 1
+        default_next = join_hierarchy_3_boxes(p1 or "Toppage", p2 or "menu", "button_%d" % next_num)
         name = JOptionPane.showInputDialog(
             self.main_panel,
-            "Nhập tên cho Chức năng tiếp theo (Tên %d):\n"
-            "(Các API xuất hiện khi bạn bấm nút tiếp theo trên web sẽ tự động gom vào đây)" % next_num,
-            "Chức năng %d" % next_num)
+            "Nhập đường dẫn phân cấp Group cho hành động/nút bấm tiếp theo (ngăn cách bằng dấu '>'):\n"
+            "Ví dụ: Toppage > menu > button \"Search\"\n"
+            "(Các API xuất hiện khi bạn bấm nút tiếp theo trên trình duyệt sẽ gom vào nhánh này)",
+            default_next)
         if name is None:
             return
-        self.start_new_feature(u_text(name))
+        self.start_new_feature(normalize_hierarchy_path(name))
+
+    def _on_group_mode_changed(self, event):
+        if self.group_model is None or getattr(self, "cb_group_mode", None) is None:
+            return
+        idx = self.cb_group_mode.getSelectedIndex()
+        if idx == 0:
+            # Default: Per-API Grouping (show all APIs, each with its own selectable Group Path)
+            self.group_model.set_feature_filter(None)
+            self.group_model.set_hierarchy_filter(None)
+        else:
+            # Filter by currently selected hierarchy branch
+            prefix = self._selected_hierarchy_prefix()
+            self.group_model.set_hierarchy_filter(prefix)
 
     def _on_audit_filter_changed(self, event):
         if self.group_model is None or getattr(self, "cb_audit_filter", None) is None:
@@ -2978,13 +3523,140 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._show_result(None)
 
     def _on_show_all_features(self, event):
+        if getattr(self, "cb_group_mode", None) is not None:
+            self.cb_group_mode.setSelectedIndex(0)
         if self.feature_table is not None and self.feature_model.getRowCount() > 0:
             self.feature_table.setRowSelectionInterval(0, 0)
         if getattr(self, "cb_audit_filter", None) is not None:
             self.cb_audit_filter.setSelectedIndex(0)
         if self.group_model is not None:
             self.group_model.set_feature_filter(None)
+            self.group_model.set_hierarchy_filter(None)
             self.group_model.set_audit_filter(AUDIT_FILTER_ALL)
+        if getattr(self, "btn_replay_branch", None) is not None:
+            self.btn_replay_branch.setText("▶ Gửi Nhánh/Group đang chọn (VD: Toppage)")
+
+    def _selected_left_tree_payload(self):
+        if getattr(self, "left_hierarchy_tree", None) is None:
+            return None, None
+        path = self.left_hierarchy_tree.getSelectionPath()
+        if path is None:
+            return None, None
+        node = path.getLastPathComponent()
+        obj = node.getUserObject() if isinstance(node, DefaultMutableTreeNode) else None
+        if isinstance(obj, _TreeNodeItem):
+            return obj.kind, obj.payload
+        return None, None
+
+    def _selected_hierarchy_prefix(self):
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "FOLDER":
+            return payload
+        if kind == "GROUP" and payload is not None:
+            return getattr(payload, "feature_name", None)
+        if kind in ("ROLE", "ORIG") and payload is not None:
+            return getattr(payload[0], "feature_name", None)
+        feat = self._selected_feature_from_table()
+        return feat.name if feat is not None else None
+
+    def _on_left_hierarchy_tree_selected(self):
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "ROOT":
+            if getattr(self, "btn_replay_branch", None) is not None:
+                self.btn_replay_branch.setText("▶ Gửi Toàn bộ Group (%d API)" % len(self.group_model.all_groups()))
+            if getattr(self, "cb_group_mode", None) is not None and self.cb_group_mode.getSelectedIndex() == 1:
+                self.group_model.set_hierarchy_filter(None)
+            return
+        if kind == "FOLDER":
+            prefix = payload
+            cnt = len(self.groups_for_hierarchy_prefix(prefix))
+            if getattr(self, "btn_replay_branch", None) is not None:
+                self.btn_replay_branch.setText("▶ Gửi Nhánh \"%s\" (%d API)" % (prefix, cnt))
+            if getattr(self, "cb_group_mode", None) is not None and self.cb_group_mode.getSelectedIndex() == 1:
+                self.group_model.set_hierarchy_filter(prefix)
+            return
+        if kind == "GROUP" and payload is not None:
+            if getattr(self, "btn_replay_branch", None) is not None:
+                self.btn_replay_branch.setText("▶ Gửi API #%d (%d Roles)" % (payload.gid, len(payload.results)))
+            self._select_group_in_table(payload)
+            return
+        if kind in ("ROLE", "ORIG") and payload is not None:
+            g, r = payload
+            self._select_group_in_table(g, target_result=r)
+
+    def _select_group_in_table(self, target_group, target_result=None):
+        if target_group is None or self.group_model is None:
+            return
+        for mr in range(self.group_model.getRowCount()):
+            if self.group_model.group_at(mr) is target_group:
+                vr = self.group_table.convertRowIndexToView(mr)
+                if vr >= 0:
+                    self.group_table.setRowSelectionInterval(vr, vr)
+                break
+        if target_result is not None and self.result_model is not None:
+            for rmr in range(self.result_model.getRowCount()):
+                if self.result_model.result_at(rmr) is target_result:
+                    rvr = self.result_table.convertRowIndexToView(rmr)
+                    if rvr >= 0:
+                        self.result_table.setRowSelectionInterval(rvr, rvr)
+                    break
+
+    def _on_replay_selected_hierarchy_or_feature(self, event):
+        """
+        Manual recursive send:
+        - If a parent/child folder (e.g. 'Toppage' or 'Toppage > menu' or 'Toppage > menu > button \"Search\"')
+          is selected in the Hierarchy Tree, send ALL APIs inside that folder and all its sub-folders!
+        - If an individual API node is selected, send all N roles of that API.
+        - If a single Role node is selected, send that Role.
+        """
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "ROOT":
+            all_g = self.group_model.all_groups()
+            for g in all_g:
+                self.replay(g, g.results)
+            return
+        if kind == "FOLDER" and payload:
+            sent = self.replay_hierarchy_prefix(payload)
+            if not sent:
+                JOptionPane.showMessageDialog(
+                    self.main_panel, "Nhánh '%s' chưa có API nào để gửi." % payload,
+                    EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        if kind == "GROUP" and payload is not None:
+            self.replay(payload, payload.results)
+            return
+        if kind == "ROLE" and payload is not None:
+            g, r = payload
+            self.replay(g, [r])
+            return
+        # Fallback to feature table or active feature prefix
+        feat = self._selected_feature_from_table()
+        if feat is not None:
+            sent = self.replay_hierarchy_prefix(feat.name)
+            if not sent:
+                JOptionPane.showMessageDialog(
+                    self.main_panel, "Nhánh '%s' chưa có API nào để gửi." % feat.name,
+                    EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+
+    def _on_send_selected_hierarchy_repeater(self, event):
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "FOLDER" and payload:
+            sent = self.send_hierarchy_prefix_to_repeater(payload)
+            if not sent:
+                JOptionPane.showMessageDialog(
+                    self.main_panel, "Nhánh '%s' chưa có API nào." % payload,
+                    EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        if kind == "GROUP" and payload is not None:
+            self.send_to_repeater(payload, payload.results)
+            return
+        if kind == "ROLE" and payload is not None:
+            g, r = payload
+            self.send_to_repeater(g, [r])
+            return
+        feat = self._selected_feature_from_table()
+        if feat is not None:
+            self.send_hierarchy_prefix_to_repeater(feat.name)
 
     def _on_feature_filter_selected(self):
         if self.feature_table is None or self.group_model is None:
@@ -2995,63 +3667,61 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         else:
             feat = self.feature_model.feature_at_row(r)
             if feat is not None:
-                self.group_model.set_feature_filter(feat.fid)
-        if self.group_model.getRowCount() > 0:
+                if getattr(self, "btn_replay_branch", None) is not None:
+                    self.btn_replay_branch.setText("▶ Gửi Nhánh \"%s\"" % feat.name)
+                if getattr(self, "cb_group_mode", None) is not None and self.cb_group_mode.getSelectedIndex() == 1:
+                    self.group_model.set_feature_filter(feat.fid)
+                else:
+                    self.group_model.set_feature_filter(None)
+        if self.group_model.getRowCount() > 0 and self.group_table.getSelectedRow() < 0:
             self.group_table.setRowSelectionInterval(0, 0)
-        else:
-            self.result_model.set_group(None)
-            self._show_result(None)
 
     def _selected_feature_from_table(self):
+        if getattr(self, "feature_table", None) is None:
+            return self.active_feature()
         r = self.feature_table.getSelectedRow()
         if r <= 0:
             return self.active_feature()
         return self.feature_model.feature_at_row(r) or self.active_feature()
 
     def _on_set_selected_feature_active(self, event):
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "FOLDER" and payload:
+            feat = self.find_or_create_feature_by_path(payload)
+            self.set_active_feature(feat.fid)
+            self.log("Đặt nhánh '%s' làm nhánh đang bắt API hiện tại." % feat.name)
+            return
         r = self.feature_table.getSelectedRow()
         if r <= 0:
             JOptionPane.showMessageDialog(
-                self.main_panel, "Chọn một dòng Chức năng cụ thể (Tên 1, Tên 2...) trong bảng bên trái.",
+                self.main_panel, "Chọn một nhánh trong Cây phân cấp hoặc trong Bảng Chức năng bên trái.",
                 EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
             return
         feat = self.feature_model.feature_at_row(r)
         if feat is not None:
             self.set_active_feature(feat.fid)
-            self.log("Đặt %s làm chức năng đang bắt API hiện tại." % format_feature_label(feat.fid, feat.name))
+            self.log("Đặt %s làm nhánh đang bắt API hiện tại." % format_feature_label(feat.fid, feat.name))
 
     def _on_rename_selected_feature(self, event):
-        feat = self._selected_feature_from_table()
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "FOLDER" and payload:
+            feat = self.find_or_create_feature_by_path(payload)
+        else:
+            feat = self._selected_feature_from_table()
         if feat is None:
             return
         new_name = JOptionPane.showInputDialog(
-            self.main_panel, "Đổi tên cho Tên %d:" % feat.fid, feat.name)
+            self.main_panel,
+            "Đổi đường dẫn phân cấp Group (VD: Toppage > menu > button \"Search\") cho [#%d]:" % feat.fid,
+            feat.name)
         if new_name is not None and new_name.strip():
-            self.rename_feature(feat.fid, new_name.strip())
+            self.rename_feature(feat.fid, normalize_hierarchy_path(new_name))
 
     def _on_send_feature_repeater(self, event):
-        feat = self._selected_feature_from_table()
-        if feat is None:
-            return
-        groups = self.group_model.groups_for_feature(feat.fid)
-        if not groups:
-            JOptionPane.showMessageDialog(self.main_panel, "Chức năng này chưa có API nào.", EXT_NAME,
-                                          JOptionPane.INFORMATION_MESSAGE)
-            return
-        for g in groups:
-            self.send_to_repeater(g, g.results)
+        self._on_send_selected_hierarchy_repeater(event)
 
     def _on_replay_feature(self, event):
-        feat = self._selected_feature_from_table()
-        if feat is None:
-            return
-        groups = self.group_model.groups_for_feature(feat.fid)
-        if not groups:
-            JOptionPane.showMessageDialog(self.main_panel, "Chức năng này chưa có API nào.", EXT_NAME,
-                                          JOptionPane.INFORMATION_MESSAGE)
-            return
-        for g in groups:
-            self.replay(g, g.results)
+        self._on_replay_selected_hierarchy_or_feature(event)
 
     def _on_move_groups_feature(self, event):
         groups = self._selected_groups()
@@ -3059,25 +3729,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._require_group()
             return
         feats = self.features_list()
-        options = [format_feature_label(f.fid, f.name) for f in feats] + ["+ Tạo Chức năng mới..."]
+        options = [f.name for f in feats] + ["+ Nhập đường dẫn Group mới (Toppage > menu > button)..."]
         choice = JOptionPane.showInputDialog(
-            self.main_panel, "Chuyển %d API đang chọn sang Chức năng:" % len(groups),
-            EXT_NAME, JOptionPane.PLAIN_MESSAGE, None, options, options[-1])
+            self.main_panel,
+            "Chọn đường dẫn Group cho %d API đang chọn (hoặc bạn có thể click đúp trực tiếp cột 'Group Path' trên bảng):"
+            % len(groups),
+            EXT_NAME, JOptionPane.PLAIN_MESSAGE, None, options, options[0])
         if choice is None:
             return
         if choice == options[-1]:
-            next_num = len(feats) + 1
+            p1, p2, _ = split_hierarchy_3_boxes(self.active_feature().name)
+            default_path = join_hierarchy_3_boxes(p1 or "Toppage", p2 or "menu", "button \"Search\"")
             name = JOptionPane.showInputDialog(
-                self.main_panel, "Nhập tên Chức năng mới (Tên %d):" % next_num, "Chức năng %d" % next_num)
+                self.main_panel, "Nhập đường dẫn Group mới (ngăn cách bởi '>'):", default_path)
             if not name:
                 return
-            feat = self.start_new_feature(name)
+            feat = self.find_or_create_feature_by_path(name)
             self.move_groups_to_feature(groups, feat.fid)
             return
-        for f in feats:
-            if format_feature_label(f.fid, f.name) == choice:
-                self.move_groups_to_feature(groups, f.fid)
-                break
+        feat = self.find_or_create_feature_by_path(choice)
+        self.move_groups_to_feature(groups, feat.fid)
 
     # ---- History Tree actions
     def _selected_tree_payload(self):
@@ -3093,39 +3764,50 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return None, None
 
     def _on_history_tree_selected(self):
-        # Tree nodes render custom labels via DefaultMutableTreeNode string or tuple
         pass
 
     def _on_rename_tree_feature(self, event):
         kind, payload = self._selected_tree_payload()
-        feat = payload if kind == "FEATURE" else (
-            self.get_feature(payload.fid) if kind == "GROUP" else (
-                self.get_feature(payload[0].fid) if kind == "ROLE" else self.active_feature()))
+        feat = None
+        if kind == "FOLDER" and payload:
+            feat = self.find_or_create_feature_by_path(payload)
+        elif kind == "FEATURE":
+            feat = payload
+        elif kind == "GROUP":
+            feat = self.get_feature(payload.fid)
+        elif kind in ("ROLE", "ORIG"):
+            feat = self.get_feature(payload[0].fid)
+        else:
+            feat = self.active_feature()
         if feat is None:
             return
         new_name = JOptionPane.showInputDialog(
-            self.main_panel, "Đổi tên cho Tên %d:" % feat.fid, feat.name)
+            self.main_panel, "Đổi tên đường dẫn phân cấp cho [#%d]:" % feat.fid, feat.name)
         if new_name is not None and new_name.strip():
-            self.rename_feature(feat.fid, new_name.strip())
+            self.rename_feature(feat.fid, normalize_hierarchy_path(new_name))
 
     def _on_send_tree_repeater(self, event):
         kind, payload = self._selected_tree_payload()
-        if kind == "FEATURE":
+        if kind == "FOLDER" and payload:
+            self.send_hierarchy_prefix_to_repeater(payload)
+        elif kind == "FEATURE":
             for g in self.group_model.groups_for_feature(payload.fid):
                 self.send_to_repeater(g, g.results)
         elif kind == "GROUP":
             self.send_to_repeater(payload, payload.results)
-        elif kind == "ROLE":
+        elif kind in ("ROLE", "ORIG"):
             g, r = payload
             self.send_to_repeater(g, [r])
         else:
             JOptionPane.showMessageDialog(
-                self.main_panel, "Hãy chọn một Chức năng, API hoặc Role trong cây bên trái.",
+                self.main_panel, "Hãy chọn một Nhánh (VD: Toppage), API hoặc Role trong cây.",
                 EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
 
     def _on_replay_tree_selection(self, event):
         kind, payload = self._selected_tree_payload()
-        if kind == "FEATURE":
+        if kind == "FOLDER" and payload:
+            self.replay_hierarchy_prefix(payload)
+        elif kind == "FEATURE":
             for g in self.group_model.groups_for_feature(payload.fid):
                 self.replay(g, g.results)
         elif kind == "GROUP":
@@ -3133,9 +3815,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         elif kind == "ROLE":
             g, r = payload
             self.replay(g, [r])
+        elif kind == "ORIG":
+            g, _ = payload
+            self.replay(g, g.results)
         else:
             JOptionPane.showMessageDialog(
-                self.main_panel, "Hãy chọn một Chức năng, API hoặc Role trong cây bên trái.",
+                self.main_panel, "Hãy chọn một Nhánh (VD: Toppage), API hoặc Role trong cây.",
                 EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
 
     def _on_jump_to_group_from_tree(self, event):
@@ -3143,22 +3828,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         target_group = None
         if kind == "GROUP":
             target_group = payload
-        elif kind == "ROLE":
+        elif kind in ("ROLE", "ORIG"):
             target_group = payload[0]
+        elif kind == "FOLDER" and payload:
+            groups = self.groups_for_hierarchy_prefix(payload)
+            target_group = groups[0] if groups else None
         elif kind == "FEATURE":
             groups = self.group_model.groups_for_feature(payload.fid)
             target_group = groups[0] if groups else None
         if target_group is None:
             return
         self.group_model.set_feature_filter(None)
+        self.group_model.set_hierarchy_filter(None)
         if self.feature_table.getRowCount() > 0:
             self.feature_table.setRowSelectionInterval(0, 0)
-        for mr in range(self.group_model.getRowCount()):
-            if self.group_model.group_at(mr) is target_group:
-                vr = self.group_table.convertRowIndexToView(mr)
-                if vr >= 0:
-                    self.group_table.setRowSelectionInterval(vr, vr)
-                break
+        self._select_group_in_table(target_group)
         self.tabs.setSelectedIndex(0)
 
     def _on_export_history_report(self, event):
@@ -3194,7 +3878,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         out = []
         for vr in self.result_table.getSelectedRows():
             r = self.result_model.result_at(self.result_table.convertRowIndexToModel(vr))
-            if r is not None:
+            if r is not None and not getattr(r, "is_original", False):
                 out.append(r)
         return out
 
@@ -3242,7 +3926,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.req_viewer.setMessage(empty, True)
             self.resp_viewer.setMessage(empty, False)
             return
-        self.req_viewer.setMessage(res.request, True)
+        self.req_viewer.setMessage(res.request if res.request is not None else empty, True)
         self.resp_viewer.setMessage(res.response if res.response is not None else empty, False)
 
     def _require_group(self):
@@ -3264,6 +3948,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _on_send_role(self, event):
         g = self._require_group()
         if g is None:
+            return
+        _, cur_res = self.current_selection()
+        if cur_res is not None and getattr(cur_res, "is_original", False):
+            self.send_to_repeater(g, [cur_res])
             return
         results = self._selected_results()
         if not results:
@@ -3287,10 +3975,18 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if g is None:
             return
         results = self._selected_results()
-        if results:
-            self.replay(g, results)
-            self.log("%s (%s): replaying %d selected role(s)." %
-                     (format_api_label(g.gid), format_group_id(g.gid), len(results)))
+        if not results:
+            # If user selected only the original row and clicked replay role, replay all roles for convenience
+            _, cur_res = self.current_selection()
+            if cur_res is not None and getattr(cur_res, "is_original", False):
+                self.replay(g, g.results)
+                return
+            JOptionPane.showMessageDialog(self.main_panel, "Hãy chọn ít nhất 1 dòng Role để gửi.", EXT_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
+        self.replay(g, results)
+        self.log("%s (%s): replaying %d selected role(s)." %
+                 (format_api_label(g.gid), format_group_id(g.gid), len(results)))
 
     def _on_rebuild(self, event):
         for g in self._selected_groups():
@@ -3300,6 +3996,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         g = self._require_group()
         if g is None:
             return
+        if self.result_model.getRowCount() > 0:
+            self.result_table.setRowSelectionInterval(0, 0)
         empty = self.helpers.stringToBytes("")
         self.req_viewer.setMessage(g.orig_request if g.orig_request is not None else empty, True)
         self.resp_viewer.setMessage(g.orig_response if g.orig_response is not None else empty, False)
@@ -3343,7 +4041,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def _on_clear_groups(self, event):
         if JOptionPane.showConfirmDialog(
-                self.main_panel, "Xóa toàn bộ các API đã bắt, đặt lại danh sách Chức năng về Tên 1 và xóa Dedup cache?",
+                self.main_panel, "Xóa toàn bộ các API đã bắt, đặt lại danh sách Nhánh về mặc định và xóa Dedup cache?",
                 EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
         self.group_model.clear()
@@ -3351,19 +4049,24 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._show_result(None)
         with self._state_lock:
             self._seen_keys.clear()
+            self._skipped_count = 0
+            self._last_skip_reason = ""
             self._next_gid = 1
             self._next_fid = 2
             self._active_fid = 1
-            self._features = [FeatureGroup(1, "Chức năng 1")]
+            self._features = [FeatureGroup(1, DEFAULT_HIERARCHY_PATH)]
         self.group_model.set_feature_filter(None)
+        self.group_model.set_hierarchy_filter(None)
         self._refresh_feature_views()
-        self.log("All captured APIs, feature history, and dedup cache reset.")
+        self.log("All captured APIs, hierarchy history, and dedup cache reset.")
         self.update_status()
 
     def _on_reset_dedup(self, event):
         with self._state_lock:
             n = len(self._seen_keys)
             self._seen_keys.clear()
+            self._skipped_count = 0
+            self._last_skip_reason = ""
         self.log("Dedup cache reset (%d endpoint key(s) forgotten)." % n)
         self.update_status()
 

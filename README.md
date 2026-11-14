@@ -85,36 +85,37 @@ Text fields take effect when you press **Enter** or click **Apply Text Fields**.
 - `theMythOfCrawl: Clone to all enabled roles`: **skips** all filters and dedup.
 - `theMythOfCrawl: Clone to all enabled roles (apply capture filters + dedup)`: applies the filters and dedup.
 
-### 2.3 Cloning, Repeater, replay
+### 2.3 Cloning (`1 API Gốc + N Roles`), Manual Recursive Sending & Repeater
 
-For each matched request with N enabled roles, the extension builds exactly N requests. The method, request line (path and query), body and all other headers stay the same. Content-Length is recalculated by Burp's `buildHttpMessage`.
+For each matched API request with $N$ enabled roles, the extension stores:
+- **`1 API Gốc` (`[API GỐC] 00_Original (Acc Crawl)` — Row 0 (`GỐC`) in the detail table):** The exact baseline request & response from the main account used during crawling.
+- **`N API Roles thêm` (`01_Admin` … `10_Guest` — Rows `Role 1` … `Role N`):** $N$ cloned requests with each role's custom JWT/Bearer, Cookie/Session key rules (`COOKIE_SET` / `COOKIE_REMOVE`), or HTTP Header rules (`REPLACE` / `ADD` / `REMOVE`).
 
-Top bar toggles:
-- **Auto-send new groups to Repeater** (on by default): every new group is sent to Repeater as N tabs named
-  `[G<GroupID>:<METHOD> <ShortPath>] <RoleName>`, for example `[G01:POST /v1/transfer] 01_Admin` … `[G01:POST /v1/transfer] 10_Guest`.
-  - If a role name doesn't already start with a number prefix, the extension adds `NN_` (you can turn this off).
-  - Long paths are shortened from the left (`.../deep/path`). The maximum length is configurable.
-  - Group IDs keep counting up even after **Clear All**, so tab names never collide.
-- **Auto-Send to Server & Record**: all N requests are sent on background worker threads. For each role the extension records the state, HTTP status, response body length, the difference from the original response's length, time in ms, how many times it was sent, and the full request/response.
+**Default Mode is Strictly Manual (Anti-Lag & Safe Crawling):**
+- By default, **both** `Cho phép Tự động Gửi ngầm (auto_send)` and `Tự động đẩy Repeater (auto_repeater)` are **OFF (`False`)**.
+- During crawling, APIs are captured and cloned into memory (`Not sent`) without spamming the target server or creating hundreds of Burp Repeater tabs.
+- You manually trigger sending at **any level**:
+  - **Parent / Sub-Folder Group (`▶ Gửi Nhánh/Group đang chọn`, e.g. `Toppage` or `Toppage > menu`):** Recursively sends **all** APIs inside that folder and all its nested sub-folders (`button "Search"`, `button "Export"`, etc.).
+  - **Single API (`▶ Gửi API đang chọn (N Roles)`):** Sends all $N$ role requests of the selected API(s).
+  - **Single Role (`▶ Gửi lại Role đang chọn`):** Sends only the selected role row(s).
+- If you explicitly want automatic background replay or automatic Repeater tab creation, check `Cho phép Tự động Gửi ngầm` or `Tự động đẩy Repeater` in the top bar.
 
 Tuning: **Replay worker threads** (1–64, resized live) and **Throttle per request (ms)**.
 
-> With auto-Repeater on during a large crawl, Repeater fills up quickly (endpoints × roles tabs). Keep dedup on, narrow the regex and scope, or turn auto-Repeater off and send groups manually.
+### 2.4 Hierarchical Grouping (`Toppage > menu > button "Search"`) & Per-API Group Selection
 
-### 2.4 Feature / Button Action Batching & Sequential API History (`Tên 1: API 1, API 2...`, `Tên 2: API 3, API 4...`)
+1. **3-Box Quick Hierarchy Bar (`Page` > `Menu` > `Button`) + Full Path:**
+   - In the top bar, enter `Page` (e.g. `Toppage`), `Menu` (e.g. `menu`), and `Button` (e.g. `button "Search"`) and click **`Gộp 3 ô -> Path`** (or type `Toppage > menu > button "Search"` directly into the `Path` field).
+   - Click **`+ Nút / Action Mới...`** when moving to the next button on the page; it pre-fills the current `Page > Menu > ...` prefix so you only need to type the new button name.
+2. **Nested Hierarchy Tree (`Cây phân cấp Group`):**
+   - Renders a nested folder tree: opening **`Group "Toppage"`** reveals **`Group "menu"`**, opening **`Group "menu"`** reveals **`Group "button \"Search\""`**, and opening **`Group "button \"Search\""`** reveals each captured API (`API 1 [G01]`, `API 2 [G02]`...) containing **`1 API GỐC`** + **`N API Roles`**.
+3. **Default View = Per-API Grouping (`Mặc định: Group theo từng API`):**
+   - The right-hand API table defaults to showing every captured API individually (`Chế độ xem: Mặc định: Group theo từng API`).
+   - **Per-API Group Selection:** Double-click the **`Group Path (Click đúp đổi Group riêng)`** cell (Column 2) on **any individual API row** to pick an existing hierarchy path from the dropdown or type a custom `Page > Menu > Button` path for that specific API.
 
-When you click a button or perform a workflow step in the web application, multiple API requests often fire in sequence (`API 1`, `API 2`, …). `theMythOfCrawl` numbers every captured API sequentially and groups them under the currently active **Feature (`Chức năng`)**:
+### 2.5 Master-Detail view (tab **API Groups**), Color Highlighting & Anti-Lag Architecture
 
-1. **Before clicking button #1 in the browser:** In the top bar (**Bộ gom Chức năng**), type a name for `Tên 1` (e.g., `Xem hồ sơ & Ví`) and click **Cập nhật Tên** (or press Enter).
-2. **Click button #1 in the browser:** All matching APIs that pass through Proxy (`API 1`, `API 2`, …) are cloned across your $N$ roles, sent to Repeater, and recorded under **`Tên 1: Xem hồ sơ & Ví`**.
-3. **Before clicking button #2 in the browser:** Click **`+ Qua Chức Năng Mới (Bấm nút tiếp theo -> Tên mới)`**, enter the label for `Tên 2` (e.g., `Chuyển tiền`), and click OK.
-4. **Click button #2 in the browser:** Subsequent APIs (`API 3`, `API 4`, …) are automatically grouped under **`Tên 2: Chuyển tiền`**.
-5. Right-clicking messages in Proxy/Target/Repeater also offers **`Clone to NEW Feature (Tạo Tên chức năng mới...)`** so you can group manually selected APIs into a new named feature on the spot.
-6. Enable **Dedup riêng theo từng Chức năng** in **Capture Filters & Options** if you want the same endpoint to be captured again whenever you switch to a new Feature (`Tên 2`, `Tên 3`, …).
-
-### 2.5 Master-Detail view (tab **API Groups**), Color Highlighting & Audit History (tab **History & Features**)
-
-Every row in the **Features**, **API Groups**, and **Role Results** tables is automatically color-highlighted based on the role replay outcomes:
+Every row in the **Features**, **API Groups**, and **Role Results** tables is automatically color-highlighted based on the role replay outcomes (cached in $O(1)$ on the model so scrolling and mouse movement never lag on the Swing EDT):
 
 | Color / Level | Meaning |
 |---|---|

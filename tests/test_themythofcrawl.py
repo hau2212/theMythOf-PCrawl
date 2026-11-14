@@ -436,7 +436,11 @@ class EngineTests(unittest.TestCase):
                                {"name": "Cookie", "value": "[REMOVE]"}]}]
         roles += [{"name": "Disabled", "enabled": False, "headers": []}]
         self.cb.settings[tm.SETTINGS_KEY_ROLES] = json.dumps(roles)
-        self.cb.settings[tm.SETTINGS_KEY_CONFIG] = json.dumps({"capture_enabled": True, "auto_send": True})
+        self.cb.settings[tm.SETTINGS_KEY_CONFIG] = json.dumps({
+            "capture_enabled": True,
+            "auto_send": True,
+            "auto_repeater": True,
+        })
         self.ext = tm.BurpExtender()
         self.ext.registerExtenderCallbacks(self.cb)
         self.svc = FakeService()
@@ -664,6 +668,80 @@ class EngineTests(unittest.TestCase):
         g_ok_lvl, g_ok_sum = tm.evaluate_group_audit(g)
         self.assertEqual(g_ok_lvl, tm.AUDIT_OK)
         self.assertIn("OK: Cả 10 Role 2xx", g_ok_sum)
+
+    def test_hierarchy_grouping_per_api_and_manual_recursive_send(self):
+        # 1. Verify DEFAULT_CONFIG has strict manual sending by default (no auto-send, no auto-repeater)
+        self.assertFalse(tm.DEFAULT_CONFIG["auto_send"])
+        self.assertFalse(tm.DEFAULT_CONFIG["auto_repeater"])
+
+        # Switch extender to default manual mode
+        cfg = self.ext.get_config()
+        cfg["auto_send"] = False
+        cfg["auto_repeater"] = False
+        self.ext.apply_config(cfg)
+
+        # Hook group_model so captured groups are registered in headless test mode
+        self.ext.group_model = tm.GroupTableModel(self.ext)
+        self.ext.result_model = tm.ResultTableModel()
+        orig_clone = self.ext._clone_for_roles
+
+        def spy_clone(group, info, roles, cfg_arg):
+            res = orig_clone(group, info, roles, cfg_arg)
+            self.ext.group_model.add(group)
+            return res
+
+        self.ext._clone_for_roles = spy_clone
+
+        # 2. Fast pre-filter helper extracts method & path without full request parsing
+        m, p = tm.fast_extract_method_and_path(BASE_REQ)
+        self.assertEqual((m, p), ("POST", "/v1/transfer?x=1"))
+
+        # 3. Capture API 1 under "Toppage > menu > button \"Search\""
+        self.ext.rename_feature(1, "Toppage > menu > button \"Search\"")
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/search?q=abc"))
+
+        # Capture API 2 under "Toppage > menu > button \"Export\""
+        self.ext.start_new_feature("Toppage > menu > button \"Export\"")
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/export"))
+
+        # Capture API 3 under "Settings > Profile > button \"Save\""
+        self.ext.start_new_feature("Settings > Profile > button \"Save\"")
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/profile/save"))
+
+        all_groups = self.ext.group_model.all_groups()
+        self.assertEqual(len(all_groups), 3)
+
+        # Verify manual mode did NOT send any HTTP requests or Repeater tabs automatically
+        self.assertEqual(len(self.cb.sent), 0)
+        self.assertEqual(len(self.cb.repeater), 0)
+
+        # 4. Verify each API group contains 1 API gốc + N (10) API roles thêm
+        g1, g2, g3 = all_groups
+        self.assertTrue(g1.orig_result.is_original)
+        self.assertEqual(g1.orig_result.status, 200)
+        self.assertEqual(len(g1.results), 10)
+        self.assertEqual(len(g1.all_entries()), 11)
+
+        self.ext.result_model.set_group(g1)
+        self.assertEqual(self.ext.result_model.getRowCount(), 11)
+        self.assertEqual(self.ext.result_model.getValueAt(0, 0), "GỐC")
+        self.assertIn("[API GỐC]", self.ext.result_model.getValueAt(0, 1))
+        self.assertEqual(self.ext.result_model.getValueAt(1, 0), "Role 1")
+
+        # 5. Per-API Group Selection: change g3's group path via assign_group_to_path, then back
+        self.ext.assign_group_to_path(g3, "Toppage > submenu > button \"QuickSave\"")
+        self.assertEqual(g3.feature_name, "Toppage > submenu > button \"QuickSave\"")
+        self.ext.assign_group_to_path(g3, "Settings > Profile > button \"Save\"")
+        self.assertEqual(g3.feature_name, "Settings > Profile > button \"Save\"")
+
+        # 6. Manual Recursive Send on parent group "Toppage" sends BOTH g1 and g2 (20 role requests)
+        # while leaving g3 ("Settings > Profile > button \"Save\"") unsent!
+        sent_groups = self.ext.replay_hierarchy_prefix("Toppage")
+        self.assertEqual([g.gid for g in sent_groups], [1, 2])
+        self.assertEqual(len(self.cb.sent), 20)
+        self.assertTrue(all(r.state == tm.STATE_DONE for r in g1.results))
+        self.assertTrue(all(r.state == tm.STATE_DONE for r in g2.results))
+        self.assertTrue(all(r.state == tm.STATE_NOT_SENT for r in g3.results))
 
 
 if __name__ == "__main__":
