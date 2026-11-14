@@ -22,13 +22,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ----------------------------------------------------------------------------- stubs
 
 
+class _DummyMeta(type):
+    def __getattr__(cls, n):
+        if n.startswith("__"):
+            raise AttributeError(n)
+        return lambda *a, **k: _dummy_class(n)()
+
+
 def _dummy_class(name):
     def __init__(self, *a, **k):
-        pass
+        if name == "JComboBox" and "actionPerformed" in k:
+            raise TypeError("readonly attribute")
 
     def __getattr__(self, n):
-        return lambda *a, **k: None
-    return type(name, (object,), {"__init__": __init__, "__getattr__": __getattr__})
+        if n.startswith("__"):
+            raise AttributeError(n)
+        return lambda *a, **k: _dummy_class(n)()
+    return _DummyMeta(name, (object,), {"__init__": __init__, "__getattr__": __getattr__})
 
 
 class _StubModule(types.ModuleType):
@@ -252,11 +262,26 @@ class FakeCallbacks(object):
     def registerExtensionStateListener(self, l):
         pass
 
+    def registerHttpListener(self, l):
+        pass
+
+    def registerContextMenuFactory(self, f):
+        pass
+
+    def addSuiteTab(self, tab):
+        self.tab = tab
+
+    def customizeUiComponent(self, comp):
+        pass
+
+    def createMessageEditor(self, ctrl, editable):
+        return _dummy_class("FakeEditor")()
+
     def printOutput(self, s):
         self.out.append(s)
 
     def printError(self, s):
-        self.out.append(s)
+        self.out.append("ERROR: " + str(s))
 
     def isInScope(self, url):
         return self.in_scope
@@ -742,6 +767,69 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(r.state == tm.STATE_DONE for r in g1.results))
         self.assertTrue(all(r.state == tm.STATE_DONE for r in g2.results))
         self.assertTrue(all(r.state == tm.STATE_NOT_SENT for r in g3.results))
+
+    def test_dynamic_n_level_subfolders_tree_nodes_and_compact_repeater(self):
+        # 1. N-level dynamic sub-folder manipulation (1..6+ levels, not limited to 3)
+        p = "Toppage"
+        p = tm.append_hierarchy_segment(p, "Menu")
+        p = tm.append_hierarchy_segment(p, "SubMenu > Tab 1 > Modal > Button Save")
+        self.assertEqual(len(tm.split_hierarchy_path(p)), 6)
+        self.assertEqual(p, "Toppage > Menu > SubMenu > Tab 1 > Modal > Button Save")
+
+        p = tm.insert_hierarchy_segment_after(p, 1, "SubMenu_Before")
+        self.assertEqual(p, "Toppage > Menu > SubMenu_Before > SubMenu > Tab 1 > Modal > Button Save")
+
+        p = tm.replace_hierarchy_segment_at(p, 2, "RenamedSub")
+        self.assertEqual(p, "Toppage > Menu > RenamedSub > SubMenu > Tab 1 > Modal > Button Save")
+
+        p = tm.delete_hierarchy_segment_at(p, 2)
+        self.assertEqual(p, "Toppage > Menu > SubMenu > Tab 1 > Modal > Button Save")
+
+        p = tm.pop_hierarchy_segment(p)
+        self.assertEqual(p, "Toppage > Menu > SubMenu > Tab 1 > Modal")
+
+        # Prefix rename preserves all deeper sub-folders
+        renamed = tm.replace_hierarchy_prefix(p, "Toppage > Menu", "Portal > Nav")
+        self.assertEqual(renamed, "Portal > Nav > SubMenu > Tab 1 > Modal")
+
+        # 2. Verify HierarchyTreeNode str/repr/toString never renders '<_TreeNodeItem object at 0x...>'
+        node = tm.HierarchyTreeNode("FOLDER", "Toppage > Menu", "[Cấp 2] Menu (5 API)")
+        self.assertEqual(str(node), "[Cấp 2] Menu (5 API)")
+        self.assertEqual(repr(node), "[Cấp 2] Menu (5 API)")
+        self.assertEqual(node.toString(), "[Cấp 2] Menu (5 API)")
+        self.assertEqual(tm.BurpExtender._extract_node_kind_payload(node), ("FOLDER", "Toppage > Menu"))
+
+        # 3. Verify compact Repeater tab naming & dispatch
+        self.assertEqual(tm.compact_repeater_tab_name(1, "01_Admin"), "G01•01_Admin")
+        self.assertEqual(tm.compact_repeater_tab_name(1, "01_Admin", fid=2, include_feature=True), "F02•G01•01_Admin")
+
+        cfg = self.ext.get_config()
+        cfg["auto_send"] = False
+        cfg["auto_repeater"] = False
+        self.ext.apply_config(cfg)
+
+        captured = []
+        orig_clone = self.ext._clone_for_roles
+
+        def spy_clone(group, info, roles, cfg_arg):
+            res = orig_clone(group, info, roles, cfg_arg)
+            captured.append(group)
+            return res
+
+        self.ext._clone_for_roles = spy_clone
+        self.capture(BASE_REQ)
+        g = captured[0]
+        self.ext.send_to_repeater(g, g.results, compact=True, copy_group_name=False)
+        self.assertEqual(len(self.cb.repeater), 10)
+        self.assertEqual(self.cb.repeater[0][4], "G01•01_Admin")
+        self.assertEqual(self.cb.repeater[-1][4], "G01•10_Guest")
+
+    def test_init_ui_builds_cleanly(self):
+        self.ext._init_ui()
+        errors = [x for x in self.cb.out if str(x).startswith("ERROR:")]
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(self.ext.getUiComponent())
+        self.assertEqual(self.ext.getTabCaption(), "theMythOfCrawl")
 
 
 if __name__ == "__main__":
