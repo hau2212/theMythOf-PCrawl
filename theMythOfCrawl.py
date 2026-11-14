@@ -19,7 +19,12 @@ Threading model
   * Burp listener threads only copy bytes and enqueue work (never block).
   * One single-thread "capture" executor builds groups (deterministic IDs + dedup).
   * A resizable thread pool performs all network I/O (makeHttpRequest).
-  * Every Swing mutation goes through SwingUtilities.invokeLater (ui_call()).
+  * Worker threads never touch Swing: they only record what changed. A single Swing
+    Timer (UI_TICK_MS) drains that record on the EDT, so a burst of 500 captured APIs
+    costs a handful of repaints instead of 500 full tree rebuilds.
+  * Role requests are virtual: a group keeps the original request plus each role's
+    rule snapshot, and the role request is built only when it is viewed, sent or
+    pushed to Repeater. Responses live in Burp's temp file, not on the heap.
 """
 
 import base64
@@ -35,6 +40,7 @@ from burp import IHttpListener
 from burp import IContextMenuFactory
 from burp import IExtensionStateListener
 from burp import IMessageEditorController
+from burp import IHttpRequestResponse
 
 from java.awt import (BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, GridLayout,
                       Insets, Dimension, Color, Font, Toolkit)
@@ -50,9 +56,12 @@ from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable,
                          JFileChooser, JDialog, JComboBox, JSpinner, SpinnerNumberModel,
                          ListSelectionModel, SwingUtilities, BorderFactory, DefaultCellEditor,
                          BoxLayout, Box, JTree)
-from javax.swing.event import ListSelectionListener, TreeSelectionListener, ChangeListener
+from javax.swing import Timer, UIManager
+from javax.swing.event import (ListSelectionListener, TreeSelectionListener, ChangeListener,
+                               TreeWillExpandListener)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
-from javax.swing.tree import DefaultMutableTreeNode, DefaultTreeModel, DefaultTreeCellRenderer, TreeSelectionModel
+from javax.swing.tree import (DefaultMutableTreeNode, DefaultTreeModel, DefaultTreeCellRenderer,
+                              TreeSelectionModel, TreePath)
 from javax.swing.filechooser import FileNameExtensionFilter
 
 try:
@@ -100,7 +109,7 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.5.0"
+EXT_VERSION = "1.6.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
 
@@ -158,7 +167,11 @@ DEFAULT_CONFIG = {
     "threads": 5,
     "throttle_ms": 0,
     "short_path_len": 40,
+    "store_on_disk": True,
 }
+
+# One Swing timer flushes every pending UI change; nothing else repaints tables or trees.
+UI_TICK_MS = 200
 
 STATE_ORIGIN = "GỐC (Proxy)"
 STATE_NOT_SENT = "Not sent"
@@ -782,26 +795,124 @@ def evaluate_group_audit(group):
     return lvl, summary
 
 
+def audit_from_counts(total, flagged, ok):
+    """(audit_level, summary) of a branch from its API counters."""
+    if total <= 0:
+        return AUDIT_NONE, "-"
+    if flagged > 0:
+        return AUDIT_INFO, "INFO: %d/%d API có Role lỗi/lệch" % (flagged, total)
+    if ok > 0:
+        return AUDIT_OK, "OK: %d/%d API 2xx" % (ok, total)
+    return AUDIT_NONE, "Chưa Gửi (%d API)" % total
+
+
+def _group_level(g):
+    lvl = getattr(g, "_audit_level", None)
+    if lvl is None:
+        lvl, _ = evaluate_group_audit(g)
+    return lvl
+
+
 def evaluate_feature_audit(feature_groups):
     """Summarize the audit status across all API groups belonging to a Feature/Hierarchy node."""
-    f_groups = list(feature_groups or [])
-    if not f_groups:
-        return AUDIT_NONE, "-"
-    info_count = 0
-    ok_count = 0
-    for g in f_groups:
-        lvl = getattr(g, "_audit_level", None)
-        if lvl is None:
-            lvl, _ = evaluate_group_audit(g)
+    flagged = 0
+    ok = 0
+    total = 0
+    for g in feature_groups or []:
+        total += 1
+        lvl = _group_level(g)
         if lvl in (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR):
-            info_count += 1
+            flagged += 1
         elif lvl == AUDIT_OK:
-            ok_count += 1
-    if info_count > 0:
-        return AUDIT_INFO, "INFO: %d/%d API có Role lỗi/lệch" % (info_count, len(f_groups))
-    if ok_count > 0:
-        return AUDIT_OK, "OK: %d/%d API 2xx" % (ok_count, len(f_groups))
-    return AUDIT_NONE, "Chưa Gửi (%d API)" % len(f_groups)
+            ok += 1
+    return audit_from_counts(total, flagged, ok)
+
+
+def hierarchy_key(parts):
+    """Case-insensitive identity of a hierarchy prefix (matches hierarchy_matches_prefix)."""
+    return " > ".join([p.lower() for p in parts])
+
+
+class HierarchyStats(object):
+    """
+    Everything the tables, the trees and the status bar need to know about the captured
+    APIs, computed in ONE pass. Views read these counters instead of re-filtering the
+    whole API list per cell / per folder.
+    """
+
+    def __init__(self, features=None, groups=None):
+        self.features = list(features or [])
+        self.groups = list(groups or [])
+        self.by_fid = {}
+        self.prefix = {}       # hierarchy_key -> [total, flagged, ok]
+        self.paths = []        # ordered unique canonical paths (branches first, then stray API paths)
+        self.total = 0
+        self.flagged = 0
+        self.ok = 0
+        self.info_exact = 0
+        seen = set()
+        for f in self.features:
+            np = normalize_hierarchy_path(f.name)
+            if np not in seen:
+                seen.add(np)
+                self.paths.append(np)
+        for g in self.groups:
+            self.by_fid.setdefault(getattr(g, "fid", 1), []).append(g)
+            lvl = _group_level(g)
+            is_flagged = lvl in (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR)
+            is_ok = (lvl == AUDIT_OK)
+            self.total += 1
+            if is_flagged:
+                self.flagged += 1
+            if is_ok:
+                self.ok += 1
+            if lvl == AUDIT_INFO:
+                self.info_exact += 1
+            parts = split_hierarchy_path(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH)
+            np = " > ".join(parts)
+            if np not in seen:
+                seen.add(np)
+                self.paths.append(np)
+            lowered = [p.lower() for p in parts]
+            for i in range(len(lowered)):
+                key = " > ".join(lowered[:i + 1])
+                c = self.prefix.get(key)
+                if c is None:
+                    c = [0, 0, 0]
+                    self.prefix[key] = c
+                c[0] += 1
+                if is_flagged:
+                    c[1] += 1
+                if is_ok:
+                    c[2] += 1
+
+    def prefix_counts(self, parts):
+        return self.prefix.get(hierarchy_key(parts), (0, 0, 0))
+
+    def groups_of(self, fid):
+        return self.by_fid.get(fid, [])
+
+
+def build_feature_rows(stats, active_fid):
+    """Rows of the branch table: (cells, audit_level, feature_or_None); row 0 is [All]."""
+    groups = stats.groups
+    lvl, summary = audit_from_counts(stats.total, stats.flagged, stats.ok)
+    rows = [(["ALL", "[Tất cả: %d chức năng]" % len(stats.features), len(groups), summary,
+              ("%s .. %s" % (format_api_label(groups[0].gid), format_api_label(groups[-1].gid))
+               if groups else "-")], lvl, None)]
+    for f in stats.features:
+        f_groups = stats.groups_of(f.fid)
+        f_lvl, f_sum = evaluate_feature_audit(f_groups)
+        if not f_groups:
+            apis = "(chưa có API)"
+        elif len(f_groups) <= 3:
+            apis = ", ".join([format_api_label(g.gid) for g in f_groups])
+        else:
+            apis = "%s .. %s (%d)" % (format_api_label(f_groups[0].gid),
+                                      format_api_label(f_groups[-1].gid), len(f_groups))
+        rows.append(([("* #%d" % f.fid) if f.fid == active_fid else ("#%d" % f.fid),
+                      format_feature_label(f.fid, f.name), len(f_groups), f_sum, apis], f_lvl, f))
+    return rows
 
 
 def compile_api_regex(pattern):
@@ -1148,14 +1259,65 @@ class FeatureGroup(object):
         return format_feature_label(self.fid, self.name)
 
 
+class _BytesMessage(IHttpRequestResponse):
+    """Minimal IHttpRequestResponse over byte arrays, so Burp can move them to its temp file."""
+
+    def __init__(self, service, request, response):
+        self._service = service
+        self._request = request
+        self._response = response
+
+    def getRequest(self):
+        return self._request
+
+    def getResponse(self):
+        return self._response
+
+    def getHttpService(self):
+        return self._service
+
+    def getComment(self):
+        return None
+
+    def getHighlight(self):
+        return None
+
+    def setRequest(self, message):
+        self._request = message
+
+    def setResponse(self, message):
+        self._response = message
+
+    def setComment(self, comment):
+        pass
+
+    def setHighlight(self, color):
+        pass
+
+    def setHttpService(self, service):
+        self._service = service
+
+
 class RoleResult(object):
-    def __init__(self, role_name, role_index, request_bytes, is_stripped_auth=False, is_original=False):
+    """
+    One row of an API group: the original request, or one role's variant of it.
+
+    A role variant is VIRTUAL: it keeps only the role's rule snapshot (taken at capture
+    time) and builds its request from the group's original on demand. `request` holds
+    real bytes only for the original or after the user edited the request by hand.
+    """
+
+    def __init__(self, role_name, role_index, request_bytes=None, is_stripped_auth=False, is_original=False,
+                 group=None, rules=None):
         self.role_name = u_text(role_name)
         self.role_index = role_index
-        self.request = request_bytes
+        self._request = request_bytes
+        self._group = group
+        self.rules = rules
         self.is_stripped_auth = bool(is_stripped_auth)
         self.is_original = bool(is_original)
-        self.response = None
+        self._response = None
+        self._store = None
         self.status = None
         self.length = None
         self.elapsed_ms = None
@@ -1166,10 +1328,48 @@ class RoleResult(object):
         self._audit_level = None
         self._audit_badge = None
 
+    def _get_request(self):
+        if self._request is not None:
+            return self._request
+        g = self._group
+        if g is None:
+            return None
+        if self.is_original:
+            return g.orig_request
+        return g.build_request(self)
+
+    def _set_request(self, value):
+        self._request = value
+
+    request = property(_get_request, _set_request)
+
+    def has_custom_request(self):
+        return self._request is not None
+
+    def _get_response(self):
+        if self._store is not None:
+            return self._store.getResponse()
+        if self._response is not None:
+            return self._response
+        if self.is_original and self._group is not None:
+            return self._group.orig_response
+        return None
+
+    def _set_response(self, value):
+        self._store = None
+        self._response = value
+
+    response = property(_get_response, _set_response)
+
+    def set_response_store(self, store):
+        """Keep the response in Burp's temp file (store: IHttpRequestResponsePersisted)."""
+        self._response = None
+        self._store = store
+
 
 class ApiGroup(object):
     def __init__(self, gid, service, method, path, url, orig_request, orig_response, source,
-                fid=1, feature_name=""):
+                 fid=1, feature_name=""):
         self.gid = gid
         self.fid = fid
         self.feature_name = u_text(feature_name).strip() or ("Chức năng %d" % fid)
@@ -1180,29 +1380,69 @@ class ApiGroup(object):
         self.method = u_text(method)
         self.path = u_text(path)
         self.url = u_text(url)
-        self.orig_request = orig_request
-        self.orig_response = orig_response
+        self._store = None
+        self._orig_request = orig_request
+        self._orig_response = orig_response
+        self.has_orig_response = orig_response is not None
+        self.base_headers = None
+        self.body_offset = 0
+        self.message_builder = None
         self.orig_status = None
         self.orig_length = None
         self.source = u_text(source)
         self.created = time.strftime("%H:%M:%S")
         self.orig_result = RoleResult(
-            "[API GỐC] 00_Original (Acc Crawl)", -1, orig_request,
-            is_stripped_auth=False, is_original=True
+            "[API GỐC] 00_Original (Acc Crawl)", -1, None,
+            is_stripped_auth=False, is_original=True, group=self
         )
-        self.orig_result.response = orig_response
-        self.orig_result.state = STATE_ORIGIN if orig_response is not None else STATE_NOT_SENT
+        self.orig_result.state = STATE_ORIGIN if self.has_orig_response else STATE_NOT_SENT
         self.orig_result.tab_name = repeater_tab_name(gid, method, path, "00_Original_Crawl")
         self.results = []
         self._audit_level = None
         self._audit_summary = None
 
+    def _get_orig_request(self):
+        if self._store is not None:
+            return self._store.getRequest()
+        return self._orig_request
+
+    def _set_orig_request(self, value):
+        self._orig_request = value
+
+    orig_request = property(_get_orig_request, _set_orig_request)
+
+    def _get_orig_response(self):
+        if self._orig_response is not None:
+            return self._orig_response
+        if self._store is not None:
+            return self._store.getResponse()
+        return None
+
+    def _set_orig_response(self, value):
+        self._orig_response = value
+        self.has_orig_response = value is not None
+
+    orig_response = property(_get_orig_response, _set_orig_response)
+
+    def attach_store(self, store):
+        """Hand the original request/response over to Burp's temp file and drop the heap copies."""
+        if store is not None:
+            self._store = store
+            self._orig_request = None
+            self._orig_response = None
+
+    def build_request(self, res):
+        """Materialize a role's request: original headers + the role's rule snapshot + original body."""
+        if self.base_headers is None or self.message_builder is None:
+            return None
+        headers = apply_header_rules(self.base_headers, res.rules or [])
+        return self.message_builder(headers, self.orig_request, self.body_offset)
+
     def sync_original_meta(self, short_path_len=40, include_feature=False):
-        self.orig_result.request = self.orig_request
-        self.orig_result.response = self.orig_response
         self.orig_result.status = self.orig_status
         self.orig_result.length = self.orig_length
-        self.orig_result.state = STATE_ORIGIN if self.orig_response is not None else STATE_NOT_SENT
+        if self.orig_result.state in (STATE_ORIGIN, STATE_NOT_SENT):
+            self.orig_result.state = STATE_ORIGIN if self.has_orig_response else STATE_NOT_SENT
         self.orig_result.tab_name = repeater_tab_name(
             self.gid, self.method, self.path, "00_Original_Crawl",
             short_path_len, self.fid, include_feature
@@ -1369,14 +1609,26 @@ class FeatureTableModel(AbstractTableModel):
     """
     Lists all Feature batches (Tên 1, Tên 2, ...) plus row 0 = [All Features].
     Column 1 (Tên chức năng) is directly editable for Feature rows.
+    Cells come from a snapshot (build_feature_rows) refreshed by the UI tick, so painting is O(1).
     """
     COLS = ["#", "Tên chức năng", "Số API", "Trạng thái Role (Màu)", "Danh sách API"]
 
     def __init__(self, ext):
         self._ext = ext
+        self._rows = build_feature_rows(HierarchyStats(ext.features_list(), []), ext.active_feature_id())
+
+    def reload(self, rows):
+        same_size = len(rows) == len(self._rows)
+        self._rows = rows
+        if same_size:
+            # Row-level event: keeps the selection, unlike fireTableDataChanged.
+            self.fireTableRowsUpdated(0, len(rows) - 1)
+        else:
+            self.fireTableDataChanged()
+        return same_size
 
     def getRowCount(self):
-        return 1 + len(self._ext.features_list())
+        return len(self._rows)
 
     def getColumnCount(self):
         return len(self.COLS)
@@ -1393,23 +1645,18 @@ class FeatureTableModel(AbstractTableModel):
         return r > 0 and c == 1
 
     def feature_at_row(self, r):
-        if r <= 0:
-            return None
-        feats = self._ext.features_list()
-        idx = r - 1
-        return feats[idx] if 0 <= idx < len(feats) else None
+        if 0 < r < len(self._rows):
+            return self._rows[r][2]
+        return None
 
     def audit_level_at(self, r):
-        all_groups = self._ext.group_model.all_groups() if self._ext.group_model else []
-        if r <= 0:
-            lvl, _ = evaluate_feature_audit(all_groups)
-            return lvl
+        if 0 <= r < len(self._rows):
+            return self._rows[r][1]
+        return AUDIT_NONE
+
+    def accent_key_at(self, r):
         f = self.feature_at_row(r)
-        if f is None:
-            return AUDIT_NONE
-        f_groups = [g for g in all_groups if g.fid == f.fid]
-        lvl, _ = evaluate_feature_audit(f_groups)
-        return lvl
+        return None if f is None else f.fid
 
     def setValueAt(self, value, r, c):
         f = self.feature_at_row(r)
@@ -1422,44 +1669,10 @@ class FeatureTableModel(AbstractTableModel):
         self._ext.rename_feature(f.fid, raw or ("Chức năng %d" % f.fid))
 
     def getValueAt(self, r, c):
-        all_groups = self._ext.group_model.all_groups() if self._ext.group_model else []
-        feats = self._ext.features_list()
-        if r == 0:
-            if c == 0:
-                return "ALL"
-            if c == 1:
-                return "[Tất cả: %d chức năng]" % len(feats)
-            if c == 2:
-                return Integer(len(all_groups))
-            if c == 3:
-                _, summary = evaluate_feature_audit(all_groups)
-                return summary
-            if c == 4:
-                if not all_groups:
-                    return "-"
-                return "%s .. %s" % (format_api_label(all_groups[0].gid),
-                                     format_api_label(all_groups[-1].gid))
-            return ""
-        f = feats[r - 1]
-        f_groups = [g for g in all_groups if g.fid == f.fid]
-        if c == 0:
-            active = (f.fid == self._ext.active_feature_id())
-            return ("* #%d" % f.fid) if active else ("#%d" % f.fid)
-        if c == 1:
-            return format_feature_label(f.fid, f.name)
+        v = self._rows[r][0][c]
         if c == 2:
-            return Integer(len(f_groups))
-        if c == 3:
-            _, summary = evaluate_feature_audit(f_groups)
-            return summary
-        if c == 4:
-            if not f_groups:
-                return "(chưa có API)"
-            if len(f_groups) <= 3:
-                return ", ".join([format_api_label(g.gid) for g in f_groups])
-            return "%s .. %s (%d)" % (format_api_label(f_groups[0].gid),
-                                      format_api_label(f_groups[-1].gid), len(f_groups))
-        return ""
+            return Integer(v)
+        return v
 
 
 class GroupTableModel(AbstractTableModel):
@@ -1470,6 +1683,7 @@ class GroupTableModel(AbstractTableModel):
         self._ext = ext
         self._all_rows = []
         self._rows = []
+        self._row_of = {}
         self._filter_fid = None
         self._filter_prefix = None
         self._filter_audit = AUDIT_FILTER_ALL
@@ -1492,16 +1706,24 @@ class GroupTableModel(AbstractTableModel):
 
     def _rebuild_view(self):
         self._rows = [g for g in self._all_rows if self._matches(g)]
+        self._row_of = dict([(id(g), i) for i, g in enumerate(self._rows)])
 
+    # Filter setters are no-ops when nothing changes: a redundant fireTableDataChanged
+    # would drop the user's selection and re-sort the whole table.
     def set_feature_filter(self, fid):
+        if fid == self._filter_fid and self._filter_prefix is None:
+            return
         self._filter_fid = fid
         self._filter_prefix = None
         self._rebuild_view()
         self.fireTableDataChanged()
 
     def set_hierarchy_filter(self, prefix_path):
+        prefix = u_text(prefix_path).strip() if prefix_path else None
+        if prefix == self._filter_prefix and self._filter_fid is None:
+            return
         self._filter_fid = None
-        self._filter_prefix = u_text(prefix_path).strip() if prefix_path else None
+        self._filter_prefix = prefix
         self._rebuild_view()
         self.fireTableDataChanged()
 
@@ -1512,9 +1734,20 @@ class GroupTableModel(AbstractTableModel):
         return self._filter_fid
 
     def set_audit_filter(self, audit_level):
-        self._filter_audit = audit_level or AUDIT_FILTER_ALL
+        level = audit_level or AUDIT_FILTER_ALL
+        if level == self._filter_audit:
+            return
+        self._filter_audit = level
         self._rebuild_view()
         self.fireTableDataChanged()
+
+    def accent_key_at(self, r):
+        g = self.group_at(r)
+        return None if g is None else g.fid
+
+    def method_at(self, r):
+        g = self.group_at(r)
+        return None if g is None else g.method
 
     def audit_level_at(self, r):
         g = self.group_at(r)
@@ -1543,11 +1776,18 @@ class GroupTableModel(AbstractTableModel):
             self._ext.assign_group_to_path(g, raw)
 
     def add(self, group):
-        self._all_rows.append(group)
-        if self._matches(group):
-            self._rows.append(group)
-            n = len(self._rows) - 1
-            self.fireTableRowsInserted(n, n)
+        self.add_many([group])
+
+    def add_many(self, groups):
+        """Append a batch of captured groups with ONE table event."""
+        first = len(self._rows)
+        for group in groups:
+            self._all_rows.append(group)
+            if self._matches(group):
+                self._row_of[id(group)] = len(self._rows)
+                self._rows.append(group)
+        if len(self._rows) > first:
+            self.fireTableRowsInserted(first, len(self._rows) - 1)
 
     def remove_groups(self, groups):
         ids = set([id(g) for g in groups])
@@ -1558,7 +1798,14 @@ class GroupTableModel(AbstractTableModel):
     def clear(self):
         self._all_rows = []
         self._rows = []
+        self._row_of = {}
         self.fireTableDataChanged()
+
+    def group_count(self):
+        return len(self._all_rows)
+
+    def row_of(self, group):
+        return self._row_of.get(id(group), -1)
 
     def group_at(self, r):
         if 0 <= r < len(self._rows):
@@ -1577,14 +1824,17 @@ class GroupTableModel(AbstractTableModel):
         return [g for g in self._all_rows if hierarchy_matches_prefix(g.feature_name, prefix_path)]
 
     def refresh_group(self, group):
-        for i, g in enumerate(self._rows):
-            if g is group:
-                if self._matches(group):
-                    self.fireTableRowsUpdated(i, i)
-                    return
-                break
+        """True if only that row was repainted; False if the filtered view had to be rebuilt."""
+        i = self._row_of.get(id(group), -1)
+        matches = self._matches(group)
+        if i >= 0 and matches:
+            self.fireTableRowsUpdated(i, i)
+            return True
+        if i < 0 and not matches:
+            return True
         self._rebuild_view()
         self.fireTableDataChanged()
+        return False
 
     def getRowCount(self):
         return len(self._rows)
@@ -1652,6 +1902,18 @@ class ResultTableModel(AbstractTableModel):
     def set_group(self, group):
         self._group = group
         self.fireTableDataChanged()
+
+    def rows_updated(self):
+        """Repaint every row without dropping the selection."""
+        n = self.getRowCount()
+        if n > 0:
+            self.fireTableRowsUpdated(0, n - 1)
+
+    def accent_key_at(self, r):
+        res = self.result_at(r)
+        if res is None:
+            return None
+        return "ORIG" if getattr(res, "is_original", False) else None
 
     def group(self):
         return self._group
@@ -1726,14 +1988,121 @@ class ResultTableModel(AbstractTableModel):
         return ""
 
 
+def _mix(c1, c2, t):
+    """Blend colour c1 towards c2 by t (0..1)."""
+    return Color(int(c1.getRed() + (c2.getRed() - c1.getRed()) * t),
+                 int(c1.getGreen() + (c2.getGreen() - c1.getGreen()) * t),
+                 int(c1.getBlue() + (c2.getBlue() - c1.getBlue()) * t))
+
+
+class RowPalette(object):
+    """
+    Row colours derived from the component's own background/foreground, so the same
+    scheme reads well in Burp's light AND dark themes:
+      * every row is zebra-striped (two shades), including audit-coloured rows;
+      * audit levels tint the row instead of replacing its colour;
+      * HTTP methods and branches get their own stable accent colours.
+    """
+    HUES = {
+        AUDIT_INFO: (240, 185, 30),
+        AUDIT_OK: (55, 175, 90),
+        AUDIT_WARN: (245, 125, 25),
+        AUDIT_ERROR: (225, 60, 60),
+        AUDIT_REDIRECT: (65, 135, 235),
+    }
+    METHOD_HUES = {
+        "GET": (25, 135, 70),
+        "POST": (20, 100, 200),
+        "PUT": (185, 105, 0),
+        "PATCH": (125, 75, 190),
+        "DELETE": (200, 40, 40),
+    }
+    ACCENTS = [(66, 133, 244), (234, 88, 12), (22, 163, 74), (168, 85, 247),
+               (219, 39, 119), (13, 148, 136), (202, 138, 4), (100, 116, 139)]
+    ORIG_ACCENT = (37, 99, 235)
+
+    _cache = {}
+
+    @classmethod
+    def of(cls, bg, fg):
+        key = (bg.getRGB(), fg.getRGB())
+        pal = cls._cache.get(key)
+        if pal is None:
+            if len(cls._cache) > 8:
+                cls._cache.clear()
+            pal = cls(bg, fg)
+            cls._cache[key] = pal
+        return pal
+
+    def __init__(self, bg, fg):
+        self.dark = (bg.getRed() * 299 + bg.getGreen() * 587 + bg.getBlue() * 114) < 128000
+        self.fg = fg
+        self.zebra = (bg, _mix(bg, fg, 0.07))
+        self.grid = _mix(bg, fg, 0.14)
+        white = Color(255, 255, 255)
+        black = Color(0, 0, 0)
+        self.row_bg = {}
+        self.audit_fg = {}
+        for lvl, rgb in self.HUES.items():
+            hue = Color(rgb[0], rgb[1], rgb[2])
+            self.row_bg[lvl] = (_mix(bg, hue, 0.17), _mix(bg, hue, 0.27))
+            self.audit_fg[lvl] = _mix(hue, white, 0.35) if self.dark else _mix(hue, black, 0.45)
+        self.method_fg = {}
+        for name, rgb in self.METHOD_HUES.items():
+            hue = Color(rgb[0], rgb[1], rgb[2])
+            self.method_fg[name] = _mix(hue, white, 0.40) if self.dark else hue
+        self.accents = [Color(r, g, b) for (r, g, b) in self.ACCENTS]
+        self.orig_accent = Color(self.ORIG_ACCENT[0], self.ORIG_ACCENT[1], self.ORIG_ACCENT[2])
+        self.orig_fg = _mix(self.orig_accent, white, 0.45) if self.dark else self.orig_accent
+        self._stripe_borders = {}
+        self.pad_border = BorderFactory.createEmptyBorder(0, 6, 0, 6)
+
+    def background(self, lvl, view_row):
+        pair = self.row_bg.get(lvl, self.zebra)
+        return pair[view_row & 1]
+
+    def status_fg(self, code):
+        if 200 <= code < 300:
+            return self.audit_fg[AUDIT_OK]
+        if 300 <= code < 400:
+            return self.audit_fg[AUDIT_REDIRECT]
+        if 400 <= code < 500:
+            return self.audit_fg[AUDIT_INFO]
+        if code >= 500:
+            return self.audit_fg[AUDIT_ERROR]
+        return self.fg
+
+    def accent(self, key):
+        if key is None:
+            return None
+        if key == "ORIG":
+            return self.orig_accent
+        return self.accents[(int(key) - 1) % len(self.accents)]
+
+    def stripe_border(self, key):
+        """Left colour bar marking which branch (or the original request) a row belongs to."""
+        border = self._stripe_borders.get(key)
+        if border is None:
+            colour = self.accent(key)
+            if colour is None:
+                border = BorderFactory.createEmptyBorder(0, 10, 0, 6)
+            else:
+                border = BorderFactory.createCompoundBorder(
+                    BorderFactory.createMatteBorder(0, 4, 0, 0, colour),
+                    BorderFactory.createEmptyBorder(0, 6, 0, 6))
+            self._stripe_borders[key] = border
+        return border
+
+
 class AuditTableRenderer(DefaultTableCellRenderer):
     """
-    Row & cell color renderer for FeatureTable, GroupTable, and ResultTable:
-      - Yellow INFO (Color(255, 247, 195)): Any role call failed (401/403/4xx/5xx/Error) or permission diff
-      - Green OK    (Color(228, 248, 232)): All roles 2xx OK
-      - Orange WARN (Color(255, 230, 195)): Suspected auth bypass (Guest role got 2xx)
-      - Red ERROR   (Color(255, 222, 222)): Server 5xx / timeout
-      - Blue REDIR  (Color(225, 239, 255)): 3xx redirect
+    Shared cell renderer of the branch, API and role tables:
+      - zebra-striped rows, tinted by audit level (yellow INFO / green OK / orange WARN /
+        red ERROR / blue REDIRECT) - see RowPalette;
+      - a colour bar in the first column per branch, so APIs of different branches
+        cannot be confused when scanning a long list;
+      - coloured HTTP method, status code and audit verdict.
+    The BG_* / FG_* constants are the light-theme legend colours used by badges and buttons.
     """
     BG_INFO = Color(255, 247, 195)
     BG_OK = Color(228, 248, 232)
@@ -1750,62 +2119,70 @@ class AuditTableRenderer(DefaultTableCellRenderer):
     FG_ERR = Color(190, 15, 15)
     FG_REDIR = Color(10, 80, 180)
 
-    def __init__(self, model, status_col=None, audit_col=None):
+    def __init__(self, model, status_col=None, audit_col=None, method_col=None, bold_cols=()):
         DefaultTableCellRenderer.__init__(self)
         self._model = model
         self._status_col = status_col
         self._audit_col = audit_col
+        self._method_col = method_col
+        self._bold_cols = set(bold_cols)
+        if audit_col is not None:
+            self._bold_cols.add(audit_col)
+        if method_col is not None:
+            self._bold_cols.add(method_col)
+        self._plain_font = None
+        self._bold_font = None
 
     def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
         comp = DefaultTableCellRenderer.getTableCellRendererComponent(
-            self, table, value, isSelected, hasFocus, row, column)
+            self, table, value, isSelected, False, row, column)
+        model = self._model
+        model_row = table.convertRowIndexToModel(row)
+        model_col = table.convertColumnIndexToModel(column)
+        pal = RowPalette.of(table.getBackground(), table.getForeground())
+
+        font = table.getFont()
+        if font != self._plain_font:
+            self._plain_font = font
+            self._bold_font = font.deriveFont(Font.BOLD)
+        accent_key = model.accent_key_at(model_row)
+        bold = model_col in self._bold_cols or (accent_key == "ORIG" and model_col <= 1)
+        comp.setFont(self._bold_font if bold else font)
+        comp.setBorder(pal.stripe_border(accent_key) if column == 0 else pal.pad_border)
         if isSelected:
             return comp
 
-        model_row = table.convertRowIndexToModel(row)
-        model_col = table.convertColumnIndexToModel(column)
-        lvl = self._model.audit_level_at(model_row) if hasattr(self._model, "audit_level_at") else AUDIT_NONE
-
-        if lvl == AUDIT_INFO:
-            comp.setBackground(self.BG_INFO)
-        elif lvl == AUDIT_OK:
-            comp.setBackground(self.BG_OK)
-        elif lvl == AUDIT_WARN:
-            comp.setBackground(self.BG_WARN)
-        elif lvl == AUDIT_ERROR:
-            comp.setBackground(self.BG_ERR)
-        elif lvl == AUDIT_REDIRECT:
-            comp.setBackground(self.BG_REDIR)
-        else:
-            comp.setBackground(self.BG_EVEN if (row % 2 == 0) else self.BG_ODD)
-
-        comp.setForeground(self.FG_DEFAULT)
-
+        lvl = model.audit_level_at(model_row)
+        comp.setBackground(pal.background(lvl, row))
+        fg = pal.fg
         if model_col == self._audit_col:
-            if lvl == AUDIT_INFO:
-                comp.setForeground(self.FG_INFO)
-            elif lvl == AUDIT_OK:
-                comp.setForeground(self.FG_OK)
-            elif lvl == AUDIT_WARN:
-                comp.setForeground(self.FG_WARN)
-            elif lvl == AUDIT_ERROR:
-                comp.setForeground(self.FG_ERR)
-            elif lvl == AUDIT_REDIRECT:
-                comp.setForeground(self.FG_REDIR)
+            fg = pal.audit_fg.get(lvl, fg)
+        elif model_col == self._method_col:
+            fg = pal.method_fg.get(u_text(value).upper(), fg)
         elif model_col == self._status_col and value is not None:
             try:
-                code = int("%s" % value)
+                fg = pal.status_fg(int("%s" % value))
             except Exception:
-                code = 0
-            if 200 <= code < 300:
-                comp.setForeground(self.FG_OK)
-            elif 300 <= code < 400:
-                comp.setForeground(self.FG_REDIR)
-            elif 400 <= code < 500:
-                comp.setForeground(self.FG_INFO)
-            elif code >= 500:
-                comp.setForeground(self.FG_ERR)
+                pass
+        elif accent_key == "ORIG" and model_col <= 1:
+            fg = pal.orig_fg
+        comp.setForeground(fg)
         return comp
+
+
+def style_data_table(table):
+    """Common look of the data tables: taller rows, hairline row separators, no vertical grid."""
+    table.setRowHeight(24)
+    table.setShowGrid(False)
+    table.setShowHorizontalLines(True)
+    table.setIntercellSpacing(Dimension(0, 1))
+    table.setFillsViewportHeight(True)
+    try:
+        table.setGridColor(RowPalette.of(table.getBackground(), table.getForeground()).grid)
+        header = table.getTableHeader()
+        header.setFont(header.getFont().deriveFont(Font.BOLD))
+    except (Exception, Throwable):
+        pass
 
 
 class HeaderRuleTableModel(AbstractTableModel):
@@ -1895,6 +2272,19 @@ class _TreeListener(TreeSelectionListener):
         self._fn()
 
 
+class _LazyTreeLoader(TreeWillExpandListener):
+    """Fills an API node with its role rows the first time the user expands it."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def treeWillExpand(self, event):
+        self._fn(event.getPath().getLastPathComponent())
+
+    def treeWillCollapse(self, event):
+        pass
+
+
 class _Action(ActionListener):
     """Explicit ActionListener implementation (avoids Jython lambda coercion issues)."""
 
@@ -1938,13 +2328,15 @@ class HierarchyTreeNode(DefaultMutableTreeNode):
     while storing .kind, .payload, .label, and .audit_level directly on the node.
     """
 
-    def __init__(self, kind, payload, label, audit_level=AUDIT_NONE):
+    def __init__(self, kind, payload, label, audit_level=AUDIT_NONE, key=None):
         clean_label = u_text(label)
         DefaultMutableTreeNode.__init__(self, clean_label)
         self.kind = kind
         self.payload = payload
         self.label = clean_label
         self.audit_level = audit_level
+        self.key = key          # stable identity across rebuilds (selection / expansion restore)
+        self.loaded = True      # False while a GROUP node only holds its placeholder child
 
     def toString(self):
         return getattr(self, "label", "")
@@ -2019,7 +2411,17 @@ class HierarchyTreeRenderer(DefaultTreeCellRenderer):
                 comp.setFont(self.FONT_NORMAL)
 
             if not selected:
-                if audit_level == AUDIT_WARN:
+                tree_bg = tree.getBackground() if (tree is not None and hasattr(tree, "getBackground")) else None
+                tree_fg = tree.getForeground() if (tree_bg is not None and hasattr(tree, "getForeground")) else None
+                if tree_bg is not None and tree_fg is not None:
+                    pal = RowPalette.of(tree_bg, tree_fg)
+                    if audit_level in pal.row_bg:
+                        bg, fg = pal.row_bg[audit_level][0], pal.audit_fg[audit_level]
+                    elif kind == "ORIG":
+                        bg, fg = _mix(tree_bg, pal.orig_accent, 0.14), pal.orig_fg
+                    else:
+                        bg, fg = None, tree_fg
+                elif audit_level == AUDIT_WARN:
                     bg, fg = AuditTableRenderer.BG_WARN, AuditTableRenderer.FG_WARN
                 elif audit_level == AUDIT_INFO:
                     bg, fg = AuditTableRenderer.BG_INFO, AuditTableRenderer.FG_INFO
@@ -2031,7 +2433,6 @@ class HierarchyTreeRenderer(DefaultTreeCellRenderer):
                     bg, fg = Color(232, 240, 254), Color(20, 65, 150)
                 else:
                     bg, fg = None, AuditTableRenderer.FG_DEFAULT
-                tree_bg = tree.getBackground() if (tree is not None and hasattr(tree, "getBackground")) else None
                 eff_bg = bg if bg is not None else tree_bg
                 if hasattr(self, "setBackgroundNonSelectionColor") and eff_bg is not None:
                     self.setBackgroundNonSelectionColor(eff_bg)
@@ -2647,6 +3048,30 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.inline_role_editor = None
         self.group_path_editor_combo = None
         self._updating_feature_bar = False
+        self.feature_table = None
+        self.group_table = None
+        self.result_table = None
+
+        # Pending UI work, written by any thread and drained by the Swing timer (_ui_tick).
+        self._ui_lock = threading.Lock()
+        self._p_new = []
+        self._p_dirty = {}
+        self._p_done_res = set()
+        self._p_structure = False
+        self._p_status = False
+        self._p_log = []
+        self._ui_timer = None
+        self._in_tick = False
+        self._stats = None
+        self._stale_stats = True
+        self._stale_left = True
+        self._stale_history = True
+        self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state()}
+        self._restoring_tree = False
+        self._restoring_feature_sel = False
+        self._chips_path = None
+        self._path_combo_state = None
+        self._persist_failures = 0
 
         self.config = merge_config(self._load_json_setting(SETTINGS_KEY_CONFIG, {}))
         regex_err = self._recompile_filters(self.config)
@@ -2663,37 +3088,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.send_executor = Executors.newFixedThreadPool(self.config["threads"])
 
         callbacks.registerExtensionStateListener(self)
-        # Build UI synchronously to avoid race condition where getUiComponent() is called before _build_ui() completes
-        try:
-            callbacks.printOutput("[theMythOfCrawl] Starting UI initialization...")
-            self._build_ui()
-            callbacks.printOutput("[theMythOfCrawl] UI built successfully, adding tab to Burp...")
-            callbacks.addSuiteTab(self)
-            callbacks.printOutput("[theMythOfCrawl] Tab added successfully.")
-            callbacks.registerHttpListener(self)
-            callbacks.registerContextMenuFactory(self)
-            self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
-            SwingUtilities.invokeLater(_Task(self._refresh_feature_views, self.log))
-            SwingUtilities.invokeLater(_Task(self.update_status, self.log))
-        except Throwable as t:
-            tb = u_text(traceback.format_exc())
-            err_msg = "Error building UI (Java): %s\n%s" % (u_text(t), tb)
-            callbacks.printError("[theMythOfCrawl] " + err_msg)
-            if self.main_panel is None:
-                self.main_panel = JPanel(BorderLayout())
-            self.main_panel.add(JScrollPane(JTextArea(err_msg)), BorderLayout.CENTER)
-            callbacks.addSuiteTab(self)
-        except Exception as e:
-            tb = u_text(traceback.format_exc())
-            err_msg = "Error building UI: %s" % tb
-            callbacks.printError("[theMythOfCrawl] " + err_msg)
-            if self.main_panel is None:
-                self.main_panel = JPanel(BorderLayout())
-            self.main_panel.add(JScrollPane(JTextArea(err_msg)), BorderLayout.CENTER)
-            callbacks.addSuiteTab(self)
+        # The UI is built and the tab registered before this method returns, so
+        # getUiComponent() can never be asked for a panel that does not exist yet.
+        self._init_ui()
 
         if regex_err:
             self.log("Stored API regex is invalid: %s" % u_text(regex_err))
+
+    @staticmethod
+    def _new_tree_state():
+        return {"collapsed": set(), "expanded": set(), "next_ok": 0.0, "nodes": {}}
 
     def _build_error_fallback_panel(self, err_msg):
         panel = JPanel(BorderLayout())
@@ -2702,8 +3106,72 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         panel.add(JScrollPane(area), BorderLayout.CENTER)
         return panel
 
+    def _init_ui(self):
+        if self._unloaded:
+            return
+        ui_panel = None
+        try:
+            self._build_ui()
+            ui_panel = self.main_panel
+        except Throwable as t:
+            msg = "Error building UI (Java): %s\n%s" % (u_text(t), u_text(traceback.format_exc()))
+            self._print_error(msg)
+            ui_panel = self._build_error_fallback_panel(msg)
+        except Exception:
+            msg = "Error building UI:\n%s" % u_text(traceback.format_exc())
+            self._print_error(msg)
+            ui_panel = self._build_error_fallback_panel(msg)
+        if ui_panel is None:
+            ui_panel = self._build_error_fallback_panel("Error building UI: main_panel was None.")
+        self.main_panel = ui_panel
+
+        try:
+            self.callbacks.addSuiteTab(self)
+            self.callbacks.printOutput("%s: tab '%s' registered." % (EXT_NAME, EXT_NAME))
+        except Throwable as t:
+            self._print_error("Error calling addSuiteTab (Java): %s\n%s" % (
+                u_text(t), u_text(traceback.format_exc())))
+        except Exception:
+            self._print_error("Error calling addSuiteTab:\n%s" % u_text(traceback.format_exc()))
+
+        try:
+            self.callbacks.registerHttpListener(self)
+            self.callbacks.registerContextMenuFactory(self)
+        except Throwable as t:
+            self._print_error("Error registering listeners (Java): %s\n%s" % (
+                u_text(t), u_text(traceback.format_exc())))
+        except Exception:
+            self._print_error("Error registering listeners:\n%s" % u_text(traceback.format_exc()))
+
+        self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+        self._start_ui_timer()
+        self._refresh_feature_views()
+        self.update_status()
+
+    def _print_error(self, msg):
+        try:
+            self.callbacks.printError(msg)
+        except (Throwable, Exception):
+            pass
+
+    def _start_ui_timer(self):
+        try:
+            if self._ui_timer is not None:
+                self._ui_timer.stop()
+            timer = Timer(UI_TICK_MS, _Action(self._ui_tick))
+            timer.setCoalesce(True)
+            timer.start()
+            self._ui_timer = timer
+        except (Throwable, Exception):
+            self._print_error("Could not start UI timer:\n%s" % u_text(traceback.format_exc()))
+
     def extensionUnloaded(self):
         self._unloaded = True
+        try:
+            if self._ui_timer is not None:
+                self._ui_timer.stop()
+        except (Throwable, Exception):
+            pass
         try:
             self.capture_executor.shutdownNow()
             self.send_executor.shutdownNow()
@@ -2722,22 +3190,164 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     # --------------------------------------------------------------- logging
     def log(self, msg):
+        """Thread-safe: lines are buffered and written (extension Output + Log tab) by the UI tick."""
         line = "[%s] %s" % (time.strftime("%H:%M:%S"), u_text(msg))
+        if self._ui_timer is None:
+            try:
+                self.callbacks.printOutput(line)
+            except (Throwable, Exception):
+                pass
+            return
+        with self._ui_lock:
+            if len(self._p_log) < 5000:
+                self._p_log.append(line)
+
+    def _flush_log(self, lines):
+        text = "\n".join(lines)
         try:
-            self.callbacks.printOutput(line)
+            self.callbacks.printOutput(text)
         except (Throwable, Exception):
             pass
+        area = self.log_area
+        if area is None:
+            return
+        area.append(text + "\n")
+        doc = area.getDocument()
+        if doc.getLength() > 300000:
+            doc.remove(0, doc.getLength() - 200000)
+        area.setCaretPosition(doc.getLength())
 
-        def append():
-            area = self.log_area
-            if area is None:
-                return
-            area.append(line + "\n")
-            doc = area.getDocument()
-            if doc.getLength() > 300000:
-                doc.remove(0, doc.getLength() - 200000)
-            area.setCaretPosition(doc.getLength())
-        ui_call(append)
+    # ------------------------------------------------------------ UI refresh
+    def _mark(self, structure=False, status=False):
+        with self._ui_lock:
+            if structure:
+                self._p_structure = True
+            if status:
+                self._p_status = True
+
+    def _ui_pending(self):
+        with self._ui_lock:
+            return bool(self._p_new or self._p_dirty or self._p_structure or self._p_status or self._p_log)
+
+    def _ui_tick(self, event=None):
+        """
+        The ONLY place that pushes captured/replayed data into Swing. The timer calls it
+        every UI_TICK_MS; user actions on the EDT call it directly (event=None) so their
+        effect is immediate and not throttled.
+        """
+        if self._unloaded or self._in_tick:
+            return
+        self._in_tick = True
+        try:
+            self._ui_tick_body(force=(event is None))
+        except Throwable as t:
+            self._print_error("UI refresh error (Java): %s\n%s" % (u_text(t), u_text(traceback.format_exc())))
+        except Exception:
+            self._print_error("UI refresh error:\n%s" % u_text(traceback.format_exc()))
+        finally:
+            self._in_tick = False
+
+    def _ui_tick_body(self, force):
+        with self._ui_lock:
+            new_groups, self._p_new = self._p_new, []
+            dirty, self._p_dirty = self._p_dirty, {}
+            done_res, self._p_done_res = self._p_done_res, set()
+            structure, self._p_structure = self._p_structure, False
+            status, self._p_status = self._p_status, False
+            lines, self._p_log = self._p_log, []
+        if lines:
+            self._flush_log(lines)
+        if self.group_model is None or self.group_table is None:
+            return
+        if new_groups:
+            self.group_model.add_many(new_groups)
+            if self.group_table.getSelectedRow() < 0 and self.group_table.getRowCount() > 0:
+                self.group_table.setRowSelectionInterval(0, 0)
+            structure = True
+        if dirty:
+            self._apply_dirty_groups(dirty, done_res)
+            structure = True
+        if structure:
+            self._stale_stats = True
+            self._stale_left = True
+            self._stale_history = True
+        self._refresh_stale_views(force)
+        if status or structure:
+            self._do_update_status()
+
+    def _apply_dirty_groups(self, dirty, done_res):
+        cur = self.result_model.group()
+        view_rebuilt = False
+        for g in dirty.values():
+            if not self.group_model.refresh_group(g):
+                view_rebuilt = True
+        if view_rebuilt and cur is not None and self.group_table.getSelectedRow() < 0:
+            self._select_group_in_table(cur)
+        if cur is not None and id(cur) in dirty and self.result_model.group() is cur:
+            self.result_model.rows_updated()
+            self._refresh_grouped_repeater_bar()
+            _, sel = self.current_selection()
+            if sel is not None and id(sel) in done_res:
+                self._show_result(sel)
+
+    def _refresh_stale_views(self, force):
+        if self._stale_stats or self._stats is None:
+            self._stale_stats = False
+            self._stats = HierarchyStats(self.features_list(), self.group_model.all_groups())
+            self._reload_feature_table(self._stats)
+        stats = self._stats
+        self._sync_path_combos(stats.paths)
+        tree = self.left_hierarchy_tree
+        if self._stale_left and tree is not None and tree.isShowing():
+            label = "Tất cả Group & API (%d Nhánh | %d API)" % (len(stats.features), stats.total)
+            if self._rebuild_tree("left", tree, self.left_hierarchy_tree_model, label, stats, force):
+                self._stale_left = False
+        tree = self.history_tree
+        if self._stale_history and tree is not None and tree.isShowing():
+            label = "Tổng cộng: %d Nhánh Chức năng | %d API đã đi qua" % (len(stats.features), stats.total)
+            if self._rebuild_tree("history", tree, self.history_tree_model, label, stats, force):
+                self._stale_history = False
+                self._refresh_history_summary_only()
+
+    def _reload_feature_table(self, stats):
+        if self.feature_model is None or self.feature_table is None:
+            return
+        sel = self.feature_table.getSelectedRow()
+        self._restoring_feature_sel = True
+        try:
+            same_size = self.feature_model.reload(build_feature_rows(stats, self.active_feature_id()))
+            if not same_size:
+                n = self.feature_model.getRowCount()
+                if 0 <= sel < n:
+                    self.feature_table.setRowSelectionInterval(sel, sel)
+                elif n > 0:
+                    self.feature_table.setRowSelectionInterval(0, 0)
+        finally:
+            self._restoring_feature_sel = False
+        if not same_size:
+            self._on_feature_filter_selected()
+
+    def _sync_path_combos(self, paths):
+        combo = getattr(self, "cb_existing_paths", None)
+        editor_combo = getattr(self, "group_path_editor_combo", None)
+        if combo is None or editor_combo is None:
+            return
+        cur_act = self.active_feature().name
+        state = (tuple(paths), cur_act)
+        if state == self._path_combo_state or self.group_table.isEditing():
+            return
+        self._path_combo_state = state
+        editor_combo.removeAllItems()
+        for p in paths:
+            editor_combo.addItem(p)
+        self._updating_path_combos = True
+        try:
+            combo.removeAllItems()
+            for p in paths:
+                combo.addItem(p)
+            combo.setSelectedItem(cur_act)
+        finally:
+            self._updating_path_combos = False
 
     # -------------------------------------------------------------- features
     def features_list(self):
@@ -3154,6 +3764,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         group = ApiGroup(gid, service, method, path, "%s" % url, req, resp, source,
                          feat.fid, feat.name)
+        group.message_builder = self._build_message
         if resp is not None:
             try:
                 rinfo = self.helpers.analyzeResponse(resp)
@@ -3164,8 +3775,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         group.sync_original_meta(cfg["short_path_len"], cfg.get("include_feature_in_tab", False))
         group.results = self._clone_for_roles(group, info, roles, cfg)
         group.recalc_audit()
+        group.attach_store(self._persist(service, req, resp))
 
-        ui_call(lambda: self._add_group_ui(group))
+        with self._ui_lock:
+            self._p_new.append(group)
         self.log("%s (%s) [%s]: %s %s -> 1 API gốc + %d role clone(s) [%s]" %
                  (format_api_label(gid), format_group_id(gid),
                   format_feature_label(feat.fid, feat.name),
@@ -3176,25 +3789,48 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.replay(group, group.results)
 
     def _clone_for_roles(self, group, info, roles, cfg):
-        """Build exactly one request per enabled role; method/URL/params/body preserved."""
-        req = group.orig_request
-        base_headers = [u_text(h) for h in info.getHeaders()]
-        body = Arrays.copyOfRange(req, info.getBodyOffset(), len(req))
+        """
+        One VIRTUAL request per enabled role: only the role's rule snapshot is stored.
+        The bytes are built by ApiGroup.build_request() when the role is viewed, sent or
+        pushed to Repeater (method/URL/params/body always come from the original).
+        """
+        group.base_headers = [u_text(h) for h in info.getHeaders()]
+        group.body_offset = info.getBodyOffset()
         results = []
         for idx, role in enumerate(roles):
-            new_headers = apply_header_rules(base_headers, role["headers"])
-            jlist = ArrayList()
-            for h in new_headers:
-                jlist.add(h)
-            new_req = self.helpers.buildHttpMessage(jlist, body)
             display = display_role_name(role["name"], idx, cfg["number_roles_in_tab"])
-            res = RoleResult(display, idx, new_req, is_stripped_auth=is_stripped_auth_role(role))
+            res = RoleResult(display, idx, None, is_stripped_auth=is_stripped_auth_role(role),
+                             group=group, rules=role["headers"])
             res.tab_name = repeater_tab_name(group.gid, group.method, group.path, display,
                                              cfg["short_path_len"], group.fid,
                                              cfg.get("include_feature_in_tab", False))
             evaluate_role_result(group, res)
             results.append(res)
         return results
+
+    def _build_message(self, headers, orig_request, body_offset):
+        jlist = ArrayList()
+        for h in headers:
+            jlist.add(h)
+        body = Arrays.copyOfRange(orig_request, body_offset, len(orig_request))
+        return self.helpers.buildHttpMessage(jlist, body)
+
+    def _persist(self, service, request, response):
+        """
+        Move a message into Burp's temp file. Returns the persisted handle, or None when
+        disk storage is off / unavailable (the caller then keeps the bytes in memory).
+        """
+        if self._persist_failures >= 3 or not self.config.get("store_on_disk", True):
+            return None
+        try:
+            store = self.callbacks.saveBuffersToTempFiles(_BytesMessage(service, request, response))
+            self._persist_failures = 0
+            return store
+        except (Throwable, Exception):
+            self._persist_failures += 1
+            if self._persist_failures == 3:
+                self.log("Burp temp-file storage unavailable - keeping messages in memory.")
+            return None
 
     def rebuild_group(self, group):
         """Re-clone a group's original request with the *current* enabled roles."""
@@ -3215,6 +3851,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 if self.result_model.group() is group:
                     self.result_model.set_group(group)
                     self._select_first_result()
+                    self._refresh_grouped_repeater_bar()
                 self._refresh_feature_views()
             ui_call(apply)
             self.log("%s (%s) rebuilt with 1 API gốc + %d current role(s)." %
@@ -3293,7 +3930,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         evaluate_role_result(group, res)
         started = time.time()
         try:
-            rr = self.callbacks.makeHttpRequest(group.service, res.request)
+            request = res.request  # a virtual role request is built here, used once, then dropped
+            if request is None:
+                raise ValueError("request could not be built")
+            started = time.time()
+            rr = self.callbacks.makeHttpRequest(group.service, request)
             resp = rr.getResponse() if rr is not None else None
             res.elapsed_ms = int((time.time() - started) * 1000)
             res.sent_count += 1
@@ -3305,13 +3946,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 res.error = "No response (timeout / connection failure)"
             else:
                 rinfo = self.helpers.analyzeResponse(resp)
-                res.response = resp
+                store = self._persist(group.service, request, resp)
+                if store is not None:
+                    res.set_response_store(store)
+                else:
+                    res.response = resp
                 res.status = rinfo.getStatusCode()
                 res.length = len(resp) - rinfo.getBodyOffset()
                 res.state = STATE_DONE
                 res.error = ""
                 if getattr(res, "is_original", False):
-                    group.orig_response = resp
+                    group.has_orig_response = True
                     group.orig_status = res.status
                     group.orig_length = res.length
         except Throwable as t:
@@ -3330,36 +3975,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._notify_results(group, res, finished_send=all_settled)
 
     def _notify_results(self, group, res, finished_send=False):
-        # Coalesce rapid background updates (~100ms window) so 200 concurrent role
-        # responses never flood the Swing Event Dispatch Thread.
-        now = time.time()
-        with self._state_lock:
-            if not finished_send and self._ui_dirty and (now - self._last_ui_flush) < 0.10:
-                return
-            self._ui_dirty = True
-            self._last_ui_flush = now
-
-        def refresh():
-            with self._state_lock:
-                self._ui_dirty = False
-            if self.group_model is None:
-                return
-            self.group_model.refresh_group(group)
-            if self.feature_model is not None and self.feature_table is not None:
-                sel_feat = self.feature_table.getSelectedRow()
-                self.feature_model.fireTableDataChanged()
-                if 0 <= sel_feat < self.feature_model.getRowCount():
-                    self.feature_table.setRowSelectionInterval(sel_feat, sel_feat)
-            if self.result_model.group() is group:
-                self.result_model.fireTableDataChanged()
-                self._refresh_grouped_repeater_bar()
-                _, sel = self.current_selection()
-                if sel is not None and (res is None or sel is res):
-                    self._show_result(sel)
+        """Record that a group changed; the UI tick repaints it (any thread, never blocks)."""
+        with self._ui_lock:
+            self._p_dirty[id(group)] = group
+            if res is not None and res.state in (STATE_DONE, STATE_ERROR):
+                self._p_done_res.add(id(res))
             if finished_send:
-                self._refresh_feature_views()
-            self.update_status()
-        ui_call(refresh)
+                self._p_structure = True
+            self._p_status = True
 
     @staticmethod
     def _make_color_badge(text, bg_color, fg_color):
@@ -3448,6 +4071,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.log_area = JTextArea()
         self.log_area.setEditable(False)
         self.tabs.addTab("Log", JScrollPane(self.log_area))
+        # A tree that was hidden while APIs arrived is rebuilt the moment its tab is opened.
+        self.tabs.addChangeListener(_Change(lambda e: self._ui_tick(None)))
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
         try:
             self.callbacks.customizeUiComponent(self.main_panel)
@@ -3521,7 +4146,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.left_hierarchy_tree_model = DefaultTreeModel(left_root)
         self.left_hierarchy_tree = JTree(self.left_hierarchy_tree_model)
         self.left_hierarchy_tree.setRowHeight(22)
+        self.left_hierarchy_tree.setLargeModel(True)
         self.left_hierarchy_tree.setCellRenderer(HierarchyTreeRenderer())
+        self.left_hierarchy_tree.addTreeWillExpandListener(_LazyTreeLoader(
+            lambda node: self._lazy_load_tree_node("left", self.left_hierarchy_tree_model, node)))
         self.left_hierarchy_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
         self.left_hierarchy_tree.addTreeSelectionListener(_TreeListener(self._on_left_hierarchy_tree_selected))
         self.left_hierarchy_tree.addMouseListener(
@@ -3529,14 +4157,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         self.feature_model = FeatureTableModel(self)
         self.feature_table = JTable(self.feature_model)
-        self.feature_table.setRowHeight(22)
+        style_data_table(self.feature_table)
         self.feature_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         self.feature_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_feature_filter_selected))
         self.feature_table.addMouseListener(
             _TablePopupListener(self.feature_table, self._show_feature_table_popup))
         feat_renderer = AuditTableRenderer(self.feature_model, status_col=None, audit_col=3)
-        for col, width in ((0, 42), (1, 165), (2, 50), (3, 155), (4, 115)):
+        for col, width in ((0, 56), (1, 165), (2, 50), (3, 155), (4, 115)):
             column = self.feature_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(feat_renderer)
@@ -3544,6 +4172,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         left_tabs = JTabbedPane()
         left_tabs.addTab("Cây Sub-folder", JScrollPane(self.left_hierarchy_tree))
         left_tabs.addTab("Bảng Nhánh", JScrollPane(self.feature_table))
+        left_tabs.addChangeListener(_Change(lambda e: self._ui_tick(None)))
         self.left_group_tabs = left_tabs
 
         feat_panel = JPanel(BorderLayout(2, 2))
@@ -3571,15 +4200,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.group_model = GroupTableModel(self)
         self.group_table = JTable(self.group_model)
         self.group_table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE)
-        self.group_table.setRowHeight(22)
+        style_data_table(self.group_table)
         self.group_table.setAutoCreateRowSorter(True)
         self.group_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.group_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_group_selected))
         self.group_table.addMouseListener(
             _TablePopupListener(self.group_table, self._show_group_table_popup))
-        grp_renderer = AuditTableRenderer(self.group_model, status_col=7, audit_col=3)
-        for col, width in ((0, 55), (1, 46), (2, 210), (3, 185), (4, 55), (5, 130),
+        grp_renderer = AuditTableRenderer(self.group_model, status_col=7, audit_col=3, method_col=4,
+                                          bold_cols=(0,))
+        for col, width in ((0, 72), (1, 46), (2, 200), (3, 185), (4, 68), (5, 130),
                            (6, 235), (7, 48), (8, 62), (9, 95), (10, 58), (11, 52), (12, 60)):
             column = self.group_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
@@ -3600,7 +4230,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # Bottom detail area: 1 API Gốc + N Role results table + Built-in Grouped Repeater + Editable Viewers
         self.result_model = ResultTableModel()
         self.result_table = JTable(self.result_model)
-        self.result_table.setRowHeight(22)
+        style_data_table(self.result_table)
         self.result_table.setAutoCreateRowSorter(True)
         self.result_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.result_table.getSelectionModel().addListSelectionListener(
@@ -3609,7 +4239,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.result_table.addMouseListener(
             _TablePopupListener(self.result_table, self._show_result_table_popup))
         res_renderer = AuditTableRenderer(self.result_model, status_col=4, audit_col=2)
-        for col, width in ((0, 52), (1, 185), (2, 210), (3, 80), (4, 55), (5, 75),
+        for col, width in ((0, 66), (1, 185), (2, 210), (3, 80), (4, 55), (5, 75),
                            (6, 85), (7, 70), (8, 50), (9, 340)):
             column = self.result_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
@@ -3702,7 +4332,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.history_tree_model = DefaultTreeModel(root)
         self.history_tree = JTree(self.history_tree_model)
         self.history_tree.setRowHeight(22)
+        self.history_tree.setLargeModel(True)
         self.history_tree.setCellRenderer(HierarchyTreeRenderer())
+        self.history_tree.addTreeWillExpandListener(_LazyTreeLoader(
+            lambda node: self._lazy_load_tree_node("history", self.history_tree_model, node)))
         self.history_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
         self.history_tree.addTreeSelectionListener(_TreeListener(self._on_history_tree_selected))
         self.history_tree.addMouseListener(
@@ -3731,7 +4364,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         panel = JPanel(BorderLayout(4, 4))
         self.role_model = RoleTableModel(self)
         self.role_table = JTable(self.role_model)
-        self.role_table.setRowHeight(22)
+        self.role_table.setRowHeight(24)
         self.role_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.role_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_role_row_selected))
@@ -3816,6 +4449,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.cb_feat_tab = JCheckBox(
             "Gắn mã Chức năng vào tên tab Repeater ([F01-G01:POST /v1/...] thay vì [G01:POST /v1/...])",
             cfg.get("include_feature_in_tab", False), actionPerformed=on_change)
+        self.cb_store_disk = JCheckBox(
+            "Lưu request/response vào file tạm của Burp thay vì RAM (khuyên dùng khi bắt nhiều API)",
+            cfg.get("store_on_disk", True), actionPerformed=on_change)
         self.sp_threads = JSpinner(SpinnerNumberModel(cfg["threads"], 1, 64, 1))
         self.sp_throttle = JSpinner(SpinnerNumberModel(cfg["throttle_ms"], 0, 60000, 50))
         self.sp_pathlen = JSpinner(SpinnerNumberModel(cfg["short_path_len"], 8, 200, 1))
@@ -3840,6 +4476,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         add_row(JLabel("Short path max length in tab names:"), self.sp_pathlen)
         add_row(JLabel("Replay worker threads:"), self.sp_threads)
         add_row(JLabel("Throttle per request (ms):"), self.sp_throttle)
+        add_row(self.cb_store_disk)
         apply_btn = JButton("Apply Text Fields", actionPerformed=on_change)
         reset_btn = JButton("Restore Defaults", actionPerformed=self._on_restore_defaults)
         btns = JPanel(FlowLayout(FlowLayout.LEFT))
@@ -3870,6 +4507,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "threads": int(self.sp_threads.getValue()),
             "throttle_ms": int(self.sp_throttle.getValue()),
             "short_path_len": int(self.sp_pathlen.getValue()),
+            "store_on_disk": self.cb_store_disk.isSelected(),
         }
 
     def _on_top_filter_toggled(self, event):
@@ -3908,6 +4546,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.sp_threads.setValue(Integer(d["threads"]))
         self.sp_throttle.setValue(Integer(d["throttle_ms"]))
         self.sp_pathlen.setValue(Integer(d["short_path_len"]))
+        self.cb_store_disk.setSelected(d["store_on_disk"])
         self._on_settings_changed(None)
 
     # ---- Dynamic N-Level Sub-Folder Chips & Dropdown Menus
@@ -3915,6 +4554,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         panel = getattr(self, "subfolder_chips_panel", None)
         if panel is None:
             return
+        self._chips_path = path_text
         panel.removeAll()
         parts = split_hierarchy_path(path_text)
         for idx, seg in enumerate(parts):
@@ -4345,32 +4985,36 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         menu.show(event.getComponent(), event.getX(), event.getY())
 
     def update_status(self):
-        def refresh():
-            if self.status_label is None or getattr(self, "btn_replay_all", None) is None:
-                return
-            cfg = self.get_config()
-            all_groups = self.group_model.all_groups() if getattr(self, "group_model", None) is not None else []
-            info_apis = len([g for g in all_groups if getattr(g, "_audit_level", None) == AUDIT_INFO])
-            feats = self.features_list()
-            act = self.active_feature()
-            mode_str = "Auto" if cfg.get("auto_send") else "Manual"
-            self.status_label.setText(
-                "%s | Roles: %d/%d | Nhánh: %d | API: %d (Vàng: %d)"
-                % (mode_str, self.roles.enabled_count(), self.roles.count(),
-                   len(feats), len(all_groups), info_apis))
-            if getattr(self, "lbl_active_feature", None) is not None:
-                parts = split_hierarchy_path(act.name)
-                self.lbl_active_feature.setText("Path [#%d | %d cấp]:" % (act.fid, len(parts)))
-                if not self.tf_feature_name.hasFocus():
-                    self.tf_feature_name.setText(act.name)
+        """Refresh the header bar: immediately on the EDT, otherwise at the next UI tick."""
+        if SwingUtilities.isEventDispatchThread():
+            self._do_update_status()
+        else:
+            self._mark(status=True)
+
+    def _do_update_status(self):
+        if self.status_label is None or getattr(self, "btn_replay_all", None) is None:
+            return
+        cfg = self.get_config()
+        stats = self._stats
+        if stats is None:
+            stats = HierarchyStats(self.features_list(), [])
+        act = self.active_feature()
+        mode_str = "Auto" if cfg.get("auto_send") else "Manual"
+        self.status_label.setText(
+            "%s | Roles: %d/%d | Nhánh: %d | API: %d (Vàng: %d)"
+            % (mode_str, self.roles.enabled_count(), self.roles.count(),
+               len(self.features_list()), stats.total, stats.info_exact))
+        if getattr(self, "lbl_active_feature", None) is not None:
+            parts = split_hierarchy_path(act.name)
+            self.lbl_active_feature.setText("Path [#%d | %d cấp]:" % (act.fid, len(parts)))
+            if not self.tf_feature_name.hasFocus():
+                self.tf_feature_name.setText(act.name)
+            if act.name != self._chips_path:
                 self._rebuild_subfolder_chips(act.name)
-                act_count = len([x for x in all_groups if x.fid == act.fid])
-                self.lbl_feature_counter.setText("(%d API)" % act_count)
-            n = self.roles.enabled_count()
-            g, _ = self.current_selection()
-            count = len(g.results) if g is not None else n
-            self.btn_replay_all.setText("▶ Gửi API (%d Roles)" % count)
-        ui_call(refresh)
+            self.lbl_feature_counter.setText("(%d API)" % len(stats.groups_of(act.fid)))
+        g, _ = self.current_selection()
+        count = len(g.results) if g is not None else self.roles.enabled_count()
+        self.btn_replay_all.setText("▶ Gửi API (%d Roles)" % count)
 
     # ---------------------------------------- feature & history view helpers
     def _refresh_history_summary_only(self):
@@ -4380,162 +5024,162 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.history_summary_area.setText(text)
         self.history_summary_area.setCaretPosition(0)
 
-    def _build_nested_hierarchy_root(self, feats, all_groups, root_label):
+    def _build_hierarchy_nodes(self, stats, root_label, state):
         """
-        Build a nested HierarchyTreeNode hierarchy where N-level paths like
-        'Toppage > menu > sub1 > button "Search"' expand cleanly with human-readable labels:
-          📁 [Cấp 1] Toppage (11 API | ...)
-            └── 📁 [Cấp 2] menu (11 API | ...)
-                  └── 📁 [Cấp 3] button_3 (11 API | ...)
-                        └── 📁 [Cấp 4] test (11 API | ...)
-                              └── 🌐 API 1 [G01]: GET /path (1 Gốc + 10 Roles)
-                                    ├── 📌 [API GỐC] 00_Original (Acc Crawl)
-                                    └── 👤 01_Admin .. 10_Guest
+        Build the nested tree:
+          [Cấp 1] Toppage (11 API | ...)
+            └── [Cấp 2] menu (11 API | ...)
+                  └── API 1 [G01]: GET /path (1 Gốc + 10 Roles)
+                        ├── [API GỐC] 00_Original      <- created only when the API node is
+                        └── 01_Admin .. 10_Guest          expanded (see _load_group_children)
+        Folder counters come from HierarchyStats (one pass), and an API costs 2 nodes
+        instead of 2 + roles. Returns (root, nodes_by_key, nodes_to_expand).
         """
-        root = HierarchyTreeNode("ROOT", "", root_label, audit_level=AUDIT_NONE)
-        folder_nodes = {}  # prefix -> HierarchyTreeNode
-        ordered_paths = []
-        seen_paths = set()
-        for f in feats:
-            np = normalize_hierarchy_path(f.name)
-            if np not in seen_paths:
-                seen_paths.add(np)
-                ordered_paths.append(np)
-        for g in all_groups:
-            np = normalize_hierarchy_path(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH)
-            if np not in seen_paths:
-                seen_paths.add(np)
-                ordered_paths.append(np)
+        root = HierarchyTreeNode("ROOT", "", root_label, audit_level=AUDIT_NONE, key=("ROOT",))
+        nodes = {root.key: root}
+        expand = []
+        open_ids = set([id(root)])
+        collapsed = state["collapsed"]
+        expanded = state["expanded"]
 
-        def ensure_folder_chain(full_path):
-            parts = split_hierarchy_path(full_path)
-            parent_node = root
+        def ensure_folder_chain(parts):
+            parent = root
+            lowered = [p.lower() for p in parts]
             for idx in range(len(parts)):
-                prefix = " > ".join(parts[:idx + 1])
-                seg_name = parts[idx]
-                node = folder_nodes.get(prefix)
+                key = ("F", " > ".join(lowered[:idx + 1]))
+                node = nodes.get(key)
                 if node is None:
-                    matching_groups = [
-                        g for g in all_groups
-                        if hierarchy_matches_prefix(getattr(g, "feature_name", ""), prefix)
-                    ]
-                    folder_lvl, folder_audit = evaluate_feature_audit(matching_groups)
-                    label = "[Cấp %d] %s   (%d API | %s)" % (idx + 1, seg_name, len(matching_groups), folder_audit)
-                    node = HierarchyTreeNode("FOLDER", prefix, label, audit_level=folder_lvl)
-                    folder_nodes[prefix] = node
-                    parent_node.add(node)
-                parent_node = node
-            return parent_node
+                    total, flagged, ok = stats.prefix.get(key[1], (0, 0, 0))
+                    lvl, summary = audit_from_counts(total, flagged, ok)
+                    node = HierarchyTreeNode(
+                        "FOLDER", " > ".join(parts[:idx + 1]),
+                        "[Cấp %d] %s   (%d API | %s)" % (idx + 1, parts[idx], total, summary),
+                        audit_level=lvl, key=key)
+                    nodes[key] = node
+                    parent.add(node)
+                    if id(parent) in open_ids and key not in collapsed:
+                        open_ids.add(id(node))
+                        expand.append(node)
+                parent = node
+            return parent
 
-        for path_str in ordered_paths:
-            ensure_folder_chain(path_str)
+        for path_str in stats.paths:
+            ensure_folder_chain(split_hierarchy_path(path_str))
 
-        for g in all_groups:
-            leaf_folder = ensure_folder_chain(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH)
-            g_lvl = getattr(g, "_audit_level", None) or evaluate_group_audit(g)[0]
+        for g in stats.groups:
+            leaf = ensure_folder_chain(
+                split_hierarchy_path(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH))
+            key = ("G", g.gid)
             g_audit = getattr(g, "_audit_summary", None) or evaluate_group_audit(g)[1]
-            g_node = HierarchyTreeNode(
+            node = HierarchyTreeNode(
                 "GROUP", g,
                 "%s [%s]: %s %s  (1 Gốc + %d Roles)  --> [%s]"
                 % (format_api_label(g.gid), format_group_id(g.gid), g.method, short_path(g.path, 45),
                    len(g.results), g_audit),
-                audit_level=g_lvl
-            )
-            # 1 API gốc first
-            if getattr(g, "orig_result", None) is not None:
-                or_res = g.orig_result
-                or_lvl = getattr(or_res, "_audit_level", None) or evaluate_role_result(g, or_res)[0]
-                or_badge = getattr(or_res, "_audit_badge", None) or evaluate_role_result(g, or_res)[1]
-                orig_node = HierarchyTreeNode(
-                    "ORIG", (g, or_res),
-                    "%s  --> [%s] | Status: %s | Len: %s"
-                    % (or_res.role_name, or_badge,
-                       or_res.status if or_res.status is not None else "-",
-                       or_res.length if or_res.length is not None else "-"),
-                    audit_level=or_lvl
-                )
-                g_node.add(orig_node)
-            # N API roles thêm
-            for r in g.results:
-                r_lvl = getattr(r, "_audit_level", None) or evaluate_role_result(g, r)[0]
-                r_badge = getattr(r, "_audit_badge", None) or evaluate_role_result(g, r)[1]
-                r_node = HierarchyTreeNode(
-                    "ROLE", (g, r),
-                    "%s  --> [%s] | Status: %s | Len: %s"
-                    % (r.role_name,
-                       r_badge,
-                       r.status if r.status is not None else r.state,
-                       r.length if r.length is not None else "-"),
-                    audit_level=r_lvl
-                )
-                g_node.add(r_node)
-            leaf_folder.add(g_node)
-        return root, ordered_paths
+                audit_level=_group_level(g), key=key)
+            nodes[key] = node
+            if id(leaf) in open_ids and key in expanded:
+                self._load_group_children(node, nodes)
+                expand.append(node)
+            else:
+                node.loaded = False
+                node.add(HierarchyTreeNode("LOADING", None, "..."))
+            leaf.add(node)
+        return root, nodes, expand
 
     @staticmethod
-    def _expand_folder_nodes_only(tree, expand_groups=False):
-        """
-        Expand only FOLDER (and optionally GROUP when small) nodes so JTree never lags
-        with O(N^2) row expansions when hundreds of APIs are captured.
-        """
-        i = 0
-        max_rows = 220
-        while i < tree.getRowCount() and i < max_rows:
+    def _load_group_children(g_node, nodes=None):
+        """Replace an API node's placeholder with its real rows: 1 original + N roles."""
+        g = g_node.payload
+        g_node.removeAllChildren()
+        entries = []
+        if getattr(g, "orig_result", None) is not None:
+            entries.append(("ORIG", ("O", g.gid), g.orig_result))
+        for r in g.results:
+            entries.append(("ROLE", ("R", g.gid, r.role_index), r))
+        for kind, key, r in entries:
+            lvl = getattr(r, "_audit_level", None) or evaluate_role_result(g, r)[0]
+            badge = getattr(r, "_audit_badge", None) or evaluate_role_result(g, r)[1]
+            status = r.status if r.status is not None else ("-" if kind == "ORIG" else r.state)
+            child = HierarchyTreeNode(
+                kind, (g, r),
+                "%s  --> [%s] | Status: %s | Len: %s"
+                % (r.role_name, badge, status, r.length if r.length is not None else "-"),
+                audit_level=lvl, key=key)
+            g_node.add(child)
+            if nodes is not None:
+                nodes[key] = child
+        g_node.loaded = True
+
+    def _lazy_load_tree_node(self, name, model, node):
+        if getattr(node, "kind", None) == "GROUP" and not getattr(node, "loaded", True):
+            self._load_group_children(node, self._tree_states[name]["nodes"])
+            model.nodeStructureChanged(node)
+
+    @staticmethod
+    def _remember_tree_state(tree, state):
+        """Record which folders the user collapsed and which API nodes they opened."""
+        collapsed = state["collapsed"]
+        expanded = state["expanded"]
+        for i in range(tree.getRowCount()):
             path = tree.getPathForRow(i)
-            if path is not None:
-                node = path.getLastPathComponent()
-                kind = getattr(node, "kind", None)
-                if kind is None and isinstance(node, DefaultMutableTreeNode):
-                    kind = getattr(node.getUserObject(), "kind", None)
-                if kind in ("ROOT", "FOLDER") or (expand_groups and kind == "GROUP"):
-                    tree.expandRow(i)
-            i += 1
+            if path is None:
+                continue
+            node = path.getLastPathComponent()
+            key = getattr(node, "key", None)
+            kind = getattr(node, "kind", None)
+            if key is None or node.getChildCount() == 0:
+                continue
+            if kind == "FOLDER":
+                if tree.isExpanded(i):
+                    collapsed.discard(key)
+                else:
+                    collapsed.add(key)
+            elif kind == "GROUP":
+                if tree.isExpanded(i):
+                    expanded.add(key)
+                else:
+                    expanded.discard(key)
+
+    def _rebuild_tree(self, name, tree, model, root_label, stats, force):
+        """
+        Rebuild one tree, keeping the user's selection and expand/collapse choices.
+        Unless forced by a user action, rebuilds are spaced out in proportion to their
+        own cost, so a huge tree can never monopolise the EDT. Returns False if skipped.
+        """
+        state = self._tree_states[name]
+        started = time.time()
+        if not force and started < state["next_ok"]:
+            return False
+        self._remember_tree_state(tree, state)
+        sel_path = tree.getSelectionPath()
+        sel_key = getattr(sel_path.getLastPathComponent(), "key", None) if sel_path is not None else None
+        root, nodes, expand = self._build_hierarchy_nodes(stats, root_label, state)
+        state["nodes"] = nodes
+        state["collapsed"] = set([k for k in state["collapsed"] if k in nodes])
+        state["expanded"] = set([k for k in state["expanded"] if k in nodes])
+        self._restoring_tree = True
+        try:
+            model.setRoot(root)
+            for node in expand:
+                tree.expandPath(TreePath(node.getPath()))
+            target = nodes.get(sel_key) if sel_key is not None else None
+            if target is not None:
+                tree.setSelectionPath(TreePath(target.getPath()))
+        finally:
+            self._restoring_tree = False
+        state["next_ok"] = time.time() + min(5.0, (time.time() - started) * 8)
+        return True
 
     def _refresh_feature_views(self):
-        def refresh():
-            if self.feature_model is not None:
-                sel_row = self.feature_table.getSelectedRow()
-                self.feature_model.fireTableDataChanged()
-                if 0 <= sel_row < self.feature_model.getRowCount():
-                    self.feature_table.setRowSelectionInterval(sel_row, sel_row)
-                elif self.feature_model.getRowCount() > 0:
-                    self.feature_table.setRowSelectionInterval(0, 0)
-            if self.group_model is not None:
-                all_groups = self.group_model.all_groups()
-                feats = self.features_list()
-                expand_api_nodes = (len(all_groups) <= 8)
-                if getattr(self, "left_hierarchy_tree_model", None) is not None:
-                    left_root, ordered_paths = self._build_nested_hierarchy_root(
-                        feats, all_groups,
-                        "Tất cả Group & API (%d Nhánh | %d API)" % (len(feats), len(all_groups))
-                    )
-                    self.left_hierarchy_tree_model.setRoot(left_root)
-                    self.left_hierarchy_tree_model.reload()
-                    self._expand_folder_nodes_only(self.left_hierarchy_tree, expand_groups=expand_api_nodes)
-                    if getattr(self, "group_path_editor_combo", None) is not None:
-                        self.group_path_editor_combo.removeAllItems()
-                        for p in ordered_paths:
-                            self.group_path_editor_combo.addItem(p)
-                    if getattr(self, "cb_existing_paths", None) is not None:
-                        self._updating_path_combos = True
-                        try:
-                            cur_act = self.active_feature().name
-                            self.cb_existing_paths.removeAllItems()
-                            for p in ordered_paths:
-                                self.cb_existing_paths.addItem(p)
-                            self.cb_existing_paths.setSelectedItem(cur_act)
-                        finally:
-                            self._updating_path_combos = False
-                if getattr(self, "history_tree_model", None) is not None:
-                    hist_root, _ = self._build_nested_hierarchy_root(
-                        feats, all_groups,
-                        "Tổng cộng: %d Nhánh Chức năng | %d API đã đi qua" % (len(feats), len(all_groups))
-                    )
-                    self.history_tree_model.setRoot(hist_root)
-                    self.history_tree_model.reload()
-                    self._expand_folder_nodes_only(self.history_tree, expand_groups=expand_api_nodes)
-            self._refresh_history_summary_only()
-        ui_call(refresh)
+        """
+        Ask for the branch table, trees and report to be brought up to date.
+        On the EDT (a user action) this happens now; from worker threads it is merged
+        into the next UI tick.
+        """
+        self._mark(structure=True)
+        if SwingUtilities.isEventDispatchThread():
+            self._ui_tick(None)
 
     def _on_apply_3_boxes_hierarchy(self, event):
         self._on_apply_active_feature_name(event)
@@ -4638,6 +5282,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return feat.name if feat is not None else None
 
     def _on_left_hierarchy_tree_selected(self):
+        if self._restoring_tree:
+            return
         kind, payload = self._selected_left_tree_payload()
         if kind == "ROOT":
             if getattr(self, "btn_replay_branch", None) is not None:
@@ -4668,12 +5314,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def _select_group_in_table(self, target_group, target_result=None):
         if target_group is None or self.group_model is None:
             return
-        for mr in range(self.group_model.getRowCount()):
-            if self.group_model.group_at(mr) is target_group:
-                vr = self.group_table.convertRowIndexToView(mr)
-                if vr >= 0:
-                    self.group_table.setRowSelectionInterval(vr, vr)
-                break
+        mr = self.group_model.row_of(target_group)
+        if mr >= 0:
+            vr = self.group_table.convertRowIndexToView(mr)
+            if vr >= 0:
+                self.group_table.setRowSelectionInterval(vr, vr)
+                self.group_table.scrollRectToVisible(self.group_table.getCellRect(vr, 0, True))
         if target_result is not None and self.result_model is not None:
             for rmr in range(self.result_model.getRowCount()):
                 if self.result_model.result_at(rmr) is target_result:
@@ -4757,7 +5403,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 self._dispatch_group_with_selected_mode(g)
 
     def _on_feature_filter_selected(self):
-        if self.feature_table is None or self.group_model is None:
+        if self.feature_table is None or self.group_model is None or self._restoring_feature_sel:
             return
         r = self.feature_table.getSelectedRow()
         if r <= 0:
@@ -5071,7 +5717,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if g is None or res is None:
             self._require_group()
             return
-        if self.req_viewer is not None:
+        if self.req_viewer is not None and self.req_viewer.isMessageModified():
+            # Only a hand-edited request is pinned as real bytes; untouched roles stay virtual.
             edited = self.req_viewer.getMessage()
             if edited is not None and len(edited) > 0:
                 res.request = edited
@@ -5081,11 +5728,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         g, res = self.current_selection()
         if g is None or res is None:
             return
-        if getattr(res, "is_original", False):
-            res.request = g.orig_request
-            self._show_result(res)
-        else:
-            self.rebuild_group(g)
+        res.request = None  # back to the captured original / the role's virtual request
+        self._show_result(res)
 
     # ------------------------------------------------------ selection helpers
     def _selected_groups(self):
@@ -5114,15 +5758,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if vr >= 0:
             res = self.result_model.result_at(self.result_table.convertRowIndexToModel(vr))
         return g, res
-
-    def _add_group_ui(self, group):
-        self.group_model.add(group)
-        if self.group_table.getSelectedRow() < 0 and self.group_model.getRowCount() > 0:
-            last = self.group_table.convertRowIndexToView(self.group_model.getRowCount() - 1)
-            if last >= 0:
-                self.group_table.setRowSelectionInterval(last, last)
-        self._refresh_feature_views()
-        self.update_status()
 
     def _on_group_selected(self):
         groups = self._selected_groups()
@@ -5162,8 +5797,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             st = res.status if res.status is not None else res.state
             ln = res.length if res.length is not None else "-"
             self.lbl_resp_header.setText(" Response [%s | Status: %s | Length: %s]" % (res.role_name, st, ln))
-        self.req_viewer.setMessage(res.request if res.request is not None else empty, True)
-        self.resp_viewer.setMessage(res.response if res.response is not None else empty, False)
+        request = res.request
+        response = res.response
+        self.req_viewer.setMessage(request if request is not None else empty, True)
+        self.resp_viewer.setMessage(response if response is not None else empty, False)
 
     def _require_group(self):
         g = self.result_model.group()
@@ -5236,9 +5873,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             return
         if self.result_model.getRowCount() > 0:
             self.result_table.setRowSelectionInterval(0, 0)
-        empty = self.helpers.stringToBytes("")
-        self.req_viewer.setMessage(g.orig_request if g.orig_request is not None else empty, True)
-        self.resp_viewer.setMessage(g.orig_response if g.orig_response is not None else empty, False)
+        self._show_result(g.orig_result)
 
     def _on_export_matrix(self, event):
         groups = self.group_model.all_groups()
@@ -5293,6 +5928,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._next_fid = 2
             self._active_fid = 1
             self._features = [FeatureGroup(1, DEFAULT_HIERARCHY_PATH)]
+        with self._ui_lock:
+            self._p_new = []
+            self._p_dirty = {}
+            self._p_done_res = set()
+        self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state()}
         self.group_model.set_feature_filter(None)
         self.group_model.set_hierarchy_filter(None)
         self._refresh_feature_views()
