@@ -1102,11 +1102,19 @@ class _Task(Runnable):
         try:
             self._fn()
         except Throwable as t:
-            if self._log:
-                self._log("Unhandled Java exception in task: %s" % t)
+            msg = "Unhandled Java exception in task: %s" % u_text(t)
+            try:
+                if self._log:
+                    self._log(msg)
+            except Exception:
+                pass
         except Exception:
-            if self._log:
-                self._log("Unhandled exception in task:\n%s" % traceback.format_exc())
+            msg = "Unhandled exception in task:\n%s" % u_text(traceback.format_exc())
+            try:
+                if self._log:
+                    self._log(msg)
+            except Exception:
+                pass
 
 
 def ui_call(fn):
@@ -1932,11 +1940,11 @@ class HierarchyTreeNode(DefaultMutableTreeNode):
 
     def __init__(self, kind, payload, label, audit_level=AUDIT_NONE):
         clean_label = u_text(label)
+        DefaultMutableTreeNode.__init__(self, clean_label)
         self.kind = kind
         self.payload = payload
         self.label = clean_label
         self.audit_level = audit_level
-        DefaultMutableTreeNode.__init__(self, clean_label)
 
     def toString(self):
         return getattr(self, "label", "")
@@ -2023,14 +2031,17 @@ class HierarchyTreeRenderer(DefaultTreeCellRenderer):
                     bg, fg = Color(232, 240, 254), Color(20, 65, 150)
                 else:
                     bg, fg = None, AuditTableRenderer.FG_DEFAULT
-                if hasattr(self, "setBackgroundNonSelectionColor"):
-                    self.setBackgroundNonSelectionColor(bg)
-                if hasattr(self, "setTextNonSelectionColor"):
+                tree_bg = tree.getBackground() if (tree is not None and hasattr(tree, "getBackground")) else None
+                eff_bg = bg if bg is not None else tree_bg
+                if hasattr(self, "setBackgroundNonSelectionColor") and eff_bg is not None:
+                    self.setBackgroundNonSelectionColor(eff_bg)
+                if hasattr(self, "setTextNonSelectionColor") and fg is not None:
                     self.setTextNonSelectionColor(fg)
-                if bg is not None:
-                    comp.setBackground(bg)
-                comp.setForeground(fg)
-        except Exception:
+                if eff_bg is not None:
+                    comp.setBackground(eff_bg)
+                if fg is not None:
+                    comp.setForeground(fg)
+        except (Exception, Throwable):
             pass
         return comp
 
@@ -2646,43 +2657,84 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             else:
                 self.roles.set_all(default_role_templates())
         except Exception as e:
-            callbacks.printError("Could not load stored roles: %s" % e)
+            callbacks.printError("Could not load stored roles: %s" % u_text(e))
 
         self.capture_executor = Executors.newSingleThreadExecutor()
         self.send_executor = Executors.newFixedThreadPool(self.config["threads"])
 
         callbacks.registerExtensionStateListener(self)
         SwingUtilities.invokeLater(_Task(self._init_ui, self.log))
+
         if regex_err:
-            self.log("Stored API regex is invalid: %s" % regex_err)
+            self.log("Stored API regex is invalid: %s" % u_text(regex_err))
+
+    def _build_error_fallback_panel(self, err_msg):
+        panel = JPanel(BorderLayout())
+        area = JTextArea(u_text(err_msg))
+        area.setEditable(False)
+        panel.add(JScrollPane(area), BorderLayout.CENTER)
+        return panel
 
     def _init_ui(self):
+        if self._unloaded:
+            return
+        try:
+            self.callbacks.printOutput("%s: initializing UI on Swing EDT..." % EXT_NAME)
+        except (Throwable, Exception):
+            pass
+
+        ui_panel = None
         try:
             self._build_ui()
+            ui_panel = self.main_panel
         except Throwable as t:
-            tb = traceback.format_exc()
-            self.callbacks.printError("Error building UI (Java): %s\n%s" % (t, tb))
-            if self.main_panel is None:
-                self.main_panel = JPanel(BorderLayout())
-            self.main_panel.add(JScrollPane(JTextArea("Error building UI:\n%s\n%s" % (t, tb))), BorderLayout.CENTER)
+            tb = u_text(traceback.format_exc())
+            msg = "Error building UI (Java): %s\n%s" % (u_text(t), tb)
+            try:
+                self.callbacks.printError(msg)
+            except (Throwable, Exception):
+                pass
+            ui_panel = self._build_error_fallback_panel(msg)
         except Exception:
-            tb = traceback.format_exc()
-            self.callbacks.printError("Error building UI:\n%s" % tb)
-            if self.main_panel is None:
-                self.main_panel = JPanel(BorderLayout())
-            self.main_panel.add(JScrollPane(JTextArea("Error building UI:\n%s" % tb)), BorderLayout.CENTER)
-        self.callbacks.addSuiteTab(self)
-        # Traffic hooks are registered only after the UI exists.
-        self.callbacks.registerHttpListener(self)
-        self.callbacks.registerContextMenuFactory(self)
+            tb = u_text(traceback.format_exc())
+            msg = "Error building UI:\n%s" % tb
+            try:
+                self.callbacks.printError(msg)
+            except (Throwable, Exception):
+                pass
+            ui_panel = self._build_error_fallback_panel(msg)
+
+        if ui_panel is None:
+            ui_panel = self._build_error_fallback_panel("Error building UI: main_panel was None.")
+        self.main_panel = ui_panel
+
         try:
-            self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+            self.callbacks.addSuiteTab(self)
+            self.callbacks.printOutput("%s: tab '%s' registered." % (EXT_NAME, EXT_NAME))
+        except Throwable as t:
+            self.callbacks.printError("Error calling addSuiteTab (Java): %s\n%s" % (
+                u_text(t), u_text(traceback.format_exc())))
+        except Exception:
+            self.callbacks.printError("Error calling addSuiteTab:\n%s" % u_text(traceback.format_exc()))
+
+        try:
+            self.callbacks.registerHttpListener(self)
+            self.callbacks.registerContextMenuFactory(self)
+        except Throwable as t:
+            self.callbacks.printError("Error registering listeners (Java): %s\n%s" % (
+                u_text(t), u_text(traceback.format_exc())))
+        except Exception:
+            self.callbacks.printError("Error registering listeners:\n%s" % u_text(traceback.format_exc()))
+
+        self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+        try:
             self._refresh_feature_views()
             self.update_status()
-        except Throwable as t:
-            self.callbacks.printError("Error initializing UI state (Java): %s\n%s" % (t, traceback.format_exc()))
-        except Exception:
-            self.callbacks.printError("Error initializing UI state:\n%s" % traceback.format_exc())
+        except (Throwable, Exception):
+            try:
+                self.callbacks.printError("Error refreshing initial views:\n%s" % u_text(traceback.format_exc()))
+            except (Throwable, Exception):
+                pass
 
     def extensionUnloaded(self):
         self._unloaded = True
@@ -2704,10 +2756,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     # --------------------------------------------------------------- logging
     def log(self, msg):
-        line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
+        line = "[%s] %s" % (time.strftime("%H:%M:%S"), u_text(msg))
         try:
             self.callbacks.printOutput(line)
-        except Throwable:
+        except (Throwable, Exception):
             pass
 
         def append():
@@ -3386,8 +3438,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.lbl_active_feature = JLabel("Path [#1]:")
         self.lbl_active_feature.setFont(Font("Dialog", Font.BOLD, 11))
         self.subfolder_chips_panel = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0))
-        self.tf_feature_name = JTextField(self.active_feature().name, 18,
-                                          actionPerformed=self._on_apply_active_feature_name)
+        self.tf_feature_name = JTextField(self.active_feature().name, 18)
+        self.tf_feature_name.addActionListener(_Action(self._on_apply_active_feature_name))
         self.tf_feature_name.setToolTipText(
             "Nhập đường dẫn N cấp ngăn cách bởi '>' rồi nhấn Enter (VD: Toppage > menu > button)")
 
@@ -3431,7 +3483,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.log_area.setEditable(False)
         self.tabs.addTab("Log", JScrollPane(self.log_area))
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
-        self.callbacks.customizeUiComponent(self.main_panel)
+        try:
+            self.callbacks.customizeUiComponent(self.main_panel)
+        except (Throwable, Exception):
+            try:
+                self.callbacks.printError("Warning: customizeUiComponent failed:\n%s" % u_text(traceback.format_exc()))
+            except (Throwable, Exception):
+                pass
 
     # ---- API Groups tab (Minimalist 1-row toolbar + Dropdowns + Right-click menus + Full screen space)
     def _build_groups_tab(self):
@@ -3772,10 +3830,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         on_change = self._on_settings_changed
         self.cb_scope = JCheckBox("In-Scope Only (Target > Scope)", cfg["in_scope_only"], actionPerformed=on_change)
         self.cb_static = JCheckBox("Ignore Static Extensions:", cfg["ignore_static"], actionPerformed=on_change)
-        self.tf_static = JTextField(cfg["static_ext"], 60, actionPerformed=on_change)
+        self.tf_static = JTextField(cfg["static_ext"], 60)
+        self.tf_static.addActionListener(_Action(on_change))
         self.cb_regex = JCheckBox("API Path Regex (matched against path, no query):", cfg["api_regex_enabled"],
                                   actionPerformed=on_change)
-        self.tf_regex = JTextField(cfg["api_regex"], 60, actionPerformed=on_change)
+        self.tf_regex = JTextField(cfg["api_regex"], 60)
+        self.tf_regex.addActionListener(_Action(on_change))
         self.cb_options = JCheckBox("Ignore OPTIONS / HEAD (CORS preflight)", cfg["ignore_options_head"],
                                     actionPerformed=on_change)
         self.cb_dedup = JCheckBox("Deduplicate (Method + Host + Path) - clone each endpoint only once",

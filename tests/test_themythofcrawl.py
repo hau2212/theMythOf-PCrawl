@@ -828,8 +828,76 @@ class EngineTests(unittest.TestCase):
         self.ext._init_ui()
         errors = [x for x in self.cb.out if str(x).startswith("ERROR:")]
         self.assertEqual(errors, [])
+        self.assertIs(getattr(self.cb, "tab", None), self.ext)
         self.assertIsNotNone(self.ext.getUiComponent())
         self.assertEqual(self.ext.getTabCaption(), "theMythOfCrawl")
+
+    def test_init_ui_registers_fallback_tab_when_build_ui_fails(self):
+        def broken_build():
+            raise RuntimeError("Lỗi UI: Đường dẫn Nhánh 1 > Nhánh 2")
+
+        self.ext._build_ui = broken_build
+        self.cb.tab = None
+        self.ext._init_ui()
+        self.assertIs(getattr(self.cb, "tab", None), self.ext)
+        self.assertIsNotNone(self.ext.getUiComponent())
+        errors = [x for x in self.cb.out if str(x).startswith("ERROR:")]
+        self.assertTrue(any("Error building UI:" in str(e) for e in errors))
+
+    def test_init_ui_survives_customize_ui_component_failure(self):
+        orig = self.cb.customizeUiComponent
+
+        def broken_theme(comp):
+            raise RuntimeError("FlatLaf customize failure")
+
+        self.cb.customizeUiComponent = broken_theme
+        try:
+            self.ext._init_ui()
+        finally:
+            self.cb.customizeUiComponent = orig
+        self.assertIs(getattr(self.cb, "tab", None), self.ext)
+        self.assertIsNotNone(self.ext.getUiComponent())
+
+    def test_task_handles_utf8_and_bytes_exceptions(self):
+        def broken_task():
+            raise RuntimeError("Lỗi tiếng Việt trong task: Chế độ & Lọc")
+
+        logs = []
+        tm._Task(broken_task, log_fn=logs.append).run()
+        self.assertEqual(len(logs), 1)
+        self.assertIn("Unhandled exception in task:", logs[0])
+        self.assertIn("RuntimeError", logs[0])
+
+    def test_swing_constructors_avoid_jython_unsafe_listener_kwargs(self):
+        import ast
+        src_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "theMythOfCrawl.py")
+        with open(src_path, "rb") as fh:
+            tree = ast.parse(fh.read().decode("utf-8"))
+        unsafe = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                fname = node.func.id
+                kw_names = {kw.arg for kw in node.keywords if kw.arg}
+                if fname == "JComboBox" and "actionPerformed" in kw_names:
+                    unsafe.append((node.lineno, fname, "actionPerformed"))
+                if fname == "JTextField" and "actionPerformed" in kw_names:
+                    unsafe.append((node.lineno, fname, "actionPerformed"))
+                if fname == "JSpinner" and "stateChanged" in kw_names:
+                    unsafe.append((node.lineno, fname, "stateChanged"))
+        self.assertEqual(unsafe, [])
+
+    def test_hierarchy_tree_node_and_renderer_safety(self):
+        node = tm.HierarchyTreeNode("ROOT", "", "Tất cả Group & API", audit_level=tm.AUDIT_NONE)
+        self.assertEqual(node.label, "Tất cả Group & API")
+        self.assertEqual(node.toString(), "Tất cả Group & API")
+        renderer = tm.HierarchyTreeRenderer()
+        non_sel_bg_calls = []
+        renderer.setBackgroundNonSelectionColor = lambda c: non_sel_bg_calls.append(c)
+        renderer.setTextNonSelectionColor = lambda c: None
+        mock_tree = type("MockTree", (object,), {"getBackground": lambda self: None})()
+        comp = renderer.getTreeCellRendererComponent(mock_tree, node, False, False, False, 0, False)
+        self.assertIsNotNone(comp)
+        self.assertEqual(non_sel_bg_calls, [])
 
 
 if __name__ == "__main__":
