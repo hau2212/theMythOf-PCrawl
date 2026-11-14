@@ -2654,8 +2654,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         callbacks.registerExtensionStateListener(self)
         # Build UI synchronously to avoid race condition where getUiComponent() is called before _build_ui() completes
         try:
+            callbacks.printOutput("[theMythOfCrawl] Starting UI initialization...")
             self._build_ui()
+            callbacks.printOutput("[theMythOfCrawl] UI built successfully, adding tab to Burp...")
             callbacks.addSuiteTab(self)
+            callbacks.printOutput("[theMythOfCrawl] Tab added successfully.")
             callbacks.registerHttpListener(self)
             callbacks.registerContextMenuFactory(self)
             self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
@@ -2663,17 +2666,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             SwingUtilities.invokeLater(_Task(self.update_status, self.log))
         except Throwable as t:
             tb = traceback.format_exc()
-            self.callbacks.printError("Error building UI (Java): %s\n%s" % (t, tb))
+            err_msg = "Error building UI (Java): %s\n%s" % (t, tb)
+            self.callbacks.printError("[theMythOfCrawl] " + err_msg)
             if self.main_panel is None:
                 self.main_panel = JPanel(BorderLayout())
-            self.main_panel.add(JScrollPane(JTextArea("Error building UI:\n%s\n%s" % (t, tb))), BorderLayout.CENTER)
+            self.main_panel.add(JScrollPane(JTextArea(err_msg)), BorderLayout.CENTER)
             callbacks.addSuiteTab(self)
-        except Exception:
+        except Exception as e:
             tb = traceback.format_exc()
-            self.callbacks.printError("Error building UI:\n%s" % tb)
+            err_msg = "Error building UI: %s" % tb
+            self.callbacks.printError("[theMythOfCrawl] " + err_msg)
             if self.main_panel is None:
                 self.main_panel = JPanel(BorderLayout())
-            self.main_panel.add(JScrollPane(JTextArea("Error building UI:\n%s" % tb)), BorderLayout.CENTER)
+            self.main_panel.add(JScrollPane(JTextArea(err_msg)), BorderLayout.CENTER)
             callbacks.addSuiteTab(self)
 
         if regex_err:
