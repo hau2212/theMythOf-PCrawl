@@ -36,15 +36,20 @@ For every API endpoint it matches, the extension makes **one copy of the request
 | Import JSON / Export JSON | Import lets you **Replace** or **Append** |
 | Load 10-Role Template | Instantly populates 10 starter roles (`01_Admin` … `10_Guest`) with Replace or Append |
 
-Each role holds a list of **header rules**, applied in order:
+Each role holds a list of **header / cookie / JWT rules**, applied in order. You can edit any role either **inline on the right-hand side of the Roles tab** (and click **Save Profile Changes**) or by double-clicking a row to open the modal editor:
 
 | Mode | Behavior |
 |---|---|
-| `REPLACE` (default) | Overwrites the header if it exists (duplicates with the same name are collapsed into one), otherwise adds it |
-| `ADD` | Always appends a new header line, even if the header already exists |
-| `REMOVE`, or a value of `[REMOVE]` | Removes **every** occurrence of the header (name matching ignores case) |
+| `REPLACE` (default) | Overwrites the HTTP header if it exists (duplicates with the same name are collapsed into one), otherwise adds it |
+| `ADD` | Always appends a new HTTP header line, even if the header already exists |
+| `REMOVE`, or a value of `[REMOVE]` | Removes **every** occurrence of the HTTP header (name matching ignores case) |
+| `COOKIE_SET` | Sets or overwrites a **single cookie/session key** (`name=value`) inside the `Cookie:` header while keeping all other cookies intact (creates `Cookie:` if missing) |
+| `COOKIE_REMOVE` (or `COOKIE_SET` with `[REMOVE]`) | Strips a **single cookie/session key** from the `Cookie:` header while keeping all other cookies intact (removes the `Cookie:` header if no cookies remain) |
 
-The editor's **Bulk Paste Headers…** button accepts raw `Name: value` lines, for example lines copied from a logged-in request. CR/LF characters are removed from values, and header names with spaces or colons are rejected.
+Quick-action helpers in the Role Editor:
+- **+ Set JWT / Bearer...**: Paste a raw JWT or Bearer token (or `[REMOVE]`), choose the header name (default `Authorization`) and prefix (default `Bearer`, or leave empty for raw token). The built-in **JWT / Token Inspector** automatically base64url-decodes any `eyJ...` token in the profile and displays its `Header` and `Payload` (`sub`, `role`, `exp`, etc.).
+- **+ Set Cookie/Session Key...** & **+ Strip Cookie Key...**: Add `COOKIE_SET` / `COOKIE_REMOVE` rules for individual session keys (`JSESSIONID`, `session`, `sid`, etc.) without clobbering other cookies.
+- **Paste Headers...** & **Paste Cookies...**: Bulk-import raw `Header: value` lines or `Cookie: a=1; b=2` strings. CR/LF characters are stripped from values, and invalid names are rejected.
 
 JSON format (see [`roles.example.json`](roles.example.json) for a 10-role template):
 
@@ -96,11 +101,26 @@ Tuning: **Replay worker threads** (1–64, resized live) and **Throttle per requ
 
 > With auto-Repeater on during a large crawl, Repeater fills up quickly (endpoints × roles tabs). Keep dedup on, narrow the regex and scope, or turn auto-Repeater off and send groups manually.
 
-### 2.4 Master-Detail view (tab **API Groups**)
+### 2.4 Feature / Button Action Batching & Sequential API History (`Tên 1: API 1, API 2...`, `Tên 2: API 3, API 4...`)
 
-- **Top table (groups):** Group ID, source (Proxy/Manual), time, method, host, path, original status and length, **Role Count**, replay progress. Columns can be sorted, and you can select several rows.
+When you click a button or perform a workflow step in the web application, multiple API requests often fire in sequence (`API 1`, `API 2`, …). `theMythOfCrawl` numbers every captured API sequentially and groups them under the currently active **Feature (`Chức năng`)**:
+
+1. **Before clicking button #1 in the browser:** In the top bar (**Bộ gom Chức năng**), type a name for `Tên 1` (e.g., `Xem hồ sơ & Ví`) and click **Cập nhật Tên** (or press Enter).
+2. **Click button #1 in the browser:** All matching APIs that pass through Proxy (`API 1`, `API 2`, …) are cloned across your $N$ roles, sent to Repeater, and recorded under **`Tên 1: Xem hồ sơ & Ví`**.
+3. **Before clicking button #2 in the browser:** Click **`+ Qua Chức Năng Mới (Bấm nút tiếp theo -> Tên mới)`**, enter the label for `Tên 2` (e.g., `Chuyển tiền`), and click OK.
+4. **Click button #2 in the browser:** Subsequent APIs (`API 3`, `API 4`, …) are automatically grouped under **`Tên 2: Chuyển tiền`**.
+5. Right-clicking messages in Proxy/Target/Repeater also offers **`Clone to NEW Feature (Tạo Tên chức năng mới...)`** so you can group manually selected APIs into a new named feature on the spot.
+6. Enable **Dedup riêng theo từng Chức năng** in **Capture Filters & Options** if you want the same endpoint to be captured again whenever you switch to a new Feature (`Tên 2`, `Tên 3`, …).
+
+### 2.5 Master-Detail view (tab **API Groups**) & Audit History (tab **History & Features**)
+
+- **Top-left table (Features / Chức năng):** Lists `[Tất cả: M chức năng]` plus each `Tên 1`, `Tên 2`, …, showing how many APIs belong to each feature and its API range (`API 1, API 2`, `API 3 .. API 6`). Click any feature row to filter the API table on the right, double-click the name cell to rename it inline, or use **Gửi Chức năng -> Repeater** / **Replay Chức năng** to dispatch all APIs of that feature at once.
+- **Top-right table (API Groups):** Sequential `API #` (`API 1`, `API 2`, …), `Group` (`G01`, `G02`, …), `Chức năng (Feature)` (`Tên 1: ...`), source (Proxy/Manual), time, method, host, path, original status and length, **Role Count**, and replay progress.
 - **Middle table (roles of the selected group):** role, state, status (color-coded), body length, Δ vs original, time, sends, and the Repeater tab name or error.
 - **Bottom:** read-only Burp request/response viewers for the selected role.
+- **Tab `History & Features (Lịch sử Chức năng & API)`:**
+  - **Left:** Interactive `JTree` hierarchy (`Root → Tên 1 (API 1, API 2) → Roles`, `Tên 2 (API 3, API 4) → Roles`) with one-click Repeater dispatch, replay, or jump-to-group.
+  - **Right:** Full text audit report summarizing the total number of features, total number of APIs, each feature's API list in chronological order, and per-role replay status codes/lengths, with **Export Báo cáo Lịch sử (.txt/.md)...**.
 
 | Button | Effect |
 |---|---|

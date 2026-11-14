@@ -11,7 +11,7 @@
     {"name": "03_Auditor", "enabled": true, "headers": [
       {"name": "Authorization", "value": "Bearer REPLACE_WITH_AUDITOR_TOKEN", "mode": "REPLACE"}]},
     {"name": "04_Support", "enabled": true, "headers": [
-      {"name": "Cookie", "value": "session=REPLACE_WITH_SUPPORT_SESSION", "mode": "REPLACE"},
+      {"name": "JSESSIONID", "value": "REPLACE_WITH_SUPPORT_SESSION", "mode": "COOKIE_SET"},
       {"name": "Authorization", "value": "[REMOVE]", "mode": "REMOVE"}]},
     {"name": "05_UserA_TenantA", "enabled": true, "headers": [
       {"name": "Authorization", "value": "Bearer REPLACE_WITH_USER_A_TOKEN", "mode": "REPLACE"},

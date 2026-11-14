@@ -20,6 +20,7 @@ Threading model
   * Every Swing mutation goes through SwingUtilities.invokeLater (ui_call()).
 """
 
+import base64
 import json
 import re
 import threading
@@ -33,7 +34,7 @@ from burp import IContextMenuFactory
 from burp import IExtensionStateListener
 from burp import IMessageEditorController
 
-from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color
+from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Color, Font
 from java.awt.event import MouseAdapter
 from java.lang import Runnable, Boolean, Integer, String, Throwable
 from java.util import ArrayList, Arrays
@@ -43,9 +44,10 @@ from java.nio.file import Files
 from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable, JScrollPane,
                          JSplitPane, JTabbedPane, JTextArea, JMenuItem, JOptionPane, JFileChooser,
                          JDialog, JComboBox, JSpinner, SpinnerNumberModel, ListSelectionModel,
-                         SwingUtilities, BorderFactory, DefaultCellEditor, BoxLayout, Box)
-from javax.swing.event import ListSelectionListener
+                         SwingUtilities, BorderFactory, DefaultCellEditor, BoxLayout, Box, JTree)
+from javax.swing.event import ListSelectionListener, TreeSelectionListener
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
+from javax.swing.tree import DefaultMutableTreeNode, DefaultTreeModel, TreeSelectionModel
 from javax.swing.filechooser import FileNameExtensionFilter
 
 try:
@@ -58,15 +60,17 @@ except NameError:  # CPython 3 (offline unit tests only)
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.0.0"
+EXT_VERSION = "1.1.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_CONFIG = "tmoc.config.v1"
 
 REMOVE_TOKEN = "[REMOVE]"
-MODE_REPLACE = "REPLACE"  # overwrite first occurrence (drop duplicates) or add if missing
-MODE_ADD = "ADD"          # always append a new header line (allows duplicates)
-MODE_REMOVE = "REMOVE"    # strip every occurrence
-HEADER_MODES = [MODE_REPLACE, MODE_ADD, MODE_REMOVE]
+MODE_REPLACE = "REPLACE"              # overwrite first occurrence (drop duplicates) or add if missing
+MODE_ADD = "ADD"                      # always append a new header line (allows duplicates)
+MODE_REMOVE = "REMOVE"                # strip every occurrence of the header
+MODE_COOKIE_SET = "COOKIE_SET"        # set/replace a single cookie key=value inside Cookie header
+MODE_COOKIE_REMOVE = "COOKIE_REMOVE"  # remove a single cookie key from Cookie header
+HEADER_MODES = [MODE_REPLACE, MODE_ADD, MODE_REMOVE, MODE_COOKIE_SET, MODE_COOKIE_REMOVE]
 
 DEFAULT_STATIC_EXT = ("js,mjs,css,map,png,jpg,jpeg,gif,bmp,ico,svg,webp,avif,tif,tiff,"
                       "woff,woff2,ttf,otf,eot,mp3,mp4,m4a,webm,wav,ogg,avi,mov,flv,swf")
@@ -82,9 +86,11 @@ DEFAULT_CONFIG = {
     "ignore_options_head": True,
     "dedup": True,
     "dedup_normalize_ids": False,
+    "dedup_per_feature": False,
     "auto_repeater": True,
     "auto_send": False,
     "number_roles_in_tab": True,
+    "include_feature_in_tab": False,
     "threads": 5,
     "throttle_ms": 0,
     "short_path_len": 40,
@@ -100,6 +106,7 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 _NUM_RE = re.compile(r"^[0-9]+$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
 _ROLE_NUM_PREFIX_RE = re.compile(r"^[0-9]+[_\-. ]")
+_JWT_RE = re.compile(r"(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)")
 
 # =============================================================================
 # Pure logic (no Burp / Swing dependency -> unit-testable under CPython)
@@ -124,9 +131,12 @@ def sanitize_header_value(value):
 
 
 def normalize_mode(mode, value):
-    if value is not None and ("%s" % value).strip().upper() == REMOVE_TOKEN:
-        return MODE_REMOVE
     m = ("%s" % (mode or "")).strip().upper()
+    is_rm_val = value is not None and ("%s" % value).strip().upper() == REMOVE_TOKEN
+    if m in (MODE_COOKIE_SET, MODE_COOKIE_REMOVE):
+        return MODE_COOKIE_REMOVE if (m == MODE_COOKIE_REMOVE or is_rm_val) else MODE_COOKIE_SET
+    if is_rm_val:
+        return MODE_REMOVE
     if m in HEADER_MODES:
         return m
     return MODE_REPLACE
@@ -139,10 +149,71 @@ def _header_name_of(line):
     return line[:idx].strip().lower()
 
 
+def _parse_cookie_pairs(headers):
+    """Extract ordered (key, raw_segment) pairs across all Cookie headers."""
+    pairs = []
+    for h in headers:
+        if _header_name_of(h) != "cookie":
+            continue
+        val = h.split(":", 1)[1]
+        for seg in val.split(";"):
+            s = seg.strip()
+            if not s:
+                continue
+            k = s.split("=", 1)[0].strip() if "=" in s else s
+            pairs.append((k, s))
+    return pairs
+
+
+def apply_cookie_rule(headers, cookie_name, cookie_value, remove=False):
+    """
+    Modify a single cookie key inside the Cookie header while preserving all
+    other cookies on the request.
+    """
+    cname = sanitize_header_name(cookie_name)
+    if not cname:
+        return list(headers)
+    cval = sanitize_header_value(cookie_value)
+    pairs = _parse_cookie_pairs(headers)
+    has_cookie_hdr = any(_header_name_of(h) == "cookie" for h in headers)
+    if remove:
+        new_segs = [seg for k, seg in pairs if k != cname]
+    else:
+        target_seg = "%s=%s" % (cname, cval)
+        new_segs = []
+        replaced = False
+        for k, seg in pairs:
+            if k == cname:
+                if not replaced:
+                    new_segs.append(target_seg)
+                    replaced = True
+            else:
+                new_segs.append(seg)
+        if not replaced:
+            new_segs.append(target_seg)
+    if not new_segs:
+        return [h for h in headers if _header_name_of(h) != "cookie"]
+    cookie_line = "Cookie: %s" % "; ".join(new_segs)
+    if not has_cookie_hdr:
+        return list(headers) + [cookie_line]
+    out = []
+    emitted = False
+    for h in headers:
+        if _header_name_of(h) == "cookie":
+            if not emitted:
+                out.append(cookie_line)
+                emitted = True
+        else:
+            out.append(h)
+    return out
+
+
 def apply_header_rules(header_lines, rules):
     """
     header_lines: list of str, index 0 is the request line ("GET /x HTTP/1.1").
     rules: list of {"name", "value", "mode"} applied in order.
+      - REPLACE / ADD / REMOVE operate on whole HTTP headers.
+      - COOKIE_SET / COOKIE_REMOVE operate on individual cookie keys in Cookie:.
     Returns a new list; the request line is never modified.
     """
     lines = [("%s" % l) for l in header_lines]
@@ -156,6 +227,12 @@ def apply_header_rules(header_lines, rules):
             continue
         raw_value = rule.get("value")
         mode = normalize_mode(rule.get("mode"), raw_value)
+        if mode == MODE_COOKIE_REMOVE:
+            headers = apply_cookie_rule(headers, name, "", remove=True)
+            continue
+        if mode == MODE_COOKIE_SET:
+            headers = apply_cookie_rule(headers, name, raw_value, remove=False)
+            continue
         lname = name.lower()
         if mode == MODE_REMOVE:
             headers = [h for h in headers if _header_name_of(h) != lname]
@@ -177,6 +254,68 @@ def apply_header_rules(header_lines, rules):
             out.append(new_line)
         headers = out
     return [request_line] + headers
+
+
+def format_jwt_bearer(token, prefix="Bearer"):
+    """Normalize a raw JWT or Bearer string into 'Bearer <token>' (or [REMOVE])."""
+    t = sanitize_header_value(token)
+    if not t:
+        return ""
+    if t.upper() == REMOVE_TOKEN:
+        return REMOVE_TOKEN
+    if t.lower().startswith("authorization:"):
+        t = t.split(":", 1)[1].strip()
+    pfx = "Bearer" if prefix is None else ("%s" % prefix).strip()
+    if pfx and not t.lower().startswith(pfx.lower() + " "):
+        return "%s %s" % (pfx, t)
+    return t
+
+
+def _b64url_decode(seg):
+    s = ("%s" % seg).strip().replace("-", "+").replace("_", "/")
+    pad = len(s) % 4
+    if pad:
+        s += "=" * (4 - pad)
+    raw = base64.b64decode(s.encode("ascii"))
+    return raw.decode("utf-8", "replace")
+
+
+def decode_jwt_preview(text):
+    """
+    Find all JWTs in text (or role rules) and return a human-readable decoded
+    preview of Header + Payload (including sub/role/exp).
+    """
+    matches = _JWT_RE.findall("%s" % (text or ""))
+    if not matches:
+        return "No JWT (eyJ...) found in this role's rules."
+    blocks = []
+    for idx, tok in enumerate(matches):
+        parts = tok.split(".")
+        try:
+            hdr_txt = _b64url_decode(parts[0])
+            pay_txt = _b64url_decode(parts[1])
+            try:
+                hdr_obj = json.loads(hdr_txt)
+                hdr_pretty = json.dumps(hdr_obj, indent=2)
+            except Exception:
+                hdr_pretty = hdr_txt
+            try:
+                pay_obj = json.loads(pay_txt)
+                pay_pretty = json.dumps(pay_obj, indent=2)
+            except Exception:
+                pay_obj = {}
+                pay_pretty = pay_txt
+            summary = []
+            for k in ("sub", "user", "username", "email", "role", "roles", "scope", "tenant", "iss", "exp", "iat"):
+                if isinstance(pay_obj, dict) and k in pay_obj:
+                    summary.append("%s=%s" % (k, pay_obj[k]))
+            head_line = "JWT #%d" % (idx + 1)
+            if summary:
+                head_line += "  [" + ", ".join(summary) + "]"
+            blocks.append("%s\nHeader:\n%s\nPayload:\n%s" % (head_line, hdr_pretty, pay_pretty))
+        except Exception as e:
+            blocks.append("JWT #%d: decode error (%s)" % (idx + 1, e))
+    return "\n\n".join(blocks)
 
 
 def parse_static_extensions(text):
@@ -231,6 +370,17 @@ def format_group_id(gid):
     return "G%02d" % gid
 
 
+def format_api_label(gid):
+    return "API %d" % gid
+
+
+def format_feature_label(fid, name):
+    clean = ("%s" % (name or "")).strip()
+    if not clean or clean == ("%d" % fid):
+        return "Tên %d" % fid
+    return "Tên %d: %s" % (fid, clean)
+
+
 def display_role_name(role_name, index, number_roles):
     name = role_name or ("role%d" % (index + 1))
     if number_roles and not _ROLE_NUM_PREFIX_RE.match(name):
@@ -238,8 +388,11 @@ def display_role_name(role_name, index, number_roles):
     return name
 
 
-def repeater_tab_name(gid, method, path, role_display, max_len=40):
-    return "[%s:%s %s] %s" % (format_group_id(gid), (method or "").upper(),
+def repeater_tab_name(gid, method, path, role_display, max_len=40, fid=None, include_feature=False):
+    grp_tag = format_group_id(gid)
+    if include_feature and fid is not None:
+        grp_tag = "F%02d-%s" % (fid, grp_tag)
+    return "[%s:%s %s] %s" % (grp_tag, (method or "").upper(),
                               short_path(path, max_len), role_display)
 
 
@@ -312,7 +465,7 @@ def default_role_templates():
         ("02_Manager", [{"name": "Authorization", "value": "Bearer MANAGER_TOKEN", "mode": MODE_REPLACE},
                         {"name": "X-Role", "value": "manager", "mode": MODE_REPLACE}]),
         ("03_Auditor", [{"name": "Authorization", "value": "Bearer AUDITOR_TOKEN", "mode": MODE_REPLACE}]),
-        ("04_Support", [{"name": "Cookie", "value": "session=SUPPORT_SESSION", "mode": MODE_REPLACE},
+        ("04_Support", [{"name": "JSESSIONID", "value": "SUPPORT_SESSION", "mode": MODE_COOKIE_SET},
                         {"name": "Authorization", "value": REMOVE_TOKEN, "mode": MODE_REMOVE}]),
         ("05_UserA_TenantA", [{"name": "Authorization", "value": "Bearer USER_A_TOKEN", "mode": MODE_REPLACE},
                               {"name": "X-Tenant-ID", "value": "tenant-a", "mode": MODE_REPLACE}]),
@@ -331,8 +484,8 @@ def default_role_templates():
             for i, (n, hs) in enumerate(specs)]
 
 
-def groups_to_matrix_json(groups):
-    """Serialize captured API groups and per-role status/length metrics to JSON."""
+def groups_to_matrix_json(groups, features=None):
+    """Serialize captured Features, API groups and per-role status/length metrics to JSON."""
     items = []
     for g in groups or []:
         roles_out = []
@@ -350,7 +503,12 @@ def groups_to_matrix_json(groups):
                 "error": r.error or None,
             })
         items.append({
+            "api_number": g.gid,
+            "api_label": format_api_label(g.gid),
             "group_id": format_group_id(g.gid),
+            "feature_id": getattr(g, "fid", 1),
+            "feature_name": getattr(g, "feature_name", ""),
+            "feature_label": format_feature_label(getattr(g, "fid", 1), getattr(g, "feature_name", "")),
             "source": g.source,
             "created": g.created,
             "method": g.method,
@@ -364,7 +522,107 @@ def groups_to_matrix_json(groups):
             "role_count": len(g.results),
             "roles": roles_out,
         })
-    return json.dumps({"extension": EXT_NAME, "version": 1, "groups": items}, indent=2)
+    feat_list = []
+    if features is not None:
+        for f in features:
+            f_groups = [g for g in (groups or []) if getattr(g, "fid", 1) == f.fid]
+            feat_list.append({
+                "feature_id": f.fid,
+                "name": f.name,
+                "label": format_feature_label(f.fid, f.name),
+                "created": f.created,
+                "api_count": len(f_groups),
+                "apis": [format_api_label(g.gid) for g in f_groups],
+            })
+    return json.dumps({
+        "extension": EXT_NAME,
+        "version": 1,
+        "feature_count": len(feat_list) if feat_list else len(set([getattr(g, "fid", 1) for g in (groups or [])])),
+        "api_count": len(items),
+        "features": feat_list,
+        "groups": items,
+    }, indent=2)
+
+
+def build_history_summary_text(features, groups):
+    """
+    Build a structured audit report grouping sequential APIs (API 1, API 2, ...)
+    under their user-named Features (Tên 1, Tên 2, ...).
+    """
+    features = list(features or [])
+    groups = list(groups or [])
+    lines = []
+    lines.append("======================================================================")
+    lines.append("%s - BÁO CÁO LỊCH SỬ CHỨC NĂNG & API (AUDIT HISTORY)" % EXT_NAME)
+    lines.append("Tổng số chức năng (Features): %d   |   Tổng số API đã đi qua: %d" % (len(features), len(groups)))
+    lines.append("======================================================================")
+    if not features and not groups:
+        lines.append("\nChưa có API nào được ghi nhận.")
+        return "\n".join(lines)
+    by_fid = {}
+    for g in groups:
+        fid = getattr(g, "fid", 1)
+        by_fid.setdefault(fid, []).append(g)
+    seen_fids = set()
+    for f in features:
+        seen_fids.add(f.fid)
+        f_groups = by_fid.get(f.fid, [])
+        api_range = ("%s .. %s" % (format_api_label(f_groups[0].gid), format_api_label(f_groups[-1].gid))
+                     if f_groups else "chưa có API")
+        lines.append("")
+        lines.append("■ %s  (Số lượng API: %d | %s | Lúc: %s)" %
+                     (format_feature_label(f.fid, f.name), len(f_groups), api_range, f.created))
+        lines.append("-" * 70)
+        if not f_groups:
+            lines.append("   (Chưa có API nào trong chức năng này)")
+            continue
+        for idx, g in enumerate(f_groups, 1):
+            orig_info = "Orig Status=%s, Orig Len=%s" % (
+                g.orig_status if g.orig_status is not None else "-",
+                g.orig_length if g.orig_length is not None else "-")
+            lines.append("   %d. %s [%s]  %s %s://%s:%s%s  (%s | %d roles)" % (
+                idx, format_api_label(g.gid), format_group_id(g.gid),
+                g.method, g.protocol, g.host, g.port, g.path, orig_info, len(g.results)))
+            replayed = [r for r in g.results if r.status is not None]
+            if replayed:
+                status_summary = ", ".join(["%s:%s(len=%s)" % (r.role_name, r.status, r.length) for r in replayed])
+                lines.append("      -> Kết quả Replay: %s" % status_summary)
+    for fid in sorted(by_fid.keys()):
+        if fid in seen_fids:
+            continue
+        f_groups = by_fid[fid]
+        lines.append("")
+        lines.append("■ %s  (Số lượng API: %d)" % (format_feature_label(fid, ""), len(f_groups)))
+        for idx, g in enumerate(f_groups, 1):
+            lines.append("   %d. %s [%s]  %s %s" % (
+                idx, format_api_label(g.gid), format_group_id(g.gid), g.method, g.path))
+    return "\n".join(lines)
+
+
+def parse_bulk_cookies(text):
+    """
+    Parse a raw 'Cookie: a=1; b=2' header or 'a=1; b=2' / newline pairs into
+    individual COOKIE_SET (or COOKIE_REMOVE) rules.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.lower().startswith("cookie:"):
+            s = s.split(":", 1)[1].strip()
+        for part in s.split(";"):
+            p = part.strip()
+            if not p or "=" not in p:
+                continue
+            k, v = p.split("=", 1)
+            name = sanitize_header_name(k)
+            if not name:
+                continue
+            val = sanitize_header_value(v)
+            mode = MODE_COOKIE_REMOVE if val.upper() == REMOVE_TOKEN else MODE_COOKIE_SET
+            out.append({"name": name, "value": val, "mode": mode})
+    return out
 
 
 
@@ -441,6 +699,19 @@ def ui_call(fn):
 # =============================================================================
 
 
+class FeatureGroup(object):
+    """Represents a user-named feature / button click batch (e.g. Tên 1, Tên 2)."""
+
+    def __init__(self, fid, name="", created=None):
+        self.fid = fid
+        clean = ("%s" % (name or "")).strip()
+        self.name = clean if clean else ("%d" % fid)
+        self.created = created or time.strftime("%H:%M:%S")
+
+    def label(self):
+        return format_feature_label(self.fid, self.name)
+
+
 class RoleResult(object):
     def __init__(self, role_name, role_index, request_bytes):
         self.role_name = role_name
@@ -457,8 +728,11 @@ class RoleResult(object):
 
 
 class ApiGroup(object):
-    def __init__(self, gid, service, method, path, url, orig_request, orig_response, source):
+    def __init__(self, gid, service, method, path, url, orig_request, orig_response, source,
+                 fid=1, feature_name=""):
         self.gid = gid
+        self.fid = fid
+        self.feature_name = ("%s" % (feature_name or "")).strip() or ("%d" % fid)
         self.service = service
         self.host = service.getHost()
         self.port = service.getPort()
@@ -554,7 +828,7 @@ class RoleStore(object):
 
 
 class RoleTableModel(AbstractTableModel):
-    COLS = ["#", "Enabled", "Role Name", "Header Rules (+ADD  -REMOVE)"]
+    COLS = ["#", "Enabled", "Role Name", "Rules (Header / Cookie / JWT)"]
 
     def __init__(self, ext):
         self._ext = ext
@@ -602,29 +876,140 @@ class RoleTableModel(AbstractTableModel):
             return role["name"]
         parts = []
         for h in role["headers"]:
-            prefix = {MODE_REMOVE: "-", MODE_ADD: "+"}.get(h["mode"], "")
-            parts.append(prefix + h["name"])
+            mode = h.get("mode", MODE_REPLACE)
+            name = h.get("name", "")
+            val = h.get("value", "")
+            has_jwt = bool(_JWT_RE.search(val))
+            if mode == MODE_REMOVE:
+                parts.append("-%s" % name)
+            elif mode == MODE_ADD:
+                parts.append("+%s%s" % (name, "[JWT]" if has_jwt else ""))
+            elif mode == MODE_COOKIE_SET:
+                parts.append("Cookie:%s%s" % (name, "[JWT]" if has_jwt else ""))
+            elif mode == MODE_COOKIE_REMOVE:
+                parts.append("-Cookie:%s" % name)
+            else:
+                parts.append("%s%s" % (name, "[JWT]" if has_jwt else ""))
         return ", ".join(parts)
 
 
+class FeatureTableModel(AbstractTableModel):
+    """
+    Lists all Feature batches (Tên 1, Tên 2, ...) plus row 0 = [All Features].
+    Column 1 (Tên chức năng) is directly editable for Feature rows.
+    """
+    COLS = ["#", "Tên chức năng (Feature)", "Số API", "Danh sách API"]
+
+    def __init__(self, ext):
+        self._ext = ext
+
+    def getRowCount(self):
+        return 1 + len(self._ext.features_list())
+
+    def getColumnCount(self):
+        return len(self.COLS)
+
+    def getColumnName(self, c):
+        return self.COLS[c]
+
+    def getColumnClass(self, c):
+        if c == 2:
+            return Integer
+        return String
+
+    def isCellEditable(self, r, c):
+        return r > 0 and c == 1
+
+    def feature_at_row(self, r):
+        if r <= 0:
+            return None
+        feats = self._ext.features_list()
+        idx = r - 1
+        return feats[idx] if 0 <= idx < len(feats) else None
+
+    def setValueAt(self, value, r, c):
+        f = self.feature_at_row(r)
+        if f is None or c != 1:
+            return
+        raw = ("%s" % (value or "")).strip()
+        m = re.match(r"^(?:T[êe]n\s*\d+\s*[:\-]\s*)(.+)$", raw, re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+        self._ext.rename_feature(f.fid, raw or ("%d" % f.fid))
+
+    def getValueAt(self, r, c):
+        all_groups = self._ext.group_model.all_groups() if self._ext.group_model else []
+        feats = self._ext.features_list()
+        if r == 0:
+            if c == 0:
+                return "ALL"
+            if c == 1:
+                return "[Tất cả: %d chức năng]" % len(feats)
+            if c == 2:
+                return Integer(len(all_groups))
+            if c == 3:
+                if not all_groups:
+                    return "-"
+                return "%s .. %s" % (format_api_label(all_groups[0].gid),
+                                     format_api_label(all_groups[-1].gid))
+            return ""
+        f = feats[r - 1]
+        f_groups = [g for g in all_groups if g.fid == f.fid]
+        if c == 0:
+            active = (f.fid == self._ext.active_feature_id())
+            return ("* #%d" % f.fid) if active else ("#%d" % f.fid)
+        if c == 1:
+            return format_feature_label(f.fid, f.name)
+        if c == 2:
+            return Integer(len(f_groups))
+        if c == 3:
+            if not f_groups:
+                return "(chưa có API)"
+            if len(f_groups) <= 3:
+                return ", ".join([format_api_label(g.gid) for g in f_groups])
+            return "%s .. %s (%d)" % (format_api_label(f_groups[0].gid),
+                                      format_api_label(f_groups[-1].gid), len(f_groups))
+        return ""
+
+
 class GroupTableModel(AbstractTableModel):
-    COLS = ["Group", "Source", "Time", "Method", "Host", "Path", "Orig Status", "Orig Len",
-            "Role Count", "Replayed"]
+    COLS = ["API #", "Group", "Chức năng (Feature)", "Source", "Time", "Method", "Host", "Path",
+            "Orig Status", "Orig Len", "Role Count", "Replayed"]
 
     def __init__(self):
+        self._all_rows = []
         self._rows = []
+        self._filter_fid = None
+
+    def _rebuild_view(self):
+        if self._filter_fid is None:
+            self._rows = list(self._all_rows)
+        else:
+            self._rows = [g for g in self._all_rows if g.fid == self._filter_fid]
+
+    def set_feature_filter(self, fid):
+        self._filter_fid = fid
+        self._rebuild_view()
+        self.fireTableDataChanged()
+
+    def feature_filter(self):
+        return self._filter_fid
 
     def add(self, group):
-        self._rows.append(group)
-        n = len(self._rows) - 1
-        self.fireTableRowsInserted(n, n)
+        self._all_rows.append(group)
+        if self._filter_fid is None or group.fid == self._filter_fid:
+            self._rows.append(group)
+            n = len(self._rows) - 1
+            self.fireTableRowsInserted(n, n)
 
     def remove_groups(self, groups):
         ids = set([id(g) for g in groups])
-        self._rows = [g for g in self._rows if id(g) not in ids]
+        self._all_rows = [g for g in self._all_rows if id(g) not in ids]
+        self._rebuild_view()
         self.fireTableDataChanged()
 
     def clear(self):
+        self._all_rows = []
         self._rows = []
         self.fireTableDataChanged()
 
@@ -634,13 +1019,18 @@ class GroupTableModel(AbstractTableModel):
         return None
 
     def all_groups(self):
-        return list(self._rows)
+        return list(self._all_rows)
+
+    def groups_for_feature(self, fid):
+        return [g for g in self._all_rows if g.fid == fid]
 
     def refresh_group(self, group):
+        self._rebuild_view()
         for i, g in enumerate(self._rows):
             if g is group:
                 self.fireTableRowsUpdated(i, i)
                 return
+        self.fireTableDataChanged()
 
     def getRowCount(self):
         return len(self._rows)
@@ -652,33 +1042,37 @@ class GroupTableModel(AbstractTableModel):
         return self.COLS[c]
 
     def getColumnClass(self, c):
-        if c in (6, 7, 8):
+        if c in (8, 9, 10):
             return Integer
         return String
 
     def getValueAt(self, r, c):
         g = self._rows[r]
         if c == 0:
-            return format_group_id(g.gid)
+            return format_api_label(g.gid)
         if c == 1:
-            return g.source
+            return format_group_id(g.gid)
         if c == 2:
-            return g.created
+            return format_feature_label(g.fid, g.feature_name)
         if c == 3:
-            return g.method
+            return g.source
         if c == 4:
+            return g.created
+        if c == 5:
+            return g.method
+        if c == 6:
             default_port = ((g.protocol == "https" and g.port == 443) or
                             (g.protocol == "http" and g.port == 80))
             return g.host if default_port else "%s:%s" % (g.host, g.port)
-        if c == 5:
-            return g.path
-        if c == 6:
-            return None if g.orig_status is None else Integer(g.orig_status)
         if c == 7:
-            return None if g.orig_length is None else Integer(g.orig_length)
+            return g.path
         if c == 8:
-            return Integer(len(g.results))
+            return None if g.orig_status is None else Integer(g.orig_status)
         if c == 9:
+            return None if g.orig_length is None else Integer(g.orig_length)
+        if c == 10:
+            return Integer(len(g.results))
+        if c == 11:
             done = len([x for x in g.results if x.state in (STATE_DONE, STATE_ERROR)])
             return "%d/%d" % (done, len(g.results))
         return ""
@@ -767,10 +1161,20 @@ class StatusRenderer(DefaultTableCellRenderer):
 
 
 class HeaderRuleTableModel(AbstractTableModel):
-    COLS = ["Header Name", "Value (use [REMOVE] to strip)", "Mode"]
+    COLS = ["Header / Cookie Key", "Value (use [REMOVE] to strip)", "Mode"]
 
-    def __init__(self, rules):
+    def __init__(self, rules, on_change=None):
         self.rules = [dict(r) for r in rules]
+        self._on_change = on_change
+
+    def _changed(self):
+        if self._on_change is not None:
+            self._on_change()
+
+    def set_rules(self, rules):
+        self.rules = [dict(r) for r in rules]
+        self.fireTableDataChanged()
+        self._changed()
 
     def getRowCount(self):
         return len(self.rules)
@@ -792,19 +1196,33 @@ class HeaderRuleTableModel(AbstractTableModel):
         v = "" if value is None else "%s" % value
         self.rules[r][["name", "value", "mode"][c]] = v
         if c == 1 and v.strip().upper() == REMOVE_TOKEN:
-            self.rules[r]["mode"] = MODE_REMOVE
+            cur_mode = self.rules[r].get("mode", MODE_REPLACE)
+            self.rules[r]["mode"] = (MODE_COOKIE_REMOVE if cur_mode in (MODE_COOKIE_SET, MODE_COOKIE_REMOVE)
+                                     else MODE_REMOVE)
         self.fireTableRowsUpdated(r, r)
+        self._changed()
 
     def add_rule(self, rule):
         self.rules.append(dict(rule))
         n = len(self.rules) - 1
         self.fireTableRowsInserted(n, n)
+        self._changed()
 
     def remove_rows(self, rows):
         for i in sorted(set(rows), reverse=True):
             if 0 <= i < len(self.rules):
                 del self.rules[i]
         self.fireTableDataChanged()
+        self._changed()
+
+    def move_rule(self, idx, delta):
+        j = idx + delta
+        if 0 <= idx < len(self.rules) and 0 <= j < len(self.rules):
+            self.rules[idx], self.rules[j] = self.rules[j], self.rules[idx]
+            self.fireTableDataChanged()
+            self._changed()
+            return j
+        return idx
 
 
 # =============================================================================
@@ -819,6 +1237,29 @@ class _SelectionListener(ListSelectionListener):
     def valueChanged(self, event):
         if not event.getValueIsAdjusting():
             self._fn()
+
+
+class _TreeListener(TreeSelectionListener):
+    def __init__(self, fn):
+        self._fn = fn
+
+    def valueChanged(self, event):
+        self._fn()
+
+
+class _TreeNodeItem(object):
+    """User object for DefaultMutableTreeNode that renders a readable label in JTree."""
+
+    def __init__(self, kind, payload, label):
+        self.kind = kind
+        self.payload = payload
+        self.label = label
+
+    def __str__(self):
+        return self.label
+
+    def toString(self):
+        return self.label
 
 
 class _DoubleClick(MouseAdapter):
@@ -850,8 +1291,270 @@ class _EditorController(IMessageEditorController):
 
 
 # =============================================================================
-# Role editor dialog
+# Role editor panel & dialog (supports Header, Cookie Key, and JWT/Bearer rules)
 # =============================================================================
+
+
+class RoleEditorPanel(JPanel):
+    """
+    Reusable editor panel for a single role profile. Used both inline on the
+    Roles tab and inside the modal RoleEditorDialog.
+    """
+
+    def __init__(self, role, inline_save_fn=None):
+        JPanel.__init__(self, BorderLayout(6, 6))
+        self._inline_save_fn = inline_save_fn
+        self.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6))
+
+        top = JPanel(GridBagLayout())
+        gc = GridBagConstraints()
+        gc.insets = Insets(3, 3, 3, 3)
+        gc.anchor = GridBagConstraints.WEST
+        gc.gridx = 0
+        gc.gridy = 0
+        top.add(JLabel("Role Name:"), gc)
+        gc.gridx = 1
+        gc.fill = GridBagConstraints.HORIZONTAL
+        gc.weightx = 1.0
+        self.name_field = JTextField(role.get("name", ""), 26)
+        top.add(self.name_field, gc)
+        gc.gridx = 2
+        gc.weightx = 0.0
+        gc.fill = GridBagConstraints.NONE
+        self.enabled_box = JCheckBox("Enabled", bool(role.get("enabled", True)))
+        top.add(self.enabled_box, gc)
+        if inline_save_fn is not None:
+            gc.gridx = 3
+            self.save_btn = JButton("Save Profile Changes", actionPerformed=self._on_inline_save)
+            top.add(self.save_btn, gc)
+            gc.gridx = 4
+            self.dirty_label = JLabel(" ")
+            self.dirty_label.setForeground(Color(0, 130, 0))
+            top.add(self.dirty_label, gc)
+        else:
+            self.dirty_label = None
+        self.add(top, BorderLayout.NORTH)
+
+        self.model = HeaderRuleTableModel(role.get("headers", []), on_change=self._refresh_jwt_preview)
+        self.table = JTable(self.model)
+        self.table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE)
+        self.table.setRowHeight(22)
+        cm = self.table.getColumnModel()
+        cm.getColumn(2).setCellEditor(DefaultCellEditor(JComboBox(HEADER_MODES)))
+        cm.getColumn(0).setPreferredWidth(180)
+        cm.getColumn(1).setPreferredWidth(420)
+        cm.getColumn(2).setPreferredWidth(130)
+
+        self.jwt_area = JTextArea(5, 50)
+        self.jwt_area.setEditable(False)
+        self.jwt_area.setFont(Font("Monospaced", Font.PLAIN, 11))
+        jwt_panel = JPanel(BorderLayout())
+        jwt_panel.add(JLabel(" JWT / Token Inspector (auto-decodes any eyJ... token in this profile):"),
+                      BorderLayout.NORTH)
+        jwt_panel.add(JScrollPane(self.jwt_area), BorderLayout.CENTER)
+
+        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.table), jwt_panel)
+        split.setResizeWeight(0.68)
+
+        center = JPanel(BorderLayout(4, 4))
+        center.add(split, BorderLayout.CENTER)
+        center.add(JLabel(
+            "<html><b>Modes:</b> REPLACE = ghi đè/thêm Header &nbsp;|&nbsp; "
+            "ADD = nối thêm dòng Header &nbsp;|&nbsp; "
+            "REMOVE (hoặc <b>[REMOVE]</b>) = xóa Header &nbsp;|&nbsp; "
+            "<b>COOKIE_SET</b> = thêm/sửa 1 biến trong Cookie &nbsp;|&nbsp; "
+            "<b>COOKIE_REMOVE</b> = xóa 1 biến khỏi Cookie</html>"), BorderLayout.SOUTH)
+        self.add(center, BorderLayout.CENTER)
+
+        toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        toolbar.add(JButton("+ Header", actionPerformed=self._on_add_header))
+        toolbar.add(JButton("+ Strip Header ([REMOVE])", actionPerformed=self._on_strip_header))
+        toolbar.add(JButton("+ Set JWT / Bearer...", actionPerformed=self._on_set_jwt))
+        toolbar.add(JButton("+ Set Cookie/Session Key...", actionPerformed=self._on_set_cookie))
+        toolbar.add(JButton("+ Strip Cookie Key...", actionPerformed=self._on_strip_cookie))
+        toolbar.add(JButton("Paste Headers...", actionPerformed=self._on_bulk_headers))
+        toolbar.add(JButton("Paste Cookies...", actionPerformed=self._on_bulk_cookies))
+        toolbar.add(JButton("Rule Up", actionPerformed=lambda e: self._on_move_rule(-1)))
+        toolbar.add(JButton("Rule Down", actionPerformed=lambda e: self._on_move_rule(1)))
+        toolbar.add(JButton("Remove Rule(s)", actionPerformed=self._on_remove))
+        self.add(toolbar, BorderLayout.SOUTH)
+        self._refresh_jwt_preview()
+
+    def load_role(self, role):
+        self.stop_editing()
+        if role is None:
+            self.name_field.setText("")
+            self.enabled_box.setSelected(True)
+            self.model.set_rules([])
+            if self.dirty_label is not None:
+                self.dirty_label.setText(" ")
+            return
+        self.name_field.setText(role.get("name", ""))
+        self.enabled_box.setSelected(bool(role.get("enabled", True)))
+        self.model.set_rules(role.get("headers", []))
+        if self.dirty_label is not None:
+            self.dirty_label.setText(" ")
+
+    def stop_editing(self):
+        if self.table.isEditing():
+            self.table.getCellEditor().stopCellEditing()
+
+    def _refresh_jwt_preview(self):
+        vals = "\n".join([r.get("value", "") for r in self.model.rules])
+        self.jwt_area.setText(decode_jwt_preview(vals))
+        self.jwt_area.setCaretPosition(0)
+
+    def build_validated_role(self):
+        self.stop_editing()
+        name = self.name_field.getText().strip()
+        if not name:
+            JOptionPane.showMessageDialog(self, "Role name is required.", EXT_NAME,
+                                          JOptionPane.WARNING_MESSAGE)
+            return None
+        bad = [r.get("name", "") for r in self.model.rules if not sanitize_header_name(r.get("name"))]
+        if bad:
+            JOptionPane.showMessageDialog(
+                self, "Invalid header/cookie name(s): %s\n(no spaces, colons or line breaks)"
+                % ", ".join(["'%s'" % b for b in bad]), EXT_NAME, JOptionPane.WARNING_MESSAGE)
+            return None
+        return normalize_role({"name": name, "enabled": self.enabled_box.isSelected(),
+                               "headers": self.model.rules})
+
+    def _on_inline_save(self, event):
+        if self._inline_save_fn is not None:
+            role = self.build_validated_role()
+            if role is not None:
+                self._inline_save_fn(role)
+                if self.dirty_label is not None:
+                    self.dirty_label.setText("Saved!")
+
+    def _select_last_row(self, edit_col=None):
+        r = self.model.getRowCount() - 1
+        if r >= 0:
+            self.table.setRowSelectionInterval(r, r)
+            if edit_col is not None:
+                self.table.editCellAt(r, edit_col)
+
+    def _on_add_header(self, event):
+        self.stop_editing()
+        self.model.add_rule({"name": "X-Role", "value": "", "mode": MODE_REPLACE})
+        self._select_last_row(0)
+
+    def _on_strip_header(self, event):
+        self.stop_editing()
+        hdr = JOptionPane.showInputDialog(self, "Header name to strip (e.g. Authorization, Cookie, X-Tenant-ID):",
+                                          "Authorization")
+        if hdr is not None and sanitize_header_name(hdr):
+            self.model.add_rule({"name": sanitize_header_name(hdr), "value": REMOVE_TOKEN, "mode": MODE_REMOVE})
+            self._select_last_row()
+
+    def _on_set_jwt(self, event):
+        self.stop_editing()
+        p = JPanel(GridBagLayout())
+        gc = GridBagConstraints()
+        gc.insets = Insets(3, 3, 3, 3)
+        gc.anchor = GridBagConstraints.WEST
+        gc.fill = GridBagConstraints.HORIZONTAL
+        hdr_field = JTextField("Authorization", 25)
+        pfx_field = JTextField("Bearer", 12)
+        tok_area = JTextArea(5, 45)
+        tok_area.setLineWrap(True)
+        gc.gridx, gc.gridy = 0, 0
+        p.add(JLabel("Header Name:"), gc)
+        gc.gridx = 1
+        p.add(hdr_field, gc)
+        gc.gridx, gc.gridy = 0, 1
+        p.add(JLabel("Prefix (leave empty for raw token):"), gc)
+        gc.gridx = 1
+        p.add(pfx_field, gc)
+        gc.gridx, gc.gridy = 0, 2
+        gc.gridwidth = 2
+        p.add(JLabel("JWT / Token value (or [REMOVE]):"), gc)
+        gc.gridy = 3
+        p.add(JScrollPane(tok_area), gc)
+        res = JOptionPane.showConfirmDialog(self, p, "Set JWT / Bearer Token for Role",
+                                            JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
+        if res != JOptionPane.OK_OPTION:
+            return
+        hname = sanitize_header_name(hdr_field.getText()) or "Authorization"
+        raw_tok = tok_area.getText().strip()
+        val = format_jwt_bearer(raw_tok, pfx_field.getText())
+        mode = MODE_REMOVE if val == REMOVE_TOKEN else MODE_REPLACE
+        for i, r in enumerate(self.model.rules):
+            if r.get("name", "").lower() == hname.lower() and r.get("mode") in (MODE_REPLACE, MODE_REMOVE):
+                self.model.rules[i] = {"name": hname, "value": val, "mode": mode}
+                self.model.fireTableDataChanged()
+                self._refresh_jwt_preview()
+                return
+        self.model.add_rule({"name": hname, "value": val, "mode": mode})
+
+    def _on_set_cookie(self, event):
+        self.stop_editing()
+        p = JPanel(GridBagLayout())
+        gc = GridBagConstraints()
+        gc.insets = Insets(3, 3, 3, 3)
+        gc.anchor = GridBagConstraints.WEST
+        gc.fill = GridBagConstraints.HORIZONTAL
+        k_field = JTextField("JSESSIONID", 25)
+        v_field = JTextField("", 35)
+        gc.gridx, gc.gridy = 0, 0
+        p.add(JLabel("Cookie / Session Key (e.g. JSESSIONID, session, token):"), gc)
+        gc.gridx = 1
+        p.add(k_field, gc)
+        gc.gridx, gc.gridy = 0, 1
+        p.add(JLabel("Cookie Value:"), gc)
+        gc.gridx = 1
+        p.add(v_field, gc)
+        res = JOptionPane.showConfirmDialog(
+            self, p, "Set Individual Cookie / Session Parameter (preserves other cookies)",
+            JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
+        if res == JOptionPane.OK_OPTION:
+            cname = sanitize_header_name(k_field.getText())
+            if cname:
+                self.model.add_rule({"name": cname, "value": sanitize_header_value(v_field.getText()),
+                                     "mode": MODE_COOKIE_SET})
+                self._select_last_row()
+
+    def _on_strip_cookie(self, event):
+        self.stop_editing()
+        cname = JOptionPane.showInputDialog(
+            self, "Cookie key to strip from Cookie header (other cookies stay intact):", "JSESSIONID")
+        if cname is not None and sanitize_header_name(cname):
+            self.model.add_rule({"name": sanitize_header_name(cname), "value": REMOVE_TOKEN,
+                                 "mode": MODE_COOKIE_REMOVE})
+            self._select_last_row()
+
+    def _on_move_rule(self, delta):
+        self.stop_editing()
+        r = self.table.getSelectedRow()
+        if r >= 0:
+            nr = self.model.move_rule(r, delta)
+            self.table.setRowSelectionInterval(nr, nr)
+
+    def _on_remove(self, event):
+        self.stop_editing()
+        self.model.remove_rows(list(self.table.getSelectedRows()))
+
+    def _on_bulk_headers(self, event):
+        self.stop_editing()
+        area = JTextArea(12, 60)
+        res = JOptionPane.showConfirmDialog(self, JScrollPane(area),
+                                            "Paste HTTP headers, one 'Name: value' per line",
+                                            JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
+        if res == JOptionPane.OK_OPTION:
+            for rule in parse_bulk_headers(area.getText()):
+                self.model.add_rule(rule)
+
+    def _on_bulk_cookies(self, event):
+        self.stop_editing()
+        area = JTextArea(8, 60)
+        res = JOptionPane.showConfirmDialog(
+            self, JScrollPane(area),
+            "Paste 'Cookie: a=1; b=2' or 'a=1; b=2' (splits into individual COOKIE_SET rules)",
+            JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
+        if res == JOptionPane.OK_OPTION:
+            for rule in parse_bulk_cookies(area.getText()):
+                self.model.add_rule(rule)
 
 
 class RoleEditorDialog(object):
@@ -865,104 +1568,29 @@ class RoleEditorDialog(object):
         self.dialog.setModal(True)
         self.dialog.setLayout(BorderLayout(6, 6))
 
-        top = JPanel(GridBagLayout())
-        top.setBorder(BorderFactory.createEmptyBorder(8, 8, 0, 8))
-        gc = GridBagConstraints()
-        gc.insets = Insets(3, 3, 3, 3)
-        gc.anchor = GridBagConstraints.WEST
-        gc.gridx = 0
-        gc.gridy = 0
-        top.add(JLabel("Role name:"), gc)
-        gc.gridx = 1
-        gc.fill = GridBagConstraints.HORIZONTAL
-        gc.weightx = 1.0
-        self.name_field = JTextField(role.get("name", ""), 30)
-        top.add(self.name_field, gc)
-        gc.gridx = 2
-        gc.weightx = 0.0
-        gc.fill = GridBagConstraints.NONE
-        self.enabled_box = JCheckBox("Enabled", bool(role.get("enabled", True)))
-        top.add(self.enabled_box, gc)
-        self.dialog.add(top, BorderLayout.NORTH)
+        self.editor = RoleEditorPanel(role, inline_save_fn=None)
+        self.dialog.add(self.editor, BorderLayout.CENTER)
 
-        self.model = HeaderRuleTableModel(role.get("headers", []))
-        self.table = JTable(self.model)
-        self.table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE)
-        self.table.setRowHeight(22)
-        cm = self.table.getColumnModel()
-        cm.getColumn(2).setCellEditor(DefaultCellEditor(JComboBox(HEADER_MODES)))
-        cm.getColumn(0).setPreferredWidth(170)
-        cm.getColumn(1).setPreferredWidth(430)
-        cm.getColumn(2).setPreferredWidth(90)
-
-        center = JPanel(BorderLayout())
-        center.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8))
-        center.add(JScrollPane(self.table), BorderLayout.CENTER)
-        center.add(JLabel("<html>REPLACE = overwrite the existing header (added if absent) &nbsp;|&nbsp; "
-                          "ADD = always append another line &nbsp;|&nbsp; "
-                          "REMOVE or value <b>[REMOVE]</b> = strip the header</html>"), BorderLayout.SOUTH)
-        self.dialog.add(center, BorderLayout.CENTER)
-
-        btns = JPanel(FlowLayout(FlowLayout.LEFT))
-        btns.add(JButton("Add Header", actionPerformed=self._on_add))
-        btns.add(JButton("Remove Selected", actionPerformed=self._on_remove))
-        btns.add(JButton("Bulk Paste Headers...", actionPerformed=self._on_bulk))
-        btns.add(Box.createHorizontalStrut(30))
+        btns = JPanel(FlowLayout(FlowLayout.RIGHT))
         btns.add(JButton("Save", actionPerformed=self._on_save))
         btns.add(JButton("Cancel", actionPerformed=self._on_cancel))
         self.dialog.add(btns, BorderLayout.SOUTH)
 
-        self.dialog.setSize(Dimension(840, 420))
+        self.dialog.setSize(Dimension(940, 520))
         self.dialog.setLocationRelativeTo(owner)
 
-    def _stop_editing(self):
-        if self.table.isEditing():
-            self.table.getCellEditor().stopCellEditing()
-
-    def _on_add(self, event):
-        self._stop_editing()
-        self.model.add_rule({"name": "X-Role", "value": "", "mode": MODE_REPLACE})
-        r = self.model.getRowCount() - 1
-        self.table.setRowSelectionInterval(r, r)
-        self.table.editCellAt(r, 0)
-
-    def _on_remove(self, event):
-        self._stop_editing()
-        self.model.remove_rows(list(self.table.getSelectedRows()))
-
-    def _on_bulk(self, event):
-        self._stop_editing()
-        area = JTextArea(12, 60)
-        res = JOptionPane.showConfirmDialog(self.dialog, JScrollPane(area),
-                                            "Paste headers, one 'Name: value' per line",
-                                            JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE)
-        if res == JOptionPane.OK_OPTION:
-            for rule in parse_bulk_headers(area.getText()):
-                self.model.add_rule(rule)
-
     def _on_save(self, event):
-        self._stop_editing()
-        name = self.name_field.getText().strip()
-        if not name:
-            JOptionPane.showMessageDialog(self.dialog, "Role name is required.", EXT_NAME,
-                                          JOptionPane.WARNING_MESSAGE)
-            return
-        bad = [r.get("name", "") for r in self.model.rules if not sanitize_header_name(r.get("name"))]
-        if bad:
-            JOptionPane.showMessageDialog(
-                self.dialog, "Invalid header name(s): %s\n(no spaces, colons or line breaks)"
-                % ", ".join(["'%s'" % b for b in bad]), EXT_NAME, JOptionPane.WARNING_MESSAGE)
-            return
-        self._result = normalize_role({"name": name, "enabled": self.enabled_box.isSelected(),
-                                       "headers": self.model.rules})
-        self.dialog.dispose()
+        role = self.editor.build_validated_role()
+        if role is not None:
+            self._result = role
+            self.dialog.dispose()
 
     def _on_cancel(self, event):
         self._result = None
         self.dialog.dispose()
 
     def show(self):
-        self.dialog.setVisible(True)  # modal: blocks until disposed
+        self.dialog.setVisible(True)
         return self._result
 
 
@@ -983,6 +1611,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._cfg_lock = threading.RLock()
         self._state_lock = threading.RLock()
         self._next_gid = 1
+        self._next_fid = 2
+        self._active_fid = 1
+        self._features = [FeatureGroup(1, "Chức năng 1")]
         self._seen_keys = set()
         self._unloaded = False
         self._api_regex = None
@@ -990,8 +1621,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.log_area = None
         self.main_panel = None
         self.status_label = None
+        self.feature_model = None
         self.group_model = None
         self.result_model = None
+        self.history_tree = None
+        self.history_tree_model = None
+        self.history_summary_area = None
+        self.inline_role_editor = None
+        self._updating_feature_bar = False
 
         self.config = merge_config(self._load_json_setting(SETTINGS_KEY_CONFIG, {}))
         regex_err = self._recompile_filters(self.config)
@@ -1017,6 +1654,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.callbacks.registerHttpListener(self)
         self.callbacks.registerContextMenuFactory(self)
         self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+        self._refresh_feature_views()
         self.update_status()
 
     def extensionUnloaded(self):
@@ -1055,6 +1693,94 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 doc.remove(0, doc.getLength() - 200000)
             area.setCaretPosition(doc.getLength())
         ui_call(append)
+
+    # -------------------------------------------------------------- features
+    def features_list(self):
+        with self._state_lock:
+            return list(self._features)
+
+    def active_feature_id(self):
+        with self._state_lock:
+            return self._active_fid
+
+    def active_feature(self):
+        with self._state_lock:
+            for f in self._features:
+                if f.fid == self._active_fid:
+                    return f
+            return self._features[-1]
+
+    def get_feature(self, fid):
+        if fid is None:
+            return None
+        with self._state_lock:
+            for f in self._features:
+                if f.fid == fid:
+                    return f
+        return None
+
+    def start_new_feature(self, name=None):
+        with self._state_lock:
+            fid = self._next_fid
+            self._next_fid += 1
+            clean = ("%s" % (name or "")).strip() or ("Chức năng %d" % fid)
+            feat = FeatureGroup(fid, clean)
+            self._features.append(feat)
+            self._active_fid = fid
+        self.log("Chuyển sang %s - các API tiếp theo sẽ được gom vào chức năng này."
+                 % format_feature_label(feat.fid, feat.name))
+        self._refresh_feature_views()
+        self.update_status()
+        return feat
+
+    def rename_feature(self, fid, new_name):
+        clean = ("%s" % (new_name or "")).strip() or ("Chức năng %d" % fid)
+        with self._state_lock:
+            feat = None
+            for f in self._features:
+                if f.fid == fid:
+                    f.name = clean
+                    feat = f
+                    break
+        if feat is None:
+            return
+
+        def sync():
+            if self.group_model is not None:
+                for g in self.group_model.all_groups():
+                    if g.fid == fid:
+                        g.feature_name = clean
+                self.group_model.fireTableDataChanged()
+            self._refresh_feature_views()
+            self.update_status()
+        ui_call(sync)
+        self.log("Đổi tên chức năng #%d -> %s" % (fid, format_feature_label(fid, clean)))
+
+    def set_active_feature(self, fid):
+        with self._state_lock:
+            for f in self._features:
+                if f.fid == fid:
+                    self._active_fid = fid
+                    break
+        self._refresh_feature_views()
+        self.update_status()
+
+    def move_groups_to_feature(self, groups, fid):
+        feat = self.get_feature(fid)
+        if feat is None or not groups:
+            return
+        cfg = self.get_config()
+        for g in groups:
+            g.fid = feat.fid
+            g.feature_name = feat.name
+            for r in g.results:
+                r.tab_name = repeater_tab_name(g.gid, g.method, g.path, r.role_name,
+                                               cfg["short_path_len"], g.fid, cfg["include_feature_in_tab"])
+        if self.group_model is not None:
+            self.group_model._rebuild_view()
+            self.group_model.fireTableDataChanged()
+        self._refresh_feature_views()
+        self.update_status()
 
     # -------------------------------------------------------------- settings
     def _load_json_setting(self, key, default):
@@ -1116,8 +1842,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             resp = messageInfo.getResponse()
             req_copy = Arrays.copyOf(req, len(req))
             resp_copy = Arrays.copyOf(resp, len(resp)) if resp is not None else None
+            target_fid = self.active_feature_id()
             self.capture_executor.execute(_Task(
-                lambda: self._process_capture(service, req_copy, resp_copy, "Proxy", True), self.log))
+                lambda: self._process_capture(service, req_copy, resp_copy, "Proxy", True, target_fid),
+                self.log))
         except Throwable as t:
             self.log("Proxy capture error: %s" % t)
 
@@ -1137,21 +1865,40 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if not snapshot:
             return None
 
-        def make_handler(apply_filters):
+        cur_feat = self.active_feature()
+        cur_label = format_feature_label(cur_feat.fid, cur_feat.name)
+
+        def make_handler(apply_filters, prompt_new_feature=False):
             def handler(event):
+                target_fid = cur_feat.fid
+                if prompt_new_feature:
+                    next_num = len(self.features_list()) + 1
+                    name = JOptionPane.showInputDialog(
+                        self.main_panel,
+                        "Nhập tên cho Chức năng mới (Tên %d):" % next_num,
+                        "Chức năng %d" % next_num)
+                    if name is None:
+                        return
+                    feat = self.start_new_feature(name)
+                    target_fid = feat.fid
                 for svc, rq, rs in snapshot:
                     self.capture_executor.execute(_Task(
-                        (lambda s=svc, a=rq, b=rs: self._process_capture(s, a, b, "Manual", apply_filters)),
+                        (lambda s=svc, a=rq, b=rs, tf=target_fid:
+                         self._process_capture(s, a, b, "Manual", apply_filters, tf)),
                         self.log))
-                self.log("Manual trigger: %d message(s) queued (%s)." %
-                         (len(snapshot), "capture filters applied" if apply_filters else "filters bypassed"))
+                self.log("Manual trigger: %d message(s) queued -> Feature #%d (%s)." %
+                         (len(snapshot), target_fid,
+                          "capture filters applied" if apply_filters else "filters bypassed"))
             return handler
 
         items = ArrayList()
-        items.add(JMenuItem("%s: Clone to all enabled roles (%d message(s))" % (EXT_NAME, len(snapshot)),
-                            actionPerformed=make_handler(False)))
-        items.add(JMenuItem("%s: Clone to all enabled roles (apply capture filters + dedup)" % EXT_NAME,
-                            actionPerformed=make_handler(True)))
+        items.add(JMenuItem("%s: Clone to '%s' (%d message(s))" % (EXT_NAME, cur_label, len(snapshot)),
+                            actionPerformed=make_handler(False, False)))
+        items.add(JMenuItem("%s: Clone to NEW Feature (Tạo Tên chức năng mới...) (%d message(s))"
+                            % (EXT_NAME, len(snapshot)),
+                            actionPerformed=make_handler(False, True)))
+        items.add(JMenuItem("%s: Clone to '%s' (apply capture filters + dedup)" % (EXT_NAME, cur_label),
+                            actionPerformed=make_handler(True, False)))
         return items
 
     # -------------------------------------------------------------- filtering
@@ -1171,8 +1918,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return None
 
     # ------------------------------------------------ capture -> group build
-    def _process_capture(self, service, req, resp, source, apply_filters):
-        """Runs on the single capture thread (deterministic group IDs + dedup)."""
+    def _process_capture(self, service, req, resp, source, apply_filters, target_fid=None):
+        """Runs on the single capture thread (deterministic API # / group IDs + dedup)."""
         if self._unloaded:
             return
         cfg = self.get_config()
@@ -1180,6 +1927,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         url = info.getUrl()
         method = ("%s" % (info.getMethod() or "GET")).upper()
         path = url.getFile() or "/"
+        feat = self.get_feature(target_fid) or self.active_feature()
 
         if apply_filters:
             reason = self._filter_reason(cfg, url, method, path)
@@ -1188,8 +1936,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     self.log("Skipped %s %s (%s)" % (method, url, reason))
                 return
             if cfg["dedup"]:
-                key = dedup_key(method, service.getProtocol(), service.getHost(), service.getPort(),
-                                path, cfg["dedup_normalize_ids"])
+                base_key = dedup_key(method, service.getProtocol(), service.getHost(), service.getPort(),
+                                     path, cfg["dedup_normalize_ids"])
+                key = ("F%d|%s" % (feat.fid, base_key)) if cfg.get("dedup_per_feature") else base_key
                 with self._state_lock:
                     if key in self._seen_keys:
                         if source == "Manual":
@@ -1206,7 +1955,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             gid = self._next_gid
             self._next_gid += 1
 
-        group = ApiGroup(gid, service, method, path, "%s" % url, req, resp, source)
+        group = ApiGroup(gid, service, method, path, "%s" % url, req, resp, source,
+                         feat.fid, feat.name)
         if resp is not None:
             try:
                 rinfo = self.helpers.analyzeResponse(resp)
@@ -1217,8 +1967,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         group.results = self._clone_for_roles(group, info, roles, cfg)
 
         ui_call(lambda: self._add_group_ui(group))
-        self.log("%s: %s %s -> %d role clone(s) [%s]" %
-                 (format_group_id(gid), method, url, len(group.results), source))
+        self.log("%s (%s) [%s]: %s %s -> %d role clone(s) [%s]" %
+                 (format_api_label(gid), format_group_id(gid),
+                  format_feature_label(feat.fid, feat.name),
+                  method, url, len(group.results), source))
         if cfg["auto_repeater"]:
             self._dispatch_repeater(group, group.results)
         if cfg["auto_send"]:
@@ -1239,7 +1991,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             display = display_role_name(role["name"], idx, cfg["number_roles_in_tab"])
             res = RoleResult(display, idx, new_req)
             res.tab_name = repeater_tab_name(group.gid, group.method, group.path, display,
-                                             cfg["short_path_len"])
+                                             cfg["short_path_len"], group.fid,
+                                             cfg.get("include_feature_in_tab", False))
             results.append(res)
         return results
 
@@ -1259,8 +2012,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 if self.result_model.group() is group:
                     self.result_model.set_group(group)
                     self._select_first_result()
+                self._refresh_feature_views()
             ui_call(apply)
-            self.log("%s rebuilt with %d current role(s)." % (format_group_id(group.gid), len(new_results)))
+            self.log("%s (%s) rebuilt with %d current role(s)." %
+                     (format_api_label(group.gid), format_group_id(group.gid), len(new_results)))
         self.capture_executor.execute(_Task(work, self.log))
 
     # -------------------------------------------------------------- Repeater
@@ -1276,7 +2031,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                               res.request, res.tab_name)
             except Throwable as t:
                 self.log("Repeater dispatch failed for %s: %s" % (res.tab_name, t))
-        self.log("%s: %d request(s) sent to Repeater." % (format_group_id(group.gid), len(results)))
+        self.log("%s (%s): %d request(s) sent to Repeater." %
+                 (format_api_label(group.gid), format_group_id(group.gid), len(results)))
 
     # ------------------------------------------------------ background replay
     def replay(self, group, results):
@@ -1343,6 +2099,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 _, sel = self.current_selection()
                 if sel is not None and (res is None or sel is res):
                     self._show_result(sel)
+            if self.history_summary_area is not None:
+                self._refresh_history_summary_only()
         ui_call(refresh)
 
     # ===================================================================== UI
@@ -1350,8 +2108,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.main_panel = JPanel(BorderLayout())
         cfg = self.get_config()
 
-        # ---- top control bar (most used toggles)
-        bar = JPanel(FlowLayout(FlowLayout.LEFT, 8, 4))
+        # ---- top control bar (capture toggles + Active Feature switcher)
+        top_container = JPanel(BorderLayout())
+        bar1 = JPanel(FlowLayout(FlowLayout.LEFT, 8, 3))
         self.cb_capture = JCheckBox("Capture Proxy traffic", cfg["capture_enabled"],
                                     actionPerformed=self._on_settings_changed)
         self.cb_auto_repeater = JCheckBox("Auto-send new groups to Repeater", cfg["auto_repeater"],
@@ -1360,22 +2119,43 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                       actionPerformed=self._on_settings_changed)
         self.status_label = JLabel("")
         for comp in (self.cb_capture, self.cb_auto_repeater, self.cb_auto_send):
-            bar.add(comp)
-        bar.add(Box.createHorizontalStrut(20))
-        bar.add(self.status_label)
-        self.main_panel.add(bar, BorderLayout.NORTH)
+            bar1.add(comp)
+        bar1.add(Box.createHorizontalStrut(14))
+        bar1.add(self.status_label)
 
-        tabs = JTabbedPane()
-        tabs.addTab("API Groups", self._build_groups_tab())
-        tabs.addTab("Roles", self._build_roles_tab())
-        tabs.addTab("Capture Filters & Options", self._build_settings_tab(cfg))
+        bar2 = JPanel(FlowLayout(FlowLayout.LEFT, 6, 3))
+        bar2.setBorder(BorderFactory.createTitledBorder("Bộ gom Chức năng (Feature / Button Action Batching)"))
+        self.lbl_active_feature = JLabel("Đang bắt vào Tên 1:")
+        self.lbl_active_feature.setFont(Font("Dialog", Font.BOLD, 12))
+        self.tf_feature_name = JTextField(self.active_feature().name, 22,
+                                          actionPerformed=self._on_apply_active_feature_name)
+        btn_rename_feat = JButton("Cập nhật Tên", actionPerformed=self._on_apply_active_feature_name)
+        btn_next_feat = JButton("+ Qua Chức Năng Mới (Bấm nút tiếp theo -> Tên mới)",
+                                actionPerformed=self._on_next_feature)
+        self.lbl_feature_counter = JLabel("")
+        bar2.add(self.lbl_active_feature)
+        bar2.add(self.tf_feature_name)
+        bar2.add(btn_rename_feat)
+        bar2.add(btn_next_feat)
+        bar2.add(Box.createHorizontalStrut(10))
+        bar2.add(self.lbl_feature_counter)
+
+        top_container.add(bar1, BorderLayout.NORTH)
+        top_container.add(bar2, BorderLayout.CENTER)
+        self.main_panel.add(top_container, BorderLayout.NORTH)
+
+        self.tabs = JTabbedPane()
+        self.tabs.addTab("API Groups (Master-Detail)", self._build_groups_tab())
+        self.tabs.addTab("History & Features (Lịch sử Chức năng & API)", self._build_history_tab())
+        self.tabs.addTab("Roles (Profiles)", self._build_roles_tab())
+        self.tabs.addTab("Capture Filters & Options", self._build_settings_tab(cfg))
         self.log_area = JTextArea()
         self.log_area.setEditable(False)
-        tabs.addTab("Log", JScrollPane(self.log_area))
-        self.main_panel.add(tabs, BorderLayout.CENTER)
+        self.tabs.addTab("Log", JScrollPane(self.log_area))
+        self.main_panel.add(self.tabs, BorderLayout.CENTER)
         self.callbacks.customizeUiComponent(self.main_panel)
 
-    # ---- API Groups tab (master/detail)
+    # ---- API Groups tab (Feature table + API Group table + Role results + Viewers)
     def _build_groups_tab(self):
         panel = JPanel(BorderLayout())
 
@@ -1388,6 +2168,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         actions.add(self.btn_send_role)
         actions.add(self.btn_replay_all)
         actions.add(self.btn_replay_sel)
+        actions.add(JButton("Chuyển API -> Chức năng...", actionPerformed=self._on_move_groups_feature))
         actions.add(JButton("Rebuild with Current Roles", actionPerformed=self._on_rebuild))
         actions.add(JButton("Show Original Req/Resp", actionPerformed=self._on_show_original))
         actions.add(JButton("Export Matrix JSON...", actionPerformed=self._on_export_matrix))
@@ -1398,6 +2179,28 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         status_renderer = StatusRenderer()
 
+        # Left side of top master area: Feature (Chức năng) selector & batch actions
+        self.feature_model = FeatureTableModel(self)
+        self.feature_table = JTable(self.feature_model)
+        self.feature_table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        self.feature_table.getSelectionModel().addListSelectionListener(
+            _SelectionListener(self._on_feature_filter_selected))
+        for col, width in ((0, 50), (1, 185), (2, 55), (3, 140)):
+            self.feature_table.getColumnModel().getColumn(col).setPreferredWidth(width)
+
+        feat_panel = JPanel(BorderLayout(2, 2))
+        feat_panel.setBorder(BorderFactory.createTitledBorder(
+            "Danh sách Chức năng (Click để lọc API | Double-click cột Tên để sửa)"))
+        feat_panel.add(JScrollPane(self.feature_table), BorderLayout.CENTER)
+        feat_btns = JPanel(FlowLayout(FlowLayout.LEFT, 3, 2))
+        feat_btns.add(JButton("+ Mới", actionPerformed=self._on_next_feature))
+        feat_btns.add(JButton("Đặt làm đang bắt", actionPerformed=self._on_set_selected_feature_active))
+        feat_btns.add(JButton("Đổi tên...", actionPerformed=self._on_rename_selected_feature))
+        feat_btns.add(JButton("Gửi Chức năng -> Repeater", actionPerformed=self._on_send_feature_repeater))
+        feat_btns.add(JButton("Replay Chức năng", actionPerformed=self._on_replay_feature))
+        feat_panel.add(feat_btns, BorderLayout.SOUTH)
+
+        # Right side of top master area: Sequentially numbered API Groups table
         self.group_model = GroupTableModel()
         self.group_table = JTable(self.group_model)
         self.group_table.setAutoCreateRowSorter(True)
@@ -1405,11 +2208,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.group_table.getSelectionModel().addListSelectionListener(
             _SelectionListener(self._on_group_selected))
         self.group_table.addMouseListener(_DoubleClick(lambda: self._on_send_group(None)))
-        self.group_table.getColumnModel().getColumn(6).setCellRenderer(status_renderer)
-        for col, width in ((0, 60), (1, 60), (2, 70), (3, 70), (4, 200), (5, 420), (6, 80), (7, 80),
-                           (8, 80), (9, 70)):
+        self.group_table.getColumnModel().getColumn(8).setCellRenderer(status_renderer)
+        for col, width in ((0, 65), (1, 55), (2, 165), (3, 60), (4, 65), (5, 65),
+                           (6, 170), (7, 360), (8, 75), (9, 75), (10, 75), (11, 70)):
             self.group_table.getColumnModel().getColumn(col).setPreferredWidth(width)
 
+        group_panel = JPanel(BorderLayout())
+        group_panel.setBorder(BorderFactory.createTitledBorder(
+            "Danh sách API đã đi qua (API 1, API 2, API 3... theo thứ tự thời gian)"))
+        group_panel.add(JScrollPane(self.group_table), BorderLayout.CENTER)
+
+        top_master_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, feat_panel, group_panel)
+        top_master_split.setResizeWeight(0.28)
+
+        # Bottom detail area: Role results table + Request/Response viewers
         self.result_model = ResultTableModel()
         self.result_table = JTable(self.result_model)
         self.result_table.setAutoCreateRowSorter(True)
@@ -1436,50 +2248,111 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         detail_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.result_table), viewers)
         detail_split.setResizeWeight(0.35)
-        master_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.group_table), detail_split)
-        master_split.setResizeWeight(0.35)
+        master_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, top_master_split, detail_split)
+        master_split.setResizeWeight(0.38)
         panel.add(master_split, BorderLayout.CENTER)
         return panel
 
-    # ---- Roles tab
+    # ---- History & Features tab (Tree view + formatted audit report)
+    def _build_history_tab(self):
+        panel = JPanel(BorderLayout(6, 6))
+        top_bar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4))
+        top_bar.add(JButton("+ Tạo Chức năng mới (Next Button)", actionPerformed=self._on_next_feature))
+        top_bar.add(JButton("Đổi tên Chức năng đang chọn...", actionPerformed=self._on_rename_tree_feature))
+        top_bar.add(JButton("Gửi mục đang chọn -> Repeater", actionPerformed=self._on_send_tree_repeater))
+        top_bar.add(JButton("Replay mục đang chọn", actionPerformed=self._on_replay_tree_selection))
+        top_bar.add(JButton("Xem trong tab API Groups", actionPerformed=self._on_jump_to_group_from_tree))
+        top_bar.add(JButton("Export Báo cáo Lịch sử (.txt/.md)...", actionPerformed=self._on_export_history_report))
+        top_bar.add(JButton("Refresh", actionPerformed=lambda e: self._refresh_feature_views()))
+        panel.add(top_bar, BorderLayout.NORTH)
+
+        root = DefaultMutableTreeNode("Lịch sử Chức năng & API")
+        self.history_tree_model = DefaultTreeModel(root)
+        self.history_tree = JTree(self.history_tree_model)
+        self.history_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
+        self.history_tree.addTreeSelectionListener(_TreeListener(self._on_history_tree_selected))
+
+        tree_panel = JPanel(BorderLayout())
+        tree_panel.setBorder(BorderFactory.createTitledBorder(
+            "Cây Chức năng (Tên 1 -> API 1, API 2... | Tên 2 -> API 3, API 4...)"))
+        tree_panel.add(JScrollPane(self.history_tree), BorderLayout.CENTER)
+
+        self.history_summary_area = JTextArea()
+        self.history_summary_area.setEditable(False)
+        self.history_summary_area.setFont(Font("Monospaced", Font.PLAIN, 12))
+        summary_panel = JPanel(BorderLayout())
+        summary_panel.setBorder(BorderFactory.createTitledBorder(
+            "Bản tổng hợp Audit (Tổng số Chức năng, danh sách API theo thứ tự & kết quả các Role)"))
+        summary_panel.add(JScrollPane(self.history_summary_area), BorderLayout.CENTER)
+
+        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, tree_panel, summary_panel)
+        split.setResizeWeight(0.42)
+        panel.add(split, BorderLayout.CENTER)
+        return panel
+
+    # ---- Roles tab (Role table on left + Inline full RoleEditorPanel on right)
     def _build_roles_tab(self):
-        panel = JPanel(BorderLayout())
+        panel = JPanel(BorderLayout(6, 6))
         self.role_model = RoleTableModel(self)
         self.role_table = JTable(self.role_model)
         self.role_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
+        self.role_table.getSelectionModel().addListSelectionListener(
+            _SelectionListener(self._on_role_row_selected))
         self.role_table.addMouseListener(_DoubleClick(lambda: self._on_edit_role(None)))
-        for col, width in ((0, 35), (1, 60), (2, 220), (3, 600)):
+        for col, width in ((0, 35), (1, 55), (2, 160), (3, 360)):
             self.role_table.getColumnModel().getColumn(col).setPreferredWidth(width)
         self.role_model.reload()
-        panel.add(JScrollPane(self.role_table), BorderLayout.CENTER)
+
+        left_panel = JPanel(BorderLayout(4, 4))
+        left_panel.setBorder(BorderFactory.createTitledBorder(
+            "Danh sách Profile / Role (Click chọn để sửa ngay bên phải)"))
+        left_panel.add(JScrollPane(self.role_table), BorderLayout.CENTER)
 
         side = JPanel()
         side.setLayout(BoxLayout(side, BoxLayout.Y_AXIS))
-        side.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6))
+        side.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4))
         buttons = [
-            ("Add Role", self._on_add_role), ("Edit Role", self._on_edit_role),
-            ("Duplicate", self._on_duplicate_role), ("Delete", self._on_delete_roles),
+            ("Add Role...", self._on_add_role),
+            ("Edit in Dialog...", self._on_edit_role),
+            ("Duplicate", self._on_duplicate_role),
+            ("Delete", self._on_delete_roles),
             (None, None),
-            ("Move Up", lambda e: self._on_move_role(-1)), ("Move Down", lambda e: self._on_move_role(1)),
+            ("Move Up", lambda e: self._on_move_role(-1)),
+            ("Move Down", lambda e: self._on_move_role(1)),
             (None, None),
             ("Enable All", lambda e: self._on_enable_all(True)),
             ("Disable All", lambda e: self._on_enable_all(False)),
             (None, None),
-            ("Import JSON...", self._on_import_roles), ("Export JSON...", self._on_export_roles),
+            ("Import JSON...", self._on_import_roles),
+            ("Export JSON...", self._on_export_roles),
             (None, None),
             ("Load 10-Role Template", self._on_load_template),
         ]
         for label, handler in buttons:
             if label is None:
-                side.add(Box.createVerticalStrut(12))
+                side.add(Box.createVerticalStrut(10))
                 continue
             b = JButton(label, actionPerformed=handler)
-            b.setMaximumSize(Dimension(160, 28))
+            b.setMaximumSize(Dimension(165, 28))
             side.add(b)
             side.add(Box.createVerticalStrut(4))
-        panel.add(side, BorderLayout.EAST)
-        panel.add(JLabel(" Each enabled role produces one cloned request per captured API. "
-                         "Order here = order in groups/Repeater. Double-click to edit."), BorderLayout.SOUTH)
+        left_panel.add(side, BorderLayout.EAST)
+
+        first_role = self.roles.get(0) if self.roles.count() > 0 else {
+            "name": "01_Admin", "enabled": True, "headers": []
+        }
+        self.inline_role_editor = RoleEditorPanel(first_role, inline_save_fn=self._on_save_inline_role)
+        self.inline_role_editor.setBorder(BorderFactory.createTitledBorder(
+            "Chỉnh sửa chi tiết Profile đang chọn (Header / Cookie / Session / JWT - Bấm 'Save Profile Changes' để lưu)"))
+
+        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, left_panel, self.inline_role_editor)
+        split.setResizeWeight(0.42)
+        panel.add(split, BorderLayout.CENTER)
+        panel.add(JLabel(" Mỗi Role đang bật (Enabled) sẽ sinh ra 1 request tương ứng cho mỗi API bắt được. "
+                         "Hỗ trợ thêm/sửa/xóa từng HTTP Header, từng biến Cookie/Session riêng lẻ, và JWT/Bearer."),
+                  BorderLayout.SOUTH)
+        if self.roles.count() > 0:
+            self.role_table.setRowSelectionInterval(0, 0)
         return panel
 
     # ---- Settings tab
@@ -1517,8 +2390,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                   cfg["dedup"], actionPerformed=on_change)
         self.cb_dedup_ids = JCheckBox("Dedup: treat numeric / UUID / long-hex path segments as {id}",
                                       cfg["dedup_normalize_ids"], actionPerformed=on_change)
+        self.cb_dedup_feature = JCheckBox(
+            "Dedup riêng theo từng Chức năng (cho phép bắt lại cùng API khi chuyển sang Tên chức năng mới)",
+            cfg.get("dedup_per_feature", False), actionPerformed=on_change)
         self.cb_number = JCheckBox("Prefix role index in tab names (01_, 02_ ...) unless the name already has one",
                                    cfg["number_roles_in_tab"], actionPerformed=on_change)
+        self.cb_feat_tab = JCheckBox(
+            "Gắn mã Chức năng vào tên tab Repeater ([F01-G01:POST /v1/...] thay vì [G01:POST /v1/...])",
+            cfg.get("include_feature_in_tab", False), actionPerformed=on_change)
         self.sp_threads = JSpinner(SpinnerNumberModel(cfg["threads"], 1, 64, 1))
         self.sp_throttle = JSpinner(SpinnerNumberModel(cfg["throttle_ms"], 0, 60000, 50))
         self.sp_pathlen = JSpinner(SpinnerNumberModel(cfg["short_path_len"], 8, 200, 1))
@@ -1536,8 +2415,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         add_row(self.cb_options)
         add_row(self.cb_dedup)
         add_row(self.cb_dedup_ids)
+        add_row(self.cb_dedup_feature)
         add_row(JLabel("<html><br><b>Cloning, Repeater and replay</b></html>"))
         add_row(self.cb_number)
+        add_row(self.cb_feat_tab)
         add_row(JLabel("Short path max length in tab names:"), self.sp_pathlen)
         add_row(JLabel("Replay worker threads:"), self.sp_threads)
         add_row(JLabel("Throttle per request (ms):"), self.sp_throttle)
@@ -1565,7 +2446,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "ignore_options_head": self.cb_options.isSelected(),
             "dedup": self.cb_dedup.isSelected(),
             "dedup_normalize_ids": self.cb_dedup_ids.isSelected(),
+            "dedup_per_feature": self.cb_dedup_feature.isSelected(),
             "number_roles_in_tab": self.cb_number.isSelected(),
+            "include_feature_in_tab": self.cb_feat_tab.isSelected(),
             "threads": int(self.sp_threads.getValue()),
             "throttle_ms": int(self.sp_throttle.getValue()),
             "short_path_len": int(self.sp_pathlen.getValue()),
@@ -1588,7 +2471,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.cb_options.setSelected(d["ignore_options_head"])
         self.cb_dedup.setSelected(d["dedup"])
         self.cb_dedup_ids.setSelected(d["dedup_normalize_ids"])
+        self.cb_dedup_feature.setSelected(d["dedup_per_feature"])
         self.cb_number.setSelected(d["number_roles_in_tab"])
+        self.cb_feat_tab.setSelected(d["include_feature_in_tab"])
         self.sp_threads.setValue(Integer(d["threads"]))
         self.sp_throttle.setValue(Integer(d["throttle_ms"]))
         self.sp_pathlen.setValue(Integer(d["short_path_len"]))
@@ -1601,15 +2486,297 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             cfg = self.get_config()
             with self._state_lock:
                 seen = len(self._seen_keys)
-            groups = self.group_model.getRowCount() if getattr(self, "group_model", None) is not None else 0
-            self.status_label.setText("Capture: %s  |  Roles enabled: %d/%d  |  Groups: %d  |  Dedup keys: %d"
-                                      % ("ON" if cfg["capture_enabled"] else "OFF", self.roles.enabled_count(),
-                                         self.roles.count(), groups, seen))
+            all_groups = self.group_model.all_groups() if getattr(self, "group_model", None) is not None else []
+            feats = self.features_list()
+            act = self.active_feature()
+            self.status_label.setText(
+                "Capture: %s  |  Roles: %d/%d  |  Chức năng: %d  |  Tổng API: %d  |  Dedup: %d"
+                % ("ON" if cfg["capture_enabled"] else "OFF", self.roles.enabled_count(),
+                   self.roles.count(), len(feats), len(all_groups), seen))
+            if getattr(self, "lbl_active_feature", None) is not None:
+                self.lbl_active_feature.setText("Đang bắt vào Tên %d:" % act.fid)
+                if not self.tf_feature_name.hasFocus():
+                    self.tf_feature_name.setText(act.name)
+                act_count = len([x for x in all_groups if x.fid == act.fid])
+                self.lbl_feature_counter.setText(
+                    "(Hiện có %d chức năng | %s đang có %d API)"
+                    % (len(feats), format_feature_label(act.fid, act.name), act_count))
             n = self.roles.enabled_count()
             g, _ = self.current_selection()
             count = len(g.results) if g is not None else n
             self.btn_replay_all.setText("Replay All %d Roles to Server" % count)
         ui_call(refresh)
+
+    # ---------------------------------------- feature & history view helpers
+    def _refresh_history_summary_only(self):
+        if self.history_summary_area is None or self.group_model is None:
+            return
+        text = build_history_summary_text(self.features_list(), self.group_model.all_groups())
+        self.history_summary_area.setText(text)
+        self.history_summary_area.setCaretPosition(0)
+
+    def _refresh_feature_views(self):
+        def refresh():
+            if self.feature_model is not None:
+                sel_row = self.feature_table.getSelectedRow()
+                self.feature_model.fireTableDataChanged()
+                if 0 <= sel_row < self.feature_model.getRowCount():
+                    self.feature_table.setRowSelectionInterval(sel_row, sel_row)
+                elif self.feature_model.getRowCount() > 0:
+                    self.feature_table.setRowSelectionInterval(0, 0)
+            if self.history_tree_model is not None and self.group_model is not None:
+                all_groups = self.group_model.all_groups()
+                feats = self.features_list()
+                root = DefaultMutableTreeNode(
+                    "Tổng cộng: %d Chức năng | %d API đã đi qua" % (len(feats), len(all_groups)))
+                for f in feats:
+                    f_groups = [g for g in all_groups if g.fid == f.fid]
+                    f_node = DefaultMutableTreeNode(_TreeNodeItem(
+                        "FEATURE", f,
+                        "%s  (%d API)" % (format_feature_label(f.fid, f.name), len(f_groups))
+                    ))
+                    for g in f_groups:
+                        g_node = DefaultMutableTreeNode(_TreeNodeItem(
+                            "GROUP", g,
+                            "%s [%s]: %s %s (Orig: %s) -> %d Roles"
+                            % (format_api_label(g.gid), format_group_id(g.gid), g.method, g.path,
+                               g.orig_status if g.orig_status is not None else "-", len(g.results))
+                        ))
+                        for r in g.results:
+                            r_node = DefaultMutableTreeNode(_TreeNodeItem(
+                                "ROLE", (g, r),
+                                "%s -> Status: %s | Len: %s | Tab: %s"
+                                % (r.role_name,
+                                   r.status if r.status is not None else r.state,
+                                   r.length if r.length is not None else "-",
+                                   r.tab_name)
+                            ))
+                            g_node.add(r_node)
+                        f_node.add(g_node)
+                    root.add(f_node)
+                self.history_tree_model.setRoot(root)
+                self.history_tree_model.reload()
+                for i in range(self.history_tree.getRowCount()):
+                    self.history_tree.expandRow(i)
+            self._refresh_history_summary_only()
+        ui_call(refresh)
+
+    def _on_apply_active_feature_name(self, event):
+        act = self.active_feature()
+        new_name = self.tf_feature_name.getText().strip()
+        if new_name:
+            self.rename_feature(act.fid, new_name)
+
+    def _on_next_feature(self, event):
+        # Save any pending name change on current active feature first if user edited the text box
+        cur = self.active_feature()
+        typed = self.tf_feature_name.getText().strip() if getattr(self, "tf_feature_name", None) else ""
+        if typed and typed != cur.name:
+            self.rename_feature(cur.fid, typed)
+        next_num = len(self.features_list()) + 1
+        name = JOptionPane.showInputDialog(
+            self.main_panel,
+            "Nhập tên cho Chức năng tiếp theo (Tên %d):\n"
+            "(Các API xuất hiện khi bạn bấm nút tiếp theo trên web sẽ tự động gom vào đây)" % next_num,
+            "Chức năng %d" % next_num)
+        if name is None:
+            return
+        self.start_new_feature(name)
+
+    def _on_feature_filter_selected(self):
+        if self.feature_table is None or self.group_model is None:
+            return
+        r = self.feature_table.getSelectedRow()
+        if r <= 0:
+            self.group_model.set_feature_filter(None)
+        else:
+            feat = self.feature_model.feature_at_row(r)
+            if feat is not None:
+                self.group_model.set_feature_filter(feat.fid)
+        if self.group_model.getRowCount() > 0:
+            self.group_table.setRowSelectionInterval(0, 0)
+        else:
+            self.result_model.set_group(None)
+            self._show_result(None)
+
+    def _selected_feature_from_table(self):
+        r = self.feature_table.getSelectedRow()
+        if r <= 0:
+            return self.active_feature()
+        return self.feature_model.feature_at_row(r) or self.active_feature()
+
+    def _on_set_selected_feature_active(self, event):
+        r = self.feature_table.getSelectedRow()
+        if r <= 0:
+            JOptionPane.showMessageDialog(
+                self.main_panel, "Chọn một dòng Chức năng cụ thể (Tên 1, Tên 2...) trong bảng bên trái.",
+                EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        feat = self.feature_model.feature_at_row(r)
+        if feat is not None:
+            self.set_active_feature(feat.fid)
+            self.log("Đặt %s làm chức năng đang bắt API hiện tại." % format_feature_label(feat.fid, feat.name))
+
+    def _on_rename_selected_feature(self, event):
+        feat = self._selected_feature_from_table()
+        if feat is None:
+            return
+        new_name = JOptionPane.showInputDialog(
+            self.main_panel, "Đổi tên cho Tên %d:" % feat.fid, feat.name)
+        if new_name is not None and new_name.strip():
+            self.rename_feature(feat.fid, new_name.strip())
+
+    def _on_send_feature_repeater(self, event):
+        feat = self._selected_feature_from_table()
+        if feat is None:
+            return
+        groups = self.group_model.groups_for_feature(feat.fid)
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "Chức năng này chưa có API nào.", EXT_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
+        for g in groups:
+            self.send_to_repeater(g, g.results)
+
+    def _on_replay_feature(self, event):
+        feat = self._selected_feature_from_table()
+        if feat is None:
+            return
+        groups = self.group_model.groups_for_feature(feat.fid)
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "Chức năng này chưa có API nào.", EXT_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
+        for g in groups:
+            self.replay(g, g.results)
+
+    def _on_move_groups_feature(self, event):
+        groups = self._selected_groups()
+        if not groups:
+            self._require_group()
+            return
+        feats = self.features_list()
+        options = [format_feature_label(f.fid, f.name) for f in feats] + ["+ Tạo Chức năng mới..."]
+        choice = JOptionPane.showInputDialog(
+            self.main_panel, "Chuyển %d API đang chọn sang Chức năng:" % len(groups),
+            EXT_NAME, JOptionPane.PLAIN_MESSAGE, None, options, options[-1])
+        if choice is None:
+            return
+        if choice == options[-1]:
+            next_num = len(feats) + 1
+            name = JOptionPane.showInputDialog(
+                self.main_panel, "Nhập tên Chức năng mới (Tên %d):" % next_num, "Chức năng %d" % next_num)
+            if not name:
+                return
+            feat = self.start_new_feature(name)
+            self.move_groups_to_feature(groups, feat.fid)
+            return
+        for f in feats:
+            if format_feature_label(f.fid, f.name) == choice:
+                self.move_groups_to_feature(groups, f.fid)
+                break
+
+    # ---- History Tree actions
+    def _selected_tree_payload(self):
+        if self.history_tree is None:
+            return None, None
+        path = self.history_tree.getSelectionPath()
+        if path is None:
+            return None, None
+        node = path.getLastPathComponent()
+        obj = node.getUserObject() if isinstance(node, DefaultMutableTreeNode) else None
+        if isinstance(obj, _TreeNodeItem):
+            return obj.kind, obj.payload
+        return None, None
+
+    def _on_history_tree_selected(self):
+        # Tree nodes render custom labels via DefaultMutableTreeNode string or tuple
+        pass
+
+    def _on_rename_tree_feature(self, event):
+        kind, payload = self._selected_tree_payload()
+        feat = payload if kind == "FEATURE" else (
+            self.get_feature(payload.fid) if kind == "GROUP" else (
+                self.get_feature(payload[0].fid) if kind == "ROLE" else self.active_feature()))
+        if feat is None:
+            return
+        new_name = JOptionPane.showInputDialog(
+            self.main_panel, "Đổi tên cho Tên %d:" % feat.fid, feat.name)
+        if new_name is not None and new_name.strip():
+            self.rename_feature(feat.fid, new_name.strip())
+
+    def _on_send_tree_repeater(self, event):
+        kind, payload = self._selected_tree_payload()
+        if kind == "FEATURE":
+            for g in self.group_model.groups_for_feature(payload.fid):
+                self.send_to_repeater(g, g.results)
+        elif kind == "GROUP":
+            self.send_to_repeater(payload, payload.results)
+        elif kind == "ROLE":
+            g, r = payload
+            self.send_to_repeater(g, [r])
+        else:
+            JOptionPane.showMessageDialog(
+                self.main_panel, "Hãy chọn một Chức năng, API hoặc Role trong cây bên trái.",
+                EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+
+    def _on_replay_tree_selection(self, event):
+        kind, payload = self._selected_tree_payload()
+        if kind == "FEATURE":
+            for g in self.group_model.groups_for_feature(payload.fid):
+                self.replay(g, g.results)
+        elif kind == "GROUP":
+            self.replay(payload, payload.results)
+        elif kind == "ROLE":
+            g, r = payload
+            self.replay(g, [r])
+        else:
+            JOptionPane.showMessageDialog(
+                self.main_panel, "Hãy chọn một Chức năng, API hoặc Role trong cây bên trái.",
+                EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+
+    def _on_jump_to_group_from_tree(self, event):
+        kind, payload = self._selected_tree_payload()
+        target_group = None
+        if kind == "GROUP":
+            target_group = payload
+        elif kind == "ROLE":
+            target_group = payload[0]
+        elif kind == "FEATURE":
+            groups = self.group_model.groups_for_feature(payload.fid)
+            target_group = groups[0] if groups else None
+        if target_group is None:
+            return
+        self.group_model.set_feature_filter(None)
+        if self.feature_table.getRowCount() > 0:
+            self.feature_table.setRowSelectionInterval(0, 0)
+        for mr in range(self.group_model.getRowCount()):
+            if self.group_model.group_at(mr) is target_group:
+                vr = self.group_table.convertRowIndexToView(mr)
+                if vr >= 0:
+                    self.group_table.setRowSelectionInterval(vr, vr)
+                break
+        self.tabs.setSelectedIndex(0)
+
+    def _on_export_history_report(self, event):
+        groups = self.group_model.all_groups()
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "Chưa có dữ liệu API nào để xuất báo cáo.",
+                                          EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        chooser = JFileChooser()
+        chooser.setSelectedFile(File("theMythOfCrawl_history_report.txt"))
+        if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
+            return
+        f = chooser.getSelectedFile()
+        try:
+            text = build_history_summary_text(self.features_list(), groups)
+            data = String(text).getBytes("UTF-8")
+            Files.write(f.toPath(), data)
+            self.log("Exported feature & API history report to %s" % f.getAbsolutePath())
+        except Throwable as t:
+            JOptionPane.showMessageDialog(self.main_panel, "Export failed: %s" % t, EXT_NAME,
+                                          JOptionPane.ERROR_MESSAGE)
 
     # ------------------------------------------------------ selection helpers
     def _selected_groups(self):
@@ -1641,10 +2808,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def _add_group_ui(self, group):
         self.group_model.add(group)
-        if self.group_table.getSelectedRow() < 0:
+        if self.group_table.getSelectedRow() < 0 and self.group_model.getRowCount() > 0:
             last = self.group_table.convertRowIndexToView(self.group_model.getRowCount() - 1)
             if last >= 0:
                 self.group_table.setRowSelectionInterval(last, last)
+        self._refresh_feature_views()
         self.update_status()
 
     def _on_group_selected(self):
@@ -1708,7 +2876,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             return
         for g in groups:
             self.replay(g, g.results)
-            self.log("%s: replaying %d role(s) to server." % (format_group_id(g.gid), len(g.results)))
+            self.log("%s (%s): replaying %d role(s) to server." %
+                     (format_api_label(g.gid), format_group_id(g.gid), len(g.results)))
 
     def _on_replay_selected(self, event):
         g = self._require_group()
@@ -1717,7 +2886,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         results = self._selected_results()
         if results:
             self.replay(g, results)
-            self.log("%s: replaying %d selected role(s)." % (format_group_id(g.gid), len(results)))
+            self.log("%s (%s): replaying %d selected role(s)." %
+                     (format_api_label(g.gid), format_group_id(g.gid), len(results)))
 
     def _on_rebuild(self, event):
         for g in self._selected_groups():
@@ -1750,7 +2920,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
         try:
-            data = String(groups_to_matrix_json(groups)).getBytes("UTF-8")
+            data = String(groups_to_matrix_json(groups, self.features_list())).getBytes("UTF-8")
             Files.write(f.toPath(), data)
             self.log("Exported %d group(s) matrix to %s" % (len(groups), f.getAbsolutePath()))
         except Throwable as t:
@@ -1765,18 +2935,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if self.result_model.group() in groups:
             self.result_model.set_group(None)
             self._show_result(None)
+        self._refresh_feature_views()
         self.update_status()
 
     def _on_clear_groups(self, event):
-        if JOptionPane.showConfirmDialog(self.main_panel, "Clear all captured groups and the dedup cache?",
-                                         EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+        if JOptionPane.showConfirmDialog(
+                self.main_panel, "Xóa toàn bộ các API đã bắt, đặt lại danh sách Chức năng về Tên 1 và xóa Dedup cache?",
+                EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
         self.group_model.clear()
         self.result_model.set_group(None)
         self._show_result(None)
         with self._state_lock:
             self._seen_keys.clear()
-        self.log("All groups cleared (group IDs continue incrementing to keep Repeater tab names unique).")
+            self._next_gid = 1
+            self._next_fid = 2
+            self._active_fid = 1
+            self._features = [FeatureGroup(1, "Chức năng 1")]
+        self.group_model.set_feature_filter(None)
+        self._refresh_feature_views()
+        self.log("All captured APIs, feature history, and dedup cache reset.")
         self.update_status()
 
     def _on_reset_dedup(self, event):
@@ -1792,7 +2970,31 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.role_model.reload()
         if select_index is not None and 0 <= select_index < self.role_model.getRowCount():
             self.role_table.setRowSelectionInterval(select_index, select_index)
+        self._on_role_row_selected()
         self.update_status()
+
+    def _on_role_row_selected(self):
+        if self.inline_role_editor is None or self.role_table is None:
+            return
+        idx = self.role_table.getSelectedRow()
+        if 0 <= idx < self.roles.count():
+            self.inline_role_editor.load_role(self.roles.get(idx))
+        else:
+            self.inline_role_editor.load_role(None)
+
+    def _on_save_inline_role(self, updated_role):
+        idx = self.role_table.getSelectedRow()
+        if idx < 0 or idx >= self.roles.count():
+            idx = self.roles.add(updated_role)
+        else:
+            self.roles.update(idx, updated_role)
+        self.save_roles()
+        self.role_model.reload()
+        if 0 <= idx < self.role_model.getRowCount():
+            self.role_table.setRowSelectionInterval(idx, idx)
+        self.update_status()
+        self.log("Saved profile changes for role '%s' (%d rule(s))." %
+                 (updated_role["name"], len(updated_role.get("headers", []))))
 
     def _selected_role_index(self):
         r = self.role_table.getSelectedRow()
@@ -1834,7 +3036,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                          JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
         self.roles.remove(rows)
-        self._roles_changed()
+        self._roles_changed(min(rows[0], max(self.roles.count() - 1, 0)))
 
     def _on_move_role(self, delta):
         idx = self.role_table.getSelectedRow()
@@ -1844,7 +3046,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def _on_enable_all(self, enabled):
         self.roles.set_all_enabled(enabled)
-        self._roles_changed()
+        self._roles_changed(self.role_table.getSelectedRow())
 
     def _on_import_roles(self, event):
         chooser = JFileChooser()
@@ -1880,7 +3082,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 self.roles.add(r)
         else:
             return
-        self._roles_changed()
+        self._roles_changed(0)
         self.log("Imported %d role(s) from %s" % (len(imported), f.getAbsolutePath()))
 
     def _on_export_roles(self, event):
@@ -1919,5 +3121,5 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 self.roles.add(r)
         else:
             return
-        self._roles_changed()
+        self._roles_changed(0)
         self.log("Loaded 10 starter role profiles.")

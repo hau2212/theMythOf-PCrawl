@@ -311,6 +311,49 @@ class HeaderRuleTests(unittest.TestCase):
         out = tm.apply_header_rules(self.LINES, [{"name": "Bad Name", "value": "x"}, {"name": "a:b", "value": "x"}])
         self.assertEqual(out, self.LINES)
 
+    def test_cookie_set_and_cookie_remove_granular(self):
+        lines = ["GET /a HTTP/1.1", "Host: h", "Cookie: theme=dark; JSESSIONID=old_sess; lang=vi"]
+        # Overwrite JSESSIONID and add tenant_id while keeping theme=dark and lang=vi
+        out = tm.apply_header_rules(lines, [
+            {"name": "JSESSIONID", "value": "new_role_sess", "mode": "COOKIE_SET"},
+            {"name": "tenant_id", "value": "t42", "mode": "COOKIE_SET"},
+        ])
+        self.assertEqual(
+            out,
+            ["GET /a HTTP/1.1", "Host: h", "Cookie: theme=dark; JSESSIONID=new_role_sess; lang=vi; tenant_id=t42"]
+        )
+        # Strip JSESSIONID only while keeping theme, lang, tenant_id
+        out2 = tm.apply_header_rules(out, [
+            {"name": "JSESSIONID", "value": "[REMOVE]", "mode": "COOKIE_REMOVE"},
+        ])
+        self.assertEqual(
+            out2,
+            ["GET /a HTTP/1.1", "Host: h", "Cookie: theme=dark; lang=vi; tenant_id=t42"]
+        )
+        # Stripping all cookies removes the Cookie header completely
+        out3 = tm.apply_header_rules(["GET /a HTTP/1.1", "Host: h", "Cookie: sid=123"], [
+            {"name": "sid", "value": "[REMOVE]", "mode": "COOKIE_SET"},
+        ])
+        self.assertEqual(out3, ["GET /a HTTP/1.1", "Host: h"])
+
+    def test_jwt_bearer_and_decoder(self):
+        self.assertEqual(tm.format_jwt_bearer("abc.def.ghi", "Bearer"), "Bearer abc.def.ghi")
+        self.assertEqual(tm.format_jwt_bearer("Bearer abc.def.ghi", "Bearer"), "Bearer abc.def.ghi")
+        self.assertEqual(tm.format_jwt_bearer("rawtoken", ""), "rawtoken")
+        self.assertEqual(tm.format_jwt_bearer("[remove]", "Bearer"), "[REMOVE]")
+        # Sample JWT: {"alg":"HS256"} . {"sub":"u1","role":"admin"}
+        jwt_tok = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSIsInJvbGUiOiJhZG1pbiJ9.sig"
+        decoded = tm.decode_jwt_preview("Authorization: Bearer " + jwt_tok)
+        self.assertIn('"role": "admin"', decoded)
+        self.assertIn('"sub": "u1"', decoded)
+
+    def test_parse_bulk_cookies(self):
+        rules = tm.parse_bulk_cookies("Cookie: sid=abc; csrf=xyz\ntheme=[REMOVE]")
+        self.assertEqual(
+            [(r["name"], r["value"], r["mode"]) for r in rules],
+            [("sid", "abc", "COOKIE_SET"), ("csrf", "xyz", "COOKIE_SET"), ("theme", "[REMOVE]", "COOKIE_REMOVE")]
+        )
+
 
 class FilterAndNamingTests(unittest.TestCase):
     def test_static(self):
@@ -504,6 +547,69 @@ class EngineTests(unittest.TestCase):
         self.ext.roles.set_all_enabled(False)
         self.capture(source="Manual", filters=False)
         self.assertEqual(len(self.cb.repeater), 0)
+
+    def test_feature_batching_and_sequential_api_history(self):
+        captured = []
+        orig = self.ext._clone_for_roles
+
+        def spy(group, info, roles, cfg):
+            res = orig(group, info, roles, cfg)
+            captured.append(group)
+            return res
+        self.ext._clone_for_roles = spy
+
+        # Button 1: User names feature 1 "Đăng nhập & Lấy ví" -> API 1 and API 2 pass through Proxy
+        self.ext.rename_feature(1, "Đăng nhập & Lấy ví")
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/login"))
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/wallet"))
+
+        # Button 2: User switches to next feature "Chuyển tiền" -> API 3 and API 4 pass through Proxy
+        f2 = self.ext.start_new_feature("Chuyển tiền")
+        self.assertEqual(f2.fid, 2)
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/transfer/check"))
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/transfer/confirm"))
+
+        self.assertEqual(len(captured), 4)
+        self.assertEqual([g.gid for g in captured], [1, 2, 3, 4])
+        self.assertEqual([tm.format_api_label(g.gid) for g in captured], ["API 1", "API 2", "API 3", "API 4"])
+        self.assertEqual([g.fid for g in captured], [1, 1, 2, 2])
+        self.assertEqual(captured[0].feature_name, "Đăng nhập & Lấy ví")
+        self.assertEqual(captured[2].feature_name, "Chuyển tiền")
+
+        # Verify formatted summary text & JSON matrix include both features and sequential APIs
+        summary = tm.build_history_summary_text(self.ext.features_list(), captured)
+        self.assertIn("Tổng số chức năng (Features): 2", summary)
+        self.assertIn("Tổng số API đã đi qua: 4", summary)
+        self.assertIn("Tên 1: Đăng nhập & Lấy ví", summary)
+        self.assertIn("API 1 [G01]", summary)
+        self.assertIn("API 2 [G02]", summary)
+        self.assertIn("Tên 2: Chuyển tiền", summary)
+        self.assertIn("API 3 [G03]", summary)
+        self.assertIn("API 4 [G04]", summary)
+
+        matrix = json.loads(tm.groups_to_matrix_json(captured, self.ext.features_list()))
+        self.assertEqual(matrix["feature_count"], 2)
+        self.assertEqual(matrix["features"][0]["apis"], ["API 1", "API 2"])
+        self.assertEqual(matrix["features"][1]["apis"], ["API 3", "API 4"])
+
+    def test_dedup_per_feature_and_feature_in_tab_name(self):
+        cfg = self.ext.get_config()
+        cfg["dedup"] = True
+        cfg["dedup_per_feature"] = True
+        cfg["include_feature_in_tab"] = True
+        self.ext.apply_config(cfg)
+
+        # Same endpoint in Feature 1 is deduplicated on second hit
+        self.capture(BASE_REQ)
+        self.capture(BASE_REQ)
+        self.assertEqual(len(self.cb.repeater), 10)
+        self.assertEqual(self.cb.repeater[0][4], "[F01-G01:POST /v1/transfer] 01_Admin")
+
+        # Switching to Feature 2 allows the same endpoint to be captured again as API 2 (G02) under F02
+        self.ext.start_new_feature("Nút bấm thứ 2")
+        self.capture(BASE_REQ)
+        self.assertEqual(len(self.cb.repeater), 20)
+        self.assertEqual(self.cb.repeater[10][4], "[F02-G02:POST /v1/transfer] 01_Admin")
 
 
 if __name__ == "__main__":
