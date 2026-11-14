@@ -2652,37 +2652,32 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.send_executor = Executors.newFixedThreadPool(self.config["threads"])
 
         callbacks.registerExtensionStateListener(self)
-        SwingUtilities.invokeLater(_Task(self._init_ui, self.log))
-        if regex_err:
-            self.log("Stored API regex is invalid: %s" % regex_err)
-
-    def _init_ui(self):
+        # Build UI synchronously to avoid race condition where getUiComponent() is called before _build_ui() completes
         try:
             self._build_ui()
+            callbacks.addSuiteTab(self)
+            callbacks.registerHttpListener(self)
+            callbacks.registerContextMenuFactory(self)
+            self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+            SwingUtilities.invokeLater(_Task(self._refresh_feature_views, self.log))
+            SwingUtilities.invokeLater(_Task(self.update_status, self.log))
         except Throwable as t:
             tb = traceback.format_exc()
             self.callbacks.printError("Error building UI (Java): %s\n%s" % (t, tb))
             if self.main_panel is None:
                 self.main_panel = JPanel(BorderLayout())
             self.main_panel.add(JScrollPane(JTextArea("Error building UI:\n%s\n%s" % (t, tb))), BorderLayout.CENTER)
+            callbacks.addSuiteTab(self)
         except Exception:
             tb = traceback.format_exc()
             self.callbacks.printError("Error building UI:\n%s" % tb)
             if self.main_panel is None:
                 self.main_panel = JPanel(BorderLayout())
             self.main_panel.add(JScrollPane(JTextArea("Error building UI:\n%s" % tb)), BorderLayout.CENTER)
-        self.callbacks.addSuiteTab(self)
-        # Traffic hooks are registered only after the UI exists.
-        self.callbacks.registerHttpListener(self)
-        self.callbacks.registerContextMenuFactory(self)
-        try:
-            self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
-            self._refresh_feature_views()
-            self.update_status()
-        except Throwable as t:
-            self.callbacks.printError("Error initializing UI state (Java): %s\n%s" % (t, traceback.format_exc()))
-        except Exception:
-            self.callbacks.printError("Error initializing UI state:\n%s" % traceback.format_exc())
+            callbacks.addSuiteTab(self)
+
+        if regex_err:
+            self.log("Stored API regex is invalid: %s" % regex_err)
 
     def extensionUnloaded(self):
         self._unloaded = True
