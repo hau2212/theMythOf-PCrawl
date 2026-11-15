@@ -59,9 +59,9 @@ from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable,
                          JFileChooser, JDialog, JComboBox, JSpinner, SpinnerNumberModel,
                          ListSelectionModel, SwingUtilities, BorderFactory, DefaultCellEditor,
                          BoxLayout, Box, JTree, JRadioButton, ButtonGroup, JFrame)
-from javax.swing import Timer, UIManager, Icon, Scrollable
+from javax.swing import Timer, UIManager, Icon, Scrollable, JComponent, KeyStroke, AbstractAction
 from javax.swing.event import (ListSelectionListener, TreeSelectionListener, ChangeListener,
-                               TreeWillExpandListener)
+                               TreeWillExpandListener, DocumentListener)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from javax.swing.tree import (DefaultMutableTreeNode, DefaultTreeModel, DefaultTreeCellRenderer,
                               TreeSelectionModel, TreePath, TreeCellRenderer)
@@ -112,9 +112,10 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.9.0"
+EXT_VERSION = "1.10.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_ORIGINAL = "tmoc.original_profile.v1"
+SETTINGS_KEY_ROLE_SCOPES = "tmoc.role_scopes.v1"
 ORIGINAL_PROFILE_NAME = "00_API GỐC (Acc Crawl)"
 ORIGINAL_LABEL = "[API GỐC] 00_Original (Acc Crawl)"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
@@ -185,7 +186,26 @@ DEFAULT_CONFIG = {
     "target_only": False,
     "target_use_position": True,
     "target_allow_prefix": False,
+    "target_ids_as_params": True,
+    "target_query_mode": "ignore",
+    # "STT. path" copy (see copy_label_for)
+    "copy_format": "{stt}. {path}",
+    "copy_stt_fallback": "none",
+    "copy_counter": 1,
+    "excel_position_copy_format": True,
 }
+
+TARGET_MATCH_KEYS = ("target_allow_prefix", "target_ids_as_params", "target_query_mode")
+TARGET_QUERY_MODES = [
+    ("ignore", "Bỏ qua query trong file (mặc định)"),
+    ("names", "Request phải có đúng tên tham số query của dòng"),
+    ("values", "Tên + giá trị query phải khớp (app định tuyến kiểu ?action=getUser)"),
+]
+COPY_STT_FALLBACKS = [
+    ("none", "Không đánh số (chỉ copy path)"),
+    ("counter", "Số tăng dần theo lần copy (1, 2, 3...) - dễ đếm"),
+    ("api", "Dùng số API # (thứ tự bắt)"),
+]
 
 # (key, label, delay_ms, jitter_pct, per-host concurrency); CUSTOM keeps the user's numbers.
 SEND_PROFILES = [
@@ -1164,8 +1184,34 @@ def _fold(text):
     return u" ".join(t.replace(u"_", u" ").split())
 
 
-def normalize_target_path(raw):
-    """'https://h/a/b/?q#f' -> '/a/b' ; keeps placeholders untouched."""
+_PCT_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+_ID_SEG_RE = re.compile(r"^(?:[0-9]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+                        r"|[0-9a-fA-F]{16,})$")
+
+
+def _pct_decode(text):
+    """Decode %XX escapes except %2F (an encoded '/' must not split a path segment)."""
+    def sub(m):
+        code = int(m.group(1), 16)
+        if code == 0x2F or code < 0x20:
+            return "%" + m.group(1).upper()
+        return unichr(code) if code < 0x80 else m.group(0)
+    return _PCT_RE.sub(sub, text)
+
+
+try:
+    unichr
+except NameError:  # CPython 3 (offline tests)
+    unichr = chr
+
+
+def normalize_request_path(raw):
+    """
+    Canonical path used on BOTH sides of the Excel comparison:
+    'https://h/a/b;jsessionid=1/?q#f' -> '/a/b'. Host, query and fragment dropped, %XX decoded
+    (except %2F), ';matrix' parameters removed from each segment, '//' collapsed, trailing '/'
+    removed. Placeholders such as {id} are left untouched.
+    """
     p = u_text(raw).strip()
     low = p.lower()
     if low.startswith("http://") or low.startswith("https://"):
@@ -1173,41 +1219,86 @@ def normalize_target_path(raw):
         p = p[idx:] if idx >= 0 else "/"
     for sep in ("?", "#"):
         p = p.split(sep, 1)[0]
-    p = p.strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    while "//" in p:
-        p = p.replace("//", "/")
-    if len(p) > 1 and p.endswith("/"):
-        p = p[:-1]
-    return p
+    p = _pct_decode(p.strip())
+    segs = []
+    for seg in p.split("/"):
+        if ";" in seg:
+            seg = seg.split(";", 1)[0]
+        if seg:
+            segs.append(seg)
+    return "/" + "/".join(segs)
 
 
-def compile_path_template(raw_path):
+# Backwards-compatible name (older callers / tests)
+normalize_target_path = normalize_request_path
+
+
+def split_host_and_query(raw):
+    """(host or None, [(name, value_or_None)]) declared by an Excel PATH cell."""
+    text = u_text(raw).strip()
+    host = None
+    low = text.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        rest = text[text.find("://") + 3:]
+        host = rest.split("/", 1)[0].split("?", 1)[0].split("@")[-1].split(":", 1)[0].lower() or None
+    query = []
+    if "?" in text:
+        qs = text.split("?", 1)[1].split("#", 1)[0]
+        for part in qs.split("&"):
+            if not part:
+                continue
+            name, _, value = part.partition("=")
+            name = _pct_decode(name).strip()
+            if name:
+                query.append((name, _pct_decode(value) if "=" in part else None))
+    return host, query
+
+
+def parse_query(path):
+    """{name: [values]} of a request path's query string."""
+    out = {}
+    if "?" not in (path or ""):
+        return out
+    qs = path.split("?", 1)[1].split("#", 1)[0]
+    for part in qs.split("&"):
+        if not part:
+            continue
+        name, _, value = part.partition("=")
+        out.setdefault(_pct_decode(name), []).append(_pct_decode(value))
+    return out
+
+
+def _segment_regex(seg, ids_as_params):
+    """(regex, is_literal) of one documented path segment."""
+    if seg.startswith(":") and len(seg) > 1:
+        return u"[^/]+", False
+    if ids_as_params and _ID_SEG_RE.match(seg):
+        return u"[^/]+", False
+    out = []
+    pos = 0
+    has_param = False
+    for m in _PLACEHOLDER_RE.finditer(seg):
+        out.append(re.escape(seg[pos:m.start()]))
+        out.append(u"[^/]*" if m.group(0) == u"*" else u"[^/]+")
+        pos = m.end()
+        has_param = True
+    out.append(re.escape(seg[pos:]))
+    return u"".join(out), not has_param
+
+
+def compile_path_template(raw_path, ids_as_params=False):
     """
     (exact_regex, prefixed_regex, literal_segments) for a documented path. Placeholders match one
     segment. `prefixed_regex` also accepts extra leading segments (an unknown base path like /api/v1).
+    With `ids_as_params`, purely numeric / UUID / long-hex segments in the file are parameters too.
     """
-    path = normalize_target_path(raw_path)
-    segs = [x for x in path.split("/") if x]
+    path = normalize_request_path(raw_path)
     parts = []
     literal = 0
-    for seg in segs:
-        if seg.startswith(":") and len(seg) > 1:
-            parts.append(u"[^/]+")
-            continue
-        out = []
-        pos = 0
-        has_param = False
-        for m in _PLACEHOLDER_RE.finditer(seg):
-            out.append(re.escape(seg[pos:m.start()]))
-            out.append(u"[^/]*" if m.group(0) == u"*" else u"[^/]+")
-            pos = m.end()
-            has_param = True
-        out.append(re.escape(seg[pos:]))
-        parts.append(u"".join(out))
-        if not has_param:
-            literal += 1
+    for seg in [x for x in path.split("/") if x]:
+        rx, is_literal = _segment_regex(seg, ids_as_params)
+        parts.append(rx)
+        literal += 1 if is_literal else 0
     body = u"/" + u"/".join(parts) if parts else u""
     exact = re.compile(u"^" + (body or u"") + u"/?$", re.IGNORECASE)
     prefixed = re.compile(u"^(?:/[^/]+)*" + (body or u"") + u"/?$", re.IGNORECASE)
@@ -1228,14 +1319,40 @@ class TargetEntry(object):
         self.path = u_text(path)
         self.position = u_text(position or "").strip()
         self.row_no = row_no
-        self.exact, self.prefixed, self.literal = compile_path_template(path)
+        self.host, self.query = split_host_and_query(self.path)
+        self.norm = normalize_request_path(self.path)
+        self.segments = [x for x in self.norm.split("/") if x]
+        # both variants are compiled once, the 'ids as parameters' option just picks one
+        self._rx = {False: compile_path_template(self.path, False), True: compile_path_template(self.path, True)}
+        self.exact, self.prefixed, self.literal = self._rx[False]
+
+    def patterns(self, ids_as_params):
+        return self._rx[bool(ids_as_params)]
 
     def method_label(self):
         return ", ".join(self.methods)
 
+    def query_ok(self, params, mode="values"):
+        for name, value in self.query:
+            got = params.get(name)
+            if got is None:
+                return False
+            if mode == "names" or value is None or _PLACEHOLDER_RE.search(value):
+                continue
+            if value not in got:
+                return False
+        return True
+
     def to_dict(self):
         return {"stt": self.stt, "methods": self.methods, "path": self.path,
                 "position": self.position, "row": self.row_no}
+
+
+def _bare_host(host):
+    h = u_text(host or "").lower().strip()
+    if h.startswith("[") and "]" in h:
+        return h[:h.index("]") + 1]
+    return h.split(":", 1)[0]
 
 
 class TargetList(object):
@@ -1254,22 +1371,48 @@ class TargetList(object):
     def __len__(self):
         return len(self.entries)
 
-    def match(self, method, path, allow_prefix=False):
-        """Best row for this request: exact beats prefixed, then most literal segments, then file order."""
-        p = normalize_target_path(strip_query(path))
+    def match(self, method, path, allow_prefix=False, host=None, ids_as_params=False, query_mode="ignore"):
+        """
+        Best row for this request. A row only matches if its host (full URL in the file) agrees and,
+        with query_mode 'names' / 'values', if the request carries the row's query parameters
+        (e.g. ?action=getUser). Ranking: exact before prefixed, then rows naming this host, rows
+        with more query constraints, more literal segments, earlier rows.
+        """
+        p = normalize_request_path(path)
+        params = parse_query(path) if "?" in (path or "") else {}
+        req_host = _bare_host(host) if host else None
         candidates = self._by_method.get((method or "").upper(), []) + self._by_method.get(ANY_METHOD, [])
         best = None
         best_key = None
         for e in candidates:
-            if e.exact.match(p):
-                key = (2, e.literal, -e.row_no)
-            elif allow_prefix and e.prefixed.match(p):
-                key = (1, e.literal, -e.row_no)
+            if e.host and req_host and e.host != req_host:
+                continue
+            exact, prefixed, literal = e.patterns(ids_as_params)
+            if exact.match(p):
+                kind = 2
+            elif allow_prefix and prefixed.match(p):
+                kind = 1
             else:
                 continue
+            use_query = query_mode in ("names", "values") and e.query
+            if use_query and not e.query_ok(params, query_mode):
+                continue
+            key = (kind, 1 if (e.host and req_host) else 0, len(e.query) if use_query else 0, literal, -e.row_no)
             if best_key is None or key > best_key:
                 best, best_key = e, key
         return best
+
+    def duplicates(self):
+        """Rows declaring the same method(s) + path as an earlier row."""
+        seen = {}
+        dup = []
+        for e in self.entries:
+            key = (tuple(sorted(e.methods)), e.norm.lower(), tuple(e.query), e.host)
+            if key in seen:
+                dup.append((e, seen[key]))
+            else:
+                seen[key] = e
+        return dup
 
     def to_json(self):
         return json.dumps({"source": self.source, "sheet": self.sheet, "headers": self.headers,
@@ -1282,6 +1425,53 @@ class TargetList(object):
                                d.get("position", ""), d.get("row", i + 1))
                    for i, d in enumerate(data.get("entries", []))]
         return TargetList(entries, data.get("source", ""), data.get("sheet", ""), data.get("headers"))
+
+
+class NearMissIndex(object):
+    """
+    For Excel rows nobody captured: the closest captured API, to catch typos, version drift
+    (/v1 vs /v2) and a missing base path. Indexed by segment count so it stays cheap.
+    """
+
+    def __init__(self, groups):
+        self._by_len = {}
+        self._by_last = {}
+        for g in groups:
+            segs = [x for x in normalize_request_path(g.path).split("/") if x]
+            item = (g, [x.lower() for x in segs])
+            self._by_len.setdefault(len(segs), []).append(item)
+            if segs:
+                self._by_last.setdefault(segs[-1].lower(), []).append(item)
+
+    @staticmethod
+    def _method_ok(entry, g):
+        return ANY_METHOD in entry.methods or g.method.upper() in entry.methods
+
+    def suggest(self, entry):
+        """(group, note) or (None, '')."""
+        want = entry.segments
+        n = len(want)
+        best = None
+        for g, segs in self._by_len.get(n, []):
+            if not self._method_ok(entry, g):
+                continue
+            diffs = []
+            for a, b in zip(want, segs):
+                rx, is_literal = _segment_regex(a, True)
+                if is_literal and a.lower() != b:
+                    diffs.append((a, b))
+                    if len(diffs) > 1:
+                        break
+            if len(diffs) == 1 and (best is None or g.gid < best[0].gid):
+                best = (g, u"khác 1 đoạn: %s → %s" % diffs[0])
+        if best is not None or not want:
+            return best or (None, u"")
+        exact, prefixed, _ = entry.patterns(True)
+        for g, segs in self._by_last.get(want[-1].lower(), []):
+            if len(segs) > n and self._method_ok(entry, g) and prefixed.match("/" + "/".join(segs)):
+                extra = "/" + "/".join(segs[:len(segs) - n])
+                return g, u"có thêm tiền tố %s (bật 'cho phép tiền tố')" % extra
+        return None, u""
 
 
 _XLSX_MAX_PART = 40 * 1024 * 1024
@@ -1557,14 +1747,15 @@ def coverage_rows(targets, groups):
 # ----------------------------------------------------------------------------- Excel export
 
 EXPORT_API_HEADER = ["STT", "Method", "Path", "Vị trí tìm thấy", "Host", "URL đầy đủ",
-                     "Status gốc", "Đánh giá", "Đã gửi", "Nguồn", "Thời gian"]
-EXPORT_API_WIDTHS = [6, 9, 48, 44, 26, 70, 11, 40, 9, 9, 10]
+                     "Status gốc", "Đánh giá", "Đã gửi", "Nguồn", "Thời gian", "STT trong file Excel",
+                     "Path để copy", "Đã copy"]
+EXPORT_API_WIDTHS = [6, 9, 48, 44, 26, 70, 11, 40, 9, 9, 10, 12, 50, 9]
 EXPORT_ROLE_HEADER = ["STT", "API #", "Method", "Path", "Vị trí tìm thấy", "Role", "Trạng thái",
                       "Status", "Body Len", "Lệch so với gốc", "Thời gian (ms)", "Đánh giá"]
 EXPORT_ROLE_WIDTHS = [6, 7, 9, 44, 40, 22, 12, 8, 10, 14, 14, 40]
 
 
-def api_export_rows(groups):
+def api_export_rows(groups, label_fn=None):
     """(api_rows, role_rows) for the Excel export, ordered by API number."""
     api_rows = []
     role_rows = []
@@ -1572,7 +1763,10 @@ def api_export_rows(groups):
         _, g_sum = evaluate_group_audit(g)
         done = len([r for r in g.results if r.state in (STATE_DONE, STATE_ERROR)])
         api_rows.append([idx, g.method, strip_query(g.path), g.feature_name, g.host, g.url,
-                         g.orig_status, g_sum, "%d/%d" % (done, len(g.results)), g.source, g.created])
+                         g.orig_status, g_sum, "%d/%d" % (done, len(g.results)), g.source, g.created,
+                         g.target.stt if getattr(g, "target", None) is not None else None,
+                         label_fn(g) if label_fn else None,
+                         u"Có" if getattr(g, "copied_label", None) else None])
         for r in g.results:
             _, badge = evaluate_role_result(g, r)
             delta = (r.length - g.orig_length) if (r.length is not None and g.orig_length is not None) else None
@@ -1695,13 +1889,21 @@ def build_xlsx(sheets):
     return buf.getvalue()
 
 
-COVERAGE_EXTRA_HEADER = ["Trạng thái", "Số lần bắt", "API #", "Path thực tế", "Vị trí tìm thấy", "Đánh giá"]
-COVERAGE_WIDTHS = [6, 12, 48, 44, 12, 11, 10, 48, 44, 40]
+COVERAGE_EXTRA_HEADER = ["Trạng thái", "Số lần bắt", "API #", "Path thực tế", "Vị trí tìm thấy", "Đánh giá",
+                         "Path để copy", "Đã copy", "Gợi ý gần đúng (dòng chưa bắt)"]
+COVERAGE_WIDTHS = [6, 12, 48, 44, 12, 11, 10, 48, 44, 40, 50, 9, 60]
+OUTSIDE_HEADER = ["STT", "API #", "Method", "Path", "Vị trí tìm thấy", "Host", "Status gốc", "Path để copy"]
+OUTSIDE_WIDTHS = [6, 8, 9, 48, 44, 26, 11, 50]
 
 
-def coverage_export_rows(targets, groups):
-    """Rows mirroring the user's file (STT, method, path, position) + what was found for each row."""
+def coverage_export_rows(targets, groups, copy_format=None, position_as_copy=False):
+    """
+    Rows mirroring the user's file (STT, method, path, position) + what was found for each row.
+    POSITION keeps what the user wrote; when empty it is filled with where the API was found,
+    as 'STT. path' (copy format) when `position_as_copy` is on.
+    """
     out = []
+    near = NearMissIndex(groups or [])
     for e, found in coverage_rows(targets, groups):
         found = sorted(found, key=lambda g: g.gid)
         first = found[0] if found else None
@@ -1709,22 +1911,46 @@ def coverage_export_rows(targets, groups):
         for g in found:
             if g.feature_name not in found_positions:
                 found_positions.append(g.feature_name)
-        position = e.position or u"; ".join(found_positions)
-        out.append([e.stt, e.method_label(), e.path, position or None,
+        copy_line = format_copy_line(copy_format, e.stt, found_positions[0]) if found_positions else None
+        if e.position:
+            position = e.position
+        elif position_as_copy and copy_line:
+            position = copy_line
+        else:
+            position = u"; ".join(found_positions) or None
+        hint = u""
+        if not found:
+            g, note = near.suggest(e)
+            if g is not None:
+                hint = u"%s %s %s (%s)" % (format_api_label(g.gid), g.method, strip_query(g.path), note)
+        out.append([e.stt, e.method_label(), e.path, position,
                     u"Đã bắt" if found else u"Chưa bắt", len(found),
                     u", ".join([format_api_label(g.gid) for g in found]) or None,
                     strip_query(first.path) if first else None,
                     u"; ".join(found_positions) or None,
-                    (getattr(first, "_audit_summary", None) or evaluate_group_audit(first)[1]) if first else None])
+                    (getattr(first, "_audit_summary", None) or evaluate_group_audit(first)[1]) if first else None,
+                    copy_line, u"Có" if any([getattr(g, "copied_label", None) for g in found]) else None,
+                    hint or None])
     return out
 
 
-def build_api_workbook(groups, targets=None):
-    api_rows, role_rows = api_export_rows(groups)
+def outside_list_rows(groups, label_fn=None):
+    """Captured APIs that match no row of the Excel file (possible out-of-scope / undocumented)."""
+    rows = []
+    for g in sorted(groups or [], key=lambda x: x.gid):
+        if getattr(g, "target", None) is None:
+            rows.append([len(rows) + 1, g.gid, g.method, strip_query(g.path), g.feature_name, g.host,
+                         g.orig_status, label_fn(g) if label_fn else None])
+    return rows
+
+
+def build_api_workbook(groups, targets=None, copy_format=None, position_as_copy=False, label_fn=None):
+    api_rows, role_rows = api_export_rows(groups, label_fn)
     sheets = []
     if targets is not None and len(targets):
         sheets.append((u"Độ phủ", list(targets.headers) + COVERAGE_EXTRA_HEADER,
-                       coverage_export_rows(targets, groups), COVERAGE_WIDTHS))
+                       coverage_export_rows(targets, groups, copy_format, position_as_copy), COVERAGE_WIDTHS))
+        sheets.append((u"API ngoài danh sách", OUTSIDE_HEADER, outside_list_rows(groups, label_fn), OUTSIDE_WIDTHS))
     sheets.append((u"API", EXPORT_API_HEADER, api_rows, EXPORT_API_WIDTHS))
     sheets.append((u"Kết quả Role", EXPORT_ROLE_HEADER, role_rows, EXPORT_ROLE_WIDTHS))
     return build_xlsx(sheets)
@@ -1858,6 +2084,13 @@ def merge_config(stored):
     cfg["send_jitter_pct"] = max(0, min(100, cfg["send_jitter_pct"]))
     cfg["host_concurrency"] = max(1, min(16, cfg["host_concurrency"]))
     cfg["max_retries"] = max(0, min(10, cfg["max_retries"]))
+    if cfg["target_query_mode"] not in [k for k, _ in TARGET_QUERY_MODES]:
+        cfg["target_query_mode"] = "ignore"
+    if cfg["copy_stt_fallback"] not in [k for k, _ in COPY_STT_FALLBACKS]:
+        cfg["copy_stt_fallback"] = "none"
+    cfg["copy_counter"] = max(1, cfg["copy_counter"])
+    if not cfg["copy_format"].strip():
+        cfg["copy_format"] = DEFAULT_CONFIG["copy_format"]
     cfg["short_path_len"] = max(8, min(200, cfg["short_path_len"]))
     return cfg
 
@@ -2174,6 +2407,7 @@ class RoleResult(object):
         self.error = ""
         self.sent_count = 0
         self.tab_name = ""
+        self.role_key = None      # the role's own name (display names may carry a 01_ prefix)
         self._audit_level = None
         self._audit_badge = None
 
@@ -2248,6 +2482,9 @@ class ApiGroup(object):
         self.orig_result.tab_name = repeater_tab_name(gid, method, path, "00_Original_Crawl")
         self.results = []
         self.target = None      # TargetEntry of the imported Excel list this API matched, if any
+        self.role_overrides = {}  # {role name: enabled} set for this API only
+        self.copy_stt = None      # number given by the "STT tăng dần" copy mode
+        self.copied_label = None  # last "STT. path" line copied for this API
         self._audit_level = None
         self._audit_summary = None
 
@@ -2527,7 +2764,7 @@ class FeatureTableModel(AbstractTableModel):
 
 class GroupTableModel(AbstractTableModel):
     COLS = ["API #", "Group", "Group Path (Click đúp để chọn/đổi)", "Đánh giá / Màu (Info)", "Method", "Host", "Path",
-            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time"]
+            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time", "📋 Đã copy"]
 
     def __init__(self, ext=None):
         self._ext = ext
@@ -2734,6 +2971,8 @@ class GroupTableModel(AbstractTableModel):
             return g.source
         if c == 12:
             return g.created
+        if c == 13:
+            return getattr(g, "copied_label", None) or ""
         return ""
 
 
@@ -2751,13 +2990,17 @@ class ResultTableModel(AbstractTableModel):
 
     def set_group(self, group):
         self._group = group
+        self._last_n = self.getRowCount()
         self.fireTableDataChanged()
 
     def rows_updated(self):
-        """Repaint every row without dropping the selection."""
+        """Repaint every row without dropping the selection (full refresh if roles were added / removed)."""
         n = self.getRowCount()
-        if n > 0:
+        if n != getattr(self, "_last_n", n):
+            self.fireTableDataChanged()
+        elif n > 0:
             self.fireTableRowsUpdated(0, n - 1)
+        self._last_n = n
 
     def accent_key_at(self, r):
         res = self.result_at(r)
@@ -2841,7 +3084,7 @@ class ResultTableModel(AbstractTableModel):
 class CoverageTableModel(AbstractTableModel):
     """One row per line of the imported Excel list, with what was captured for it."""
     COLS = ["STT", "Method", "Path (trong file)", "POSITION", "Trạng thái", "API #", "Path thực tế",
-            "Vị trí tìm thấy", "Đánh giá"]
+            "Vị trí tìm thấy", "Đánh giá", "📋 Đã copy", "Gợi ý gần đúng (dòng chưa bắt)"]
     FILTERS = ["Tất cả dòng", "Chưa bắt", "Đã bắt"]
 
     def __init__(self):
@@ -2852,6 +3095,7 @@ class CoverageTableModel(AbstractTableModel):
         if filter_idx is not None:
             self._filter = filter_idx
         rows = []
+        near = NearMissIndex(groups or [])
         for e, found in coverage_rows(targets, groups):
             if (self._filter == 1 and found) or (self._filter == 2 and not found):
                 continue
@@ -2861,7 +3105,7 @@ class CoverageTableModel(AbstractTableModel):
                 level, state = AUDIT_NONE, u"Chưa bắt"
             else:
                 level = _group_level(first)
-                sent = any([r.state in (STATE_DONE, STATE_ERROR) for r in first.results])
+                sent = any([r.state in (STATE_DONE, STATE_ERROR) for r in (first.results or [first.orig_result])])
                 state = u"Đã bắt · %s" % (u"đã gửi" if sent else u"chưa gửi")
                 if len(found) > 1:
                     state += u" (%d lần)" % len(found)
@@ -2876,6 +3120,14 @@ class CoverageTableModel(AbstractTableModel):
                      strip_query(first.path) if first else u"",
                      u"; ".join(positions),
                      (getattr(first, "_audit_summary", None) or evaluate_group_audit(first)[1]) if first else u""]
+            copied = [g.copied_label for g in found if getattr(g, "copied_label", None)]
+            cells.append(copied[0] if copied else u"")
+            hint = u""
+            if not found:
+                g, note = near.suggest(e)
+                if g is not None:
+                    hint = u"%s %s %s  (%s)" % (format_api_label(g.gid), g.method, strip_query(g.path), note)
+            cells.append(hint)
             rows.append((cells, level, found))
         self._rows = rows
         self.fireTableDataChanged()
@@ -3265,6 +3517,15 @@ class _ViewportWidthPanel(JPanel, Scrollable):
 
     def getScrollableTracksViewportHeight(self):
         return False
+
+
+class _KeyAction(AbstractAction):
+    def __init__(self, fn):
+        AbstractAction.__init__(self)
+        self._fn = fn
+
+    def actionPerformed(self, event):
+        self._fn()
 
 
 class _WindowClosing(WindowAdapter):
@@ -3780,12 +4041,90 @@ class _EditorController(IMessageEditorController):
         return r.response if r is not None else None
 
 
+class _TreeViewerController(IMessageEditorController):
+    """Feeds the viewers under the 'Cây Sub-folder' tree with the entry selected in that tree."""
+
+    def __init__(self, ext):
+        self._ext = ext
+
+    def _entry(self):
+        return getattr(self._ext, "_tree_entry", None) or (None, None)
+
+    def getHttpService(self):
+        g, _ = self._entry()
+        return g.service if g is not None else None
+
+    def getRequest(self):
+        _, r = self._entry()
+        return r.request if r is not None else None
+
+    def getResponse(self):
+        _, r = self._entry()
+        return r.response if r is not None else None
+
+
+def tree_entry_for(kind, payload):
+    """(group, result) shown under the tree: an API node shows its API gốc, a role node that role."""
+    if kind == "GROUP" and payload is not None:
+        return payload, getattr(payload, "orig_result", None)
+    if kind in ("ORIG", "ROLE") and payload is not None:
+        return payload[0], payload[1]
+    return None, None
+
+
 # =============================================================================
 # Role editor panel & dialog (supports Header, Cookie Key, and JWT/Bearer rules)
 # =============================================================================
 
 
 FLAGGED_LEVELS = (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR)
+_STT_TOKEN_RE = re.compile(r"\{stt\}[\s.\-:)\]]*")
+
+
+def format_copy_line(template, stt, path, method="", url="", api="", endpoint=""):
+    """
+    'STT. path' line for one API, e.g. template '{stt}. {path}' -> '200. / > contact > button "send"'.
+    Without an STT the '{stt}.' part (and the separator after it) disappears.
+    """
+    t = u_text(template or "{stt}. {path}")
+    if stt is None or u_text(stt).strip() == "":
+        t = _STT_TOKEN_RE.sub(u"", t)
+    values = {"stt": u_text(stt if stt is not None else ""), "path": u_text(path), "method": u_text(method),
+              "url": u_text(url), "api": u_text(api), "endpoint": u_text(endpoint)}
+    out = t
+    for key, value in values.items():
+        out = out.replace(u"{%s}" % key, value)
+    return out.strip()
+
+
+def effective_role_states(all_roles, branch_path, branch_rules, overrides=None):
+    """
+    {role_name: enabled} for an API in `branch_path`: the role's global Enabled flag, overridden by
+    branch rules (a deeper branch wins over its parents), overridden by the API's own rules.
+    """
+    state = dict([(r["name"], bool(r.get("enabled"))) for r in all_roles])
+    rules = [r for r in (branch_rules or []) if hierarchy_matches_prefix(branch_path, r.get("prefix", ""))]
+    rules.sort(key=lambda r: len(split_hierarchy_path(r.get("prefix", ""))))
+    for rule in rules:
+        for name, on in rule.get("roles", {}).items():
+            if name in state:
+                state[name] = bool(on)
+    for name, on in (overrides or {}).items():
+        if name in state:
+            state[name] = bool(on)
+    return state
+
+
+def effective_roles(all_roles, branch_path, branch_rules, overrides=None):
+    """Role dicts (with their global position in '_index') enabled for one API."""
+    state = effective_role_states(all_roles, branch_path, branch_rules, overrides)
+    out = []
+    for i, r in enumerate(all_roles):
+        if state.get(r["name"]):
+            role = dict(r)
+            role["_index"] = i
+            out.append(role)
+    return out
 
 
 def role_names_in(groups):
@@ -3812,6 +4151,367 @@ def select_push_targets(group, include_original, role_names, only_flagged=False)
             continue
         out.append(r)
     return out
+
+
+def branch_prefix_counts(groups):
+    """[(branch_path, number_of_APIs_inside)] for every branch level that holds captured APIs."""
+    counts = {}
+    for g in groups:
+        parts = split_hierarchy_path(g.feature_name)
+        for i in range(1, len(parts) + 1):
+            key = normalize_hierarchy_path(parts[:i])
+            counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items(), key=lambda kv: [p.lower() for p in split_hierarchy_path(kv[0])])
+
+
+def role_scope_preview(all_roles, groups, branch_rules, role_names, enable, scope, targets):
+    """
+    (APIs whose role set would change, role rows added, role rows removed) if the rule were applied -
+    shown in the dialog before anything is changed.
+    """
+    role_names = set(role_names)
+    targets = list(targets or [])
+    rules = [dict(r, roles=dict(r["roles"])) for r in branch_rules or []]
+    roles = [dict(r) for r in all_roles]
+    if scope == "global":
+        for r in roles:
+            if r["name"] in role_names:
+                r["enabled"] = bool(enable)
+        affected = list(groups)
+    elif scope == "branch":
+        for prefix in targets:
+            clean = normalize_hierarchy_path(prefix)
+            rule = None
+            for r in rules:
+                if r["prefix"].lower() == clean.lower():
+                    rule = r
+            if rule is None:
+                rule = {"prefix": clean, "roles": {}}
+                rules.append(rule)
+            for name in role_names:
+                rule["roles"][name] = bool(enable)
+        affected = [g for g in groups if any([hierarchy_matches_prefix(g.feature_name, t) for t in targets])]
+    else:
+        affected = targets
+    changed = added = removed = 0
+    for g in affected:
+        overrides = dict(getattr(g, "role_overrides", {}) or {})
+        if scope == "api":
+            for name in role_names:
+                overrides[name] = bool(enable)
+        before = set([r.role_key or r.role_name for r in g.results])
+        after = set([r["name"] for r in effective_roles(roles, g.feature_name, rules, overrides)])
+        if before != after:
+            changed += 1
+            added += len(after - before)
+            removed += len(before - after)
+    return changed, added, removed
+
+
+class _DocChange(DocumentListener):
+    def __init__(self, fn):
+        self._fn = fn
+
+    def insertUpdate(self, e):
+        self._fn()
+
+    def removeUpdate(self, e):
+        self._fn()
+
+    def changedUpdate(self, e):
+        self._fn()
+
+
+class _CheckList(JPanel):
+    """Filterable list of check boxes; the checked state survives filtering."""
+
+    def __init__(self, items, checked, on_change, hint="Lọc..."):
+        JPanel.__init__(self, BorderLayout(2, 2))
+        self._items = list(items)            # [(key, label)]
+        self._checked = set(checked)
+        self._on_change = on_change
+        top = JPanel(BorderLayout(4, 2))
+        row = JPanel(BorderLayout(4, 0))
+        row.add(JLabel(" Lọc:"), BorderLayout.WEST)
+        self.filter = JTextField()
+        self.filter.setToolTipText(hint)
+        self.filter.getDocument().addDocumentListener(_DocChange(self._rebuild))
+        row.add(self.filter, BorderLayout.CENTER)
+        top.add(row, BorderLayout.NORTH)
+        quick = JPanel(FlowLayout(FlowLayout.LEFT, 2, 0))
+        quick.add(JButton("Chọn các mục đang hiện", actionPerformed=lambda e: self._set_visible(True)))
+        quick.add(JButton("Bỏ chọn hết", actionPerformed=lambda e: self._clear()))
+        top.add(quick, BorderLayout.SOUTH)
+        self.add(top, BorderLayout.NORTH)
+        self._box = JPanel()
+        self._box.setLayout(BoxLayout(self._box, BoxLayout.Y_AXIS))
+        scroll = JScrollPane(self._box)
+        scroll.getVerticalScrollBar().setUnitIncrement(16)
+        self.add(scroll, BorderLayout.CENTER)
+        self._visible = []
+        self._rebuild()
+
+    def _rebuild(self):
+        text = u_text(self.filter.getText()).strip().lower()
+        self._box.removeAll()
+        self._visible = []
+        shown = 0
+        for key, label in self._items:
+            if text and text not in u_text(label).lower():
+                continue
+            shown += 1
+            if shown > 600:
+                more = JLabel("   ... còn nữa - gõ thêm vào ô lọc để thu hẹp")
+                self._box.add(more)
+                break
+            box = JCheckBox(label, key in self._checked)
+            box.addActionListener(_Action(lambda e, k=key, b=box: self._toggle(k, b)))
+            self._box.add(box)
+            self._visible.append(key)
+        if not self._items:
+            self._box.add(JLabel("   (chưa có mục nào)"))
+        self._box.revalidate()
+        self._box.repaint()
+
+    def _toggle(self, key, box):
+        if box.isSelected():
+            self._checked.add(key)
+        else:
+            self._checked.discard(key)
+        self._on_change()
+
+    def _set_visible(self, on):
+        for key in self._visible:
+            if on:
+                self._checked.add(key)
+            else:
+                self._checked.discard(key)
+        self._rebuild()
+        self._on_change()
+
+    def _clear(self):
+        self._checked = set()
+        self._rebuild()
+        self._on_change()
+
+    def checked(self):
+        return [k for k, _ in self._items if k in self._checked]
+
+
+class RoleScopeDialog(object):
+    """
+    'Bật / Tắt Role theo phạm vi': choose Tắt / Bật, which roles, and where - every API (the
+    roles' own Enabled flag), selected branches (sub-branches included, also for APIs captured later)
+    or selected APIs only. Lists the branch exceptions already set and previews the change.
+    Role requests stay virtual: they are only built when viewed / sent / pushed.
+    """
+
+    SCOPES = (("global", "🌐 Toàn bộ (cờ Enabled của role - mọi API)"),
+              ("branch", "🌿 Chỉ các nhánh chọn bên dưới (gồm nhánh con, cả API bắt sau này)"),
+              ("api", "📌 Chỉ các API gốc chọn bên dưới"))
+
+    def __init__(self, ext, preset):
+        self.ext = ext
+        self._result = None
+        self._groups = ext.group_model.all_groups() if ext.group_model is not None else []
+        owner = SwingUtilities.getWindowAncestor(ext.main_panel) if ext.main_panel is not None else None
+        self.dialog = JDialog(owner) if owner is not None else JDialog()
+        self.dialog.setTitle("Bật / Tắt Role theo phạm vi")
+        self.dialog.setModal(True)
+        self.dialog.setLayout(BorderLayout(6, 6))
+        bg, fg = _ui_colors()
+        self._pal = RowPalette.of(bg, fg)
+
+        head = JPanel()
+        head.setLayout(BoxLayout(head, BoxLayout.Y_AXIS))
+        head.setBorder(BorderFactory.createEmptyBorder(8, 10, 2, 10))
+        acts = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        acts.add(JLabel("Thao tác:"))
+        enable = bool(preset.get("enable", False))
+        self.rb_off = JRadioButton("⬜ TẮT role", not enable)
+        self.rb_on = JRadioButton("✅ BẬT role", enable)
+        g1 = ButtonGroup()
+        for rb in (self.rb_off, self.rb_on):
+            g1.add(rb)
+            rb.addActionListener(_Action(lambda e: self._update()))
+            acts.add(rb)
+        acts.setAlignmentX(0.0)
+        head.add(acts)
+        scopes = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        scopes.add(JLabel("Phạm vi:"))
+        self.scope_buttons = []
+        g2 = ButtonGroup()
+        for key, label in self.SCOPES:
+            rb = JRadioButton(label, key == preset.get("scope", "global"))
+            g2.add(rb)
+            rb.addActionListener(_Action(lambda e: self._on_scope()))
+            scopes.add(rb)
+            self.scope_buttons.append((key, rb))
+        scopes.setAlignmentX(0.0)
+        head.add(scopes)
+        self.dialog.add(head, BorderLayout.NORTH)
+
+        roles = ext.roles.all()
+        chosen = preset.get("roles")
+        role_items = [(r["name"], "%s   %s" % (r["name"], "(đang bật)" if r.get("enabled") else "(đang tắt)"))
+                      for r in roles]
+        self.role_list = _CheckList(role_items, chosen if chosen is not None else [r["name"] for r in roles],
+                                    self._update, "Lọc role theo tên")
+        self.role_list.setBorder(BorderFactory.createTitledBorder("1. Role áp dụng"))
+        self.role_list.setPreferredSize(Dimension(250, 300))
+
+        branch_items = [(prefix, "%s   (%d API)" % (prefix, n)) for prefix, n in branch_prefix_counts(self._groups)]
+        known = set([k for k, _ in branch_items])
+        for r in ext.role_branch_rules:
+            if r["prefix"] not in known:
+                branch_items.append((r["prefix"], "%s   (chưa có API)" % r["prefix"]))
+        self.branch_list = _CheckList(branch_items, preset.get("branches", []), self._update,
+                                      "Lọc nhánh, vd: contact")
+        api_items = [(g.gid, "#%d  %s %s   ·   %s" % (g.gid, g.method, strip_query(g.path), g.feature_name))
+                     for g in sorted(self._groups, key=lambda x: x.gid)]
+        self.api_list = _CheckList(api_items, preset.get("apis", []), self._update, "Lọc API theo #, method, path, nhánh")
+        self.target_tabs = JTabbedPane()
+        self.target_tabs.addTab("Nhánh", self.branch_list)
+        self.target_tabs.addTab("API gốc", self.api_list)
+        self.target_tabs.addTab("Ngoại lệ đã đặt", self._build_rules_panel())
+        self.target_tabs.setBorder(BorderFactory.createTitledBorder("2. Nhánh / API (khi phạm vi không phải Toàn bộ)"))
+        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, self.role_list, self.target_tabs)
+        split.setResizeWeight(0.3)
+        self.dialog.add(split, BorderLayout.CENTER)
+
+        bottom = JPanel(BorderLayout(4, 4))
+        bottom.setBorder(BorderFactory.createEmptyBorder(4, 10, 8, 10))
+        self.cb_existing = JCheckBox("Cập nhật luôn các API đã bắt (dòng role của role đang bật giữ nguyên kết quả "
+                                     "đã nhận). Bỏ chọn = chỉ áp dụng cho API bắt sau này.",
+                                     bool(preset.get("apply_existing", True)))
+        self.cb_existing.addActionListener(_Action(lambda e: self._update()))
+        bottom.add(self.cb_existing, BorderLayout.NORTH)
+        self.lbl_summary = JLabel(" ")
+        self.lbl_summary.setFont(self.lbl_summary.getFont().deriveFont(Font.BOLD))
+        bottom.add(self.lbl_summary, BorderLayout.CENTER)
+        btns = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+        self.btn_ok = JButton("Áp dụng", actionPerformed=self._on_ok)
+        self.btn_ok.setFont(self.btn_ok.getFont().deriveFont(Font.BOLD))
+        btns.add(self.btn_ok)
+        btns.add(JButton("Đóng", actionPerformed=lambda e: self.dialog.dispose()))
+        bottom.add(btns, BorderLayout.EAST)
+        self.dialog.add(bottom, BorderLayout.SOUTH)
+        self.dialog.setSize(Dimension(1040, 620))
+        self.dialog.setLocationRelativeTo(owner)
+        self._on_scope()
+
+    def _build_rules_panel(self):
+        panel = JPanel(BorderLayout(4, 4))
+        self._rules_box = JPanel()
+        self._rules_box.setLayout(BoxLayout(self._rules_box, BoxLayout.Y_AXIS))
+        scroll = JScrollPane(self._rules_box)
+        scroll.getVerticalScrollBar().setUnitIncrement(16)
+        panel.add(scroll, BorderLayout.CENTER)
+        hint = JLabel(" Thứ tự ưu tiên: cờ Enabled toàn bộ  →  nhánh (nhánh sâu hơn thắng)  →  từng API.")
+        hint.setForeground(self._pal.muted)
+        panel.add(hint, BorderLayout.SOUTH)
+        self._fill_rules()
+        return panel
+
+    def _fill_rules(self):
+        box = self._rules_box
+        box.removeAll()
+        ext = self.ext
+        rules = sorted(ext.role_branch_rules, key=lambda r: r["prefix"].lower())
+        api_over = [g for g in self._groups if getattr(g, "role_overrides", None)]
+        if not rules and not api_over:
+            box.add(JLabel("   Chưa có ngoại lệ - mọi API dùng cờ Enabled của từng role."))
+        for r in rules:
+            row = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+            offs = sorted([n for n, on in r["roles"].items() if not on])
+            ons = sorted([n for n, on in r["roles"].items() if on])
+            row.add(JButton("✖", actionPerformed=lambda e, p=r["prefix"]: self._remove_rule(p)))
+            row.add(JLabel("🌿 %s   %s%s" % (r["prefix"], ("TẮT: " + ", ".join(offs)) if offs else "",
+                                             ("   BẬT: " + ", ".join(ons)) if ons else "")))
+            row.setAlignmentX(0.0)
+            box.add(row)
+        for g in api_over:
+            row = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+            offs = sorted([n for n, on in g.role_overrides.items() if not on])
+            ons = sorted([n for n, on in g.role_overrides.items() if on])
+            row.add(JButton("✖", actionPerformed=lambda e, grp=g: self._remove_override(grp)))
+            row.add(JLabel("📌 #%d %s %s   %s%s" % (g.gid, g.method, strip_query(g.path),
+                                                  ("TẮT: " + ", ".join(offs)) if offs else "",
+                                                  ("   BẬT: " + ", ".join(ons)) if ons else "")))
+            row.setAlignmentX(0.0)
+            box.add(row)
+        box.revalidate()
+        box.repaint()
+
+    def _remove_rule(self, prefix):
+        self.ext.remove_branch_rule(prefix, self.cb_existing.isSelected())
+        self._fill_rules()
+        self._update()
+
+    def _remove_override(self, group):
+        group.role_overrides = {}
+        if self.cb_existing.isSelected():
+            self.ext.sync_group_roles(group)
+        self._fill_rules()
+        self._update()
+
+    def scope(self):
+        for key, rb in self.scope_buttons:
+            if rb.isSelected():
+                return key
+        return "global"
+
+    def _on_scope(self):
+        sc = self.scope()
+        self.target_tabs.setEnabled(True)
+        if sc == "branch":
+            self.target_tabs.setSelectedIndex(0)
+        elif sc == "api":
+            self.target_tabs.setSelectedIndex(1)
+        self._update()
+
+    def choice(self):
+        sc = self.scope()
+        if sc == "branch":
+            targets = self.branch_list.checked()
+        elif sc == "api":
+            wanted = set(self.api_list.checked())
+            targets = [g for g in self._groups if g.gid in wanted]
+        else:
+            targets = None
+        return {"enable": self.rb_on.isSelected(), "roles": self.role_list.checked(), "scope": sc,
+                "targets": targets, "apply_existing": self.cb_existing.isSelected() or sc == "api"}
+
+    def _update(self):
+        c = self.choice()
+        verb = "BẬT" if c["enable"] else "TẮT"
+        if not c["roles"]:
+            msg, ok = "Chọn ít nhất 1 role.", False
+        elif c["scope"] != "global" and not c["targets"]:
+            msg, ok = "Chọn ít nhất 1 %s ở khung bên phải." % ("nhánh" if c["scope"] == "branch" else "API"), False
+        else:
+            ok = True
+            where = {"global": "mọi API", "branch": "%d nhánh" % len(c["targets"] or []),
+                     "api": "%d API" % len(c["targets"] or [])}[c["scope"]]
+            msg = "%s %d role cho %s" % (verb, len(c["roles"]), where)
+            if c["apply_existing"]:
+                changed, added, removed = role_scope_preview(
+                    self.ext.roles.all(), self._groups, self.ext.role_branch_rules, c["roles"], c["enable"],
+                    c["scope"], c["targets"])
+                msg += "  ·  %d API đã bắt thay đổi (+%d / -%d dòng role)" % (changed, added, removed)
+            else:
+                msg += "  ·  chỉ áp dụng cho API bắt sau này"
+        self.lbl_summary.setText(msg)
+        self.btn_ok.setEnabled(ok)
+        self.cb_existing.setEnabled(c["scope"] != "api")
+
+    def _on_ok(self, e):
+        self._result = self.choice()
+        self.dialog.dispose()
+
+    def show(self):
+        self.dialog.setVisible(True)
+        return self._result
 
 
 class PushTargetsDialog(object):
@@ -4418,6 +5118,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._scope_source = "table"
         self._push_memory = None
         self._tree_window = None
+        self._main_window = None
+        self.suite_root = None
+        self._tree_entry = None
         self._log_lock = threading.Lock()
         self._log_system = deque(maxlen=LOG_SYSTEM_MAX)
         self._log_by_gid = {}
@@ -4431,6 +5134,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._inline_target = ("role", 0)
         self.config = merge_config(self._load_json_setting(SETTINGS_KEY_CONFIG, {}))
         self.original_profile = self._load_original_profile()
+        self.role_branch_rules = self._load_role_scopes()
         self.targets = None
         self._stale_coverage = True
         try:
@@ -4537,11 +5241,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def extensionUnloaded(self):
         self._unloaded = True
-        try:
-            if self._tree_window is not None:
-                self._tree_window.dispose()
-        except (Throwable, Exception):
-            pass
+        for win in (self._tree_window, self._main_window):
+            try:
+                if win is not None:
+                    win.dispose()
+            except (Throwable, Exception):
+                pass
         try:
             if self._ui_timer is not None:
                 self._ui_timer.stop()
@@ -4562,7 +5267,58 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return EXT_NAME
 
     def getUiComponent(self):
-        return self.main_panel
+        # A fixed holder: the extension can move out into its own window and back without Burp noticing.
+        if self.suite_root is None:
+            self.suite_root = JPanel(BorderLayout())
+            if self.main_panel is not None:
+                self.suite_root.add(self.main_panel, BorderLayout.CENTER)
+        return self.suite_root
+
+    def _on_toggle_detach(self, event=None):
+        if self._main_window is not None:
+            self._attach_main()
+        else:
+            self._detach_main()
+
+    def _detach_main(self):
+        if self.main_panel is None or self._main_window is not None:
+            return
+        root = self.getUiComponent()
+        frame = JFrame("%s %s" % (EXT_NAME, EXT_VERSION))
+        frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE)
+        frame.addWindowListener(_WindowClosing(lambda: self._attach_main()))
+        root.remove(self.main_panel)
+        holder = JPanel(FlowLayout(FlowLayout.CENTER, 8, 60))
+        holder.add(JLabel("%s đang mở ở cửa sổ riêng." % EXT_NAME))
+        holder.add(JButton("Đưa cửa sổ lên trước", actionPerformed=lambda e: (frame.setState(JFrame.NORMAL),
+                                                                               frame.toFront())))
+        holder.add(JButton("Gắn lại vào tab", actionPerformed=lambda e: self._attach_main()))
+        root.add(holder, BorderLayout.CENTER)
+        root.revalidate()
+        root.repaint()
+        frame.getContentPane().add(self.main_panel)
+        size = root.getSize()
+        frame.setSize(Dimension(max(1100, size.width), max(760, size.height)))
+        frame.setLocationRelativeTo(None)
+        self._main_window = frame
+        self.btn_detach.setText("🗗 Gắn lại vào tab Burp")
+        frame.setVisible(True)
+        self._ensure_tree_renderers()
+
+    def _attach_main(self):
+        frame = self._main_window
+        if frame is None:
+            return
+        self._main_window = None
+        frame.getContentPane().removeAll()
+        frame.dispose()
+        root = self.getUiComponent()
+        root.removeAll()
+        root.add(self.main_panel, BorderLayout.CENTER)
+        root.revalidate()
+        root.repaint()
+        self.btn_detach.setText("🗗 Tách ra cửa sổ riêng")
+        self._ensure_tree_renderers()
 
     # --------------------------------------------------------------- logging
     def log(self, msg, gid=None):
@@ -4656,6 +5412,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._stale_full = True
         self._refresh_send_controls()
         self._refresh_stale_views(force)
+        if dirty:
+            self._refresh_tree_entry()
         if status or structure:
             self._do_update_status()
 
@@ -4996,6 +5754,128 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         prof["name"] = ORIGINAL_PROFILE_NAME
         return prof
 
+    def _load_role_scopes(self):
+        stored = self._load_json_setting(SETTINGS_KEY_ROLE_SCOPES, [])
+        rules = []
+        for r in stored if isinstance(stored, list) else []:
+            if isinstance(r, dict) and r.get("prefix"):
+                roles = dict([(u_text(k), bool(v)) for k, v in (r.get("roles") or {}).items()])
+                if roles:
+                    rules.append({"prefix": normalize_hierarchy_path(r["prefix"]), "roles": roles})
+        return rules
+
+    def save_role_scopes(self):
+        self.callbacks.saveExtensionSetting(SETTINGS_KEY_ROLE_SCOPES, json.dumps(self.role_branch_rules))
+
+    # ---- roles per scope (all / branches / single APIs)
+    def sync_group_roles(self, group):
+        """
+        Bring an API's role rows in line with its effective roles: drop the roles switched off, add
+        the ones switched on. Results already received by the remaining roles are kept.
+        """
+        cfg = self.get_config()
+        wanted = effective_roles(self.roles.all(), group.feature_name, self.role_branch_rules,
+                                 group.role_overrides)
+        names = [r["name"] for r in wanted]
+        keep = [r for r in group.results if (r.role_key or r.role_name) in names]
+        have = set([r.role_key or r.role_name for r in keep])
+        missing = [r for r in wanted if r["name"] not in have]
+        if not missing and len(keep) == len(group.results):
+            return False
+        group.results = sorted(keep + self._make_role_results(group, missing, cfg), key=lambda r: r.role_index)
+        group.recalc_audit()
+        self._notify_results(group, None, finished_send=True)
+        return True
+
+    def apply_role_scope(self, role_names, enable, scope, targets=None, apply_existing=True):
+        """
+        Switch `role_names` on / off for scope 'global' (the roles themselves), 'branch' (targets =
+        branch paths, sub-branches included, also for APIs captured later) or 'api' (targets = API
+        groups). Returns how many captured APIs changed.
+        """
+        role_names = list(role_names)
+        all_groups = self.group_model.all_groups() if self.group_model is not None else []
+        affected = []
+        if scope == "global":
+            roles = self.roles.all()
+            for i, r in enumerate(roles):
+                if r["name"] in role_names:
+                    self.roles.set_enabled(i, enable)
+            self.save_roles()
+            affected = all_groups if apply_existing else []
+        elif scope == "branch":
+            for prefix in targets or []:
+                clean = normalize_hierarchy_path(prefix)
+                rule = None
+                for r in self.role_branch_rules:
+                    if r["prefix"].lower() == clean.lower():
+                        rule = r
+                if rule is None:
+                    rule = {"prefix": clean, "roles": {}}
+                    self.role_branch_rules.append(rule)
+                for name in role_names:
+                    rule["roles"][name] = bool(enable)
+                if apply_existing:
+                    affected.extend([g for g in all_groups if hierarchy_matches_prefix(g.feature_name, clean)])
+            self.save_role_scopes()
+        else:
+            for g in targets or []:
+                for name in role_names:
+                    g.role_overrides[name] = bool(enable)
+            affected = list(targets or [])
+        changed = 0
+        seen = set()
+        for g in affected:
+            if id(g) not in seen:
+                seen.add(id(g))
+                changed += 1 if self.sync_group_roles(g) else 0
+        what = {"global": "toàn bộ", "branch": "nhánh: " + ", ".join([u_text(t) for t in targets or []]),
+                "api": "%d API" % len(targets or [])}[scope]
+        self.log("%s %d role (%s) cho %s; %d API đã bắt được cập nhật." % (
+            "BẬT" if enable else "TẮT", len(role_names), ", ".join(role_names), what, changed))
+        if getattr(self, "role_model", None) is not None:
+            ui_call(self.role_model.reload)
+        self._mark(structure=True, status=True)
+        return changed
+
+    def open_role_scope_dialog(self, enable=False, scope="global", branches=None, apis=None, roles=None):
+        preset = {"enable": enable, "scope": scope, "branches": branches or [],
+                  "apis": [g.gid for g in apis or []], "roles": roles,
+                  "apply_existing": getattr(self, "_scope_apply_existing", True)}
+        choice = RoleScopeDialog(self, preset).show()
+        if choice is None:
+            return None
+        if choice["scope"] != "api":
+            self._scope_apply_existing = choice["apply_existing"]
+        changed = self.apply_role_scope(choice["roles"], choice["enable"], choice["scope"], choice["targets"],
+                                        choice["apply_existing"])
+        if self.role_table is not None:
+            self._roles_changed(self.role_table.getSelectedRow())
+        self._flash_status("%s %d role · %d API cập nhật" % ("Bật" if choice["enable"] else "Tắt",
+                                                            len(choice["roles"]), changed))
+        return choice
+
+    def _open_scope_for_selection(self, enable=False):
+        groups, _ = self._groups_in_scope()
+        kind, payload = self._selected_left_tree_payload() if self._scope_source == "tree" else (None, None)
+        if kind == "FOLDER" and payload:
+            return self.open_role_scope_dialog(enable, "branch", branches=[payload])
+        if groups:
+            return self.open_role_scope_dialog(enable, "api", apis=groups)
+        return self.open_role_scope_dialog(enable)
+
+    def remove_branch_rule(self, prefix, apply_existing=True):
+        clean = normalize_hierarchy_path(prefix).lower()
+        self.role_branch_rules = [r for r in self.role_branch_rules if r["prefix"].lower() != clean]
+        self.save_role_scopes()
+        changed = 0
+        if apply_existing and self.group_model is not None:
+            for g in self.group_model.all_groups():
+                if hierarchy_matches_prefix(g.feature_name, prefix):
+                    changed += 1 if self.sync_group_roles(g) else 0
+        self.log("Đã xóa quy tắc role của nhánh '%s'; %d API cập nhật." % (prefix, changed))
+        return changed
+
     def save_original_profile(self, profile):
         prof = normalize_role(profile, 0)
         prof["name"] = ORIGINAL_PROFILE_NAME
@@ -5024,9 +5904,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         with self._cfg_lock:
             old_threads = self.config["threads"]
             was_sending = self.config.get("auto_send", False)
-            old_prefix = self.config.get("target_allow_prefix", False)
+            old_match = tuple([self.config.get(k) for k in TARGET_MATCH_KEYS])
             self.config = new_cfg
-        if old_prefix != new_cfg.get("target_allow_prefix", False) and self.targets:
+        if self.targets and old_match != tuple([new_cfg.get(k) for k in TARGET_MATCH_KEYS]):
             self._retag_groups()
         if was_sending and not new_cfg.get("auto_send", False):
             self.cancel_pending_sends("Đã DỪNG gửi")
@@ -5075,7 +5955,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 targets = self.targets
                 if cfg.get("target_only") and targets:
                     # The Excel list replaces the path regex: only documented APIs are copied.
-                    if targets.match(fast_method, fast_path, cfg.get("target_allow_prefix")) is None:
+                    if self._target_match(fast_method, fast_path, messageInfo.getHttpService().getHost(), cfg) is None:
                         with self._state_lock:
                             self._skipped_count += 1
                             self._last_skip_reason = "không có trong danh sách Excel"
@@ -5181,7 +6061,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         path = url.getFile() or "/"
         feat = self.get_feature(target_fid) or self.active_feature()
         targets = self.targets
-        target = targets.match(method, path, cfg.get("target_allow_prefix")) if targets else None
+        target = self._target_match(method, path, service.getHost(), cfg) if targets else None
         if target is not None and target.position and cfg.get("target_use_position", True):
             feat = self.find_or_create_feature_by_path(target.position)
 
@@ -5211,7 +6091,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         # Roles are optional: with none enabled the API is still captured, stored and shown
         # ("1 API gốc + 0 role") and every send / Repeater action falls back to the original.
-        roles = self.roles.enabled()
+        roles = effective_roles(self.roles.all(), feat.name, self.role_branch_rules)
 
         with self._state_lock:
             gid = self._next_gid
@@ -5278,11 +6158,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         """
         group.base_headers = [u_text(h) for h in info.getHeaders()]
         group.body_offset = info.getBodyOffset()
+        return self._make_role_results(group, roles, cfg)
+
+    def _make_role_results(self, group, roles, cfg):
         results = []
-        for idx, role in enumerate(roles):
+        for pos, role in enumerate(roles):
+            idx = role.get("_index", pos)   # position in the full role list: stable numbering
             display = display_role_name(role["name"], idx, cfg["number_roles_in_tab"])
             res = RoleResult(display, idx, None, is_stripped_auth=is_stripped_auth_role(role),
                              group=group, rules=role["headers"])
+            res.role_key = role["name"]
             res.tab_name = repeater_tab_name(group.gid, group.method, group.path, display,
                                              cfg["short_path_len"], group.fid,
                                              cfg.get("include_feature_in_tab", False))
@@ -5317,7 +6202,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
     def rebuild_group(self, group):
         """Re-clone a group's original request with the *current* enabled roles."""
         def work():
-            roles = self.roles.enabled()
+            roles = effective_roles(self.roles.all(), group.feature_name, self.role_branch_rules,
+                                    group.role_overrides)
             cfg = self.get_config()
             info = self.helpers.analyzeRequest(group.service, group.orig_request)
             new_results = self._clone_for_roles(group, info, roles, cfg)
@@ -5580,6 +6466,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         top_container.add(left_header, BorderLayout.NORTH)
         top_container.add(right_header, BorderLayout.SOUTH)
         self.main_panel.add(top_container, BorderLayout.NORTH)
+        self.btn_detach = JButton("🗗 Tách ra cửa sổ riêng", actionPerformed=self._on_toggle_detach)
+        self.btn_detach.setMargin(Insets(1, 6, 1, 6))
+        self.btn_detach.setToolTipText("Mở cả extension trong một cửa sổ riêng (vd: màn hình thứ 2); "
+                                       "đóng cửa sổ để gắn lại vào tab của Burp")
+        right_header.add(self.btn_detach)
 
         self.tabs = JTabbedPane()
         self.tabs.addTab("API Groups & Repeater", self._build_groups_tab())
@@ -5642,6 +6533,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         left_actions.add(self.btn_send_dropdown)
         left_actions.add(self.btn_repeater_dropdown)
         left_actions.add(self.btn_tools_dropdown)
+        btn_copy = JButton("📋 Copy STT + Path", actionPerformed=self._on_copy_scope)
+        btn_copy.setToolTipText("Copy 'STT. path' của API / nhánh đang chọn (Ctrl+Shift+C)")
+        left_actions.add(btn_copy)
 
         right_filters = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 1))
         right_filters.add(JLabel("Xem:"))
@@ -5666,6 +6560,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.left_hierarchy_tree = JTree(self.left_hierarchy_tree_model)
         self.left_hierarchy_tree.setRowHeight(26)
         self.left_hierarchy_tree.setLargeModel(True)
+        self._install_copy_shortcut(self.left_hierarchy_tree)
         self.left_hierarchy_tree.setCellRenderer(HierarchyTreeRenderer())
         self.left_hierarchy_tree.addTreeWillExpandListener(_LazyTreeLoader(
             lambda node: self._lazy_load_tree_node("left", self.left_hierarchy_tree_model, node)))
@@ -5722,6 +6617,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.group_table = JTable(self.group_model)
         self.group_table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE)
         style_data_table(self.group_table)
+        self._install_copy_shortcut(self.group_table)
         self.group_table.setAutoCreateRowSorter(True)
         self.group_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
         self.group_table.getSelectionModel().addListSelectionListener(
@@ -5731,7 +6627,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         grp_renderer = AuditTableRenderer(self.group_model, status_col=7, audit_col=3, method_col=4,
                                           bold_cols=(0,))
         for col, width in ((0, 72), (1, 46), (2, 200), (3, 185), (4, 68), (5, 130),
-                           (6, 235), (7, 48), (8, 62), (9, 95), (10, 58), (11, 52), (12, 60)):
+                           (6, 235), (7, 48), (8, 62), (9, 95), (10, 58), (11, 52), (12, 60), (13, 230)):
             column = self.group_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(grp_renderer)
@@ -5841,9 +6737,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.full_tree = JTree(self.full_tree_model)
         self.full_tree.setRowHeight(26)
         self.full_tree.setLargeModel(True)
+        self._install_copy_shortcut(self.full_tree)
         self.full_tree.setCellRenderer(HierarchyTreeRenderer())
         self.full_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
-        self.full_tree.addTreeSelectionListener(_TreeListener(lambda: self._on_tree_used(self.full_tree)))
+        self.full_tree.addTreeSelectionListener(_TreeListener(lambda: self._on_full_tree_selected()))
         self.full_tree.addTreeWillExpandListener(_LazyTreeLoader(
             lambda node: self._lazy_load_tree_node("full", self.full_tree_model, node)))
         self.full_tree.addMouseListener(_TreePopupListener(self.full_tree, lambda e: self._tree_popup_from(self.full_tree, e)))
@@ -5855,6 +6752,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         push = JButton("🎯 Đẩy / Gửi có chọn Role...",
                        actionPerformed=lambda e: self._tree_action(self.full_tree, lambda: self._open_push_dialog("push")))
         bar.add(push)
+        copy_btn = JButton("📋 Copy", actionPerformed=lambda e: self._on_copy_from(self.full_tree))
+        copy_btn.setToolTipText("Copy 'STT. path' của API / nhánh đang chọn (Ctrl+Shift+C)")
+        bar.add(copy_btn)
         self.btn_full_tree_more = JButton("Thao tác ▾", actionPerformed=lambda e: self._show_full_tree_menu())
         bar.add(self.btn_full_tree_more)
         # Few, short buttons: the bar must still fit when the tree is popped out into a narrow window.
@@ -5874,7 +6774,30 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         # The tree + its toolbar move as one piece between the tab and the separate window.
         self.full_tree_content = JPanel(BorderLayout())
         self.full_tree_content.add(head, BorderLayout.NORTH)
-        self.full_tree_content.add(JScrollPane(self.full_tree), BorderLayout.CENTER)
+        # Like Proxy > HTTP history: the tree on top, the selected request / response below.
+        controller = _TreeViewerController(self)
+        self._tree_entry = None
+        self._tree_entry_shown = None
+        self.tree_req_viewer = self.callbacks.createMessageEditor(controller, False)
+        self.tree_resp_viewer = self.callbacks.createMessageEditor(controller, False)
+        self.lbl_tree_req = JLabel(" Request - chọn 1 API / role trong cây")
+        self.lbl_tree_resp = JLabel(" Response")
+        for lbl in (self.lbl_tree_req, self.lbl_tree_resp):
+            lbl.setFont(lbl.getFont().deriveFont(Font.BOLD))
+        req_panel = JPanel(BorderLayout())
+        req_panel.add(self.lbl_tree_req, BorderLayout.NORTH)
+        req_panel.add(self.tree_req_viewer.getComponent(), BorderLayout.CENTER)
+        resp_panel = JPanel(BorderLayout())
+        resp_panel.add(self.lbl_tree_resp, BorderLayout.NORTH)
+        resp_panel.add(self.tree_resp_viewer.getComponent(), BorderLayout.CENTER)
+        self.tree_viewer_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, req_panel, resp_panel)
+        self.tree_viewer_split.setResizeWeight(0.5)
+        self.tree_viewer_split.setPreferredSize(Dimension(600, 340))
+        self.tree_main_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.full_tree),
+                                          self.tree_viewer_split)
+        self.tree_main_split.setResizeWeight(0.5)
+        self.tree_main_split.setOneTouchExpandable(True)
+        self.full_tree_content.add(self.tree_main_split, BorderLayout.CENTER)
 
         self.full_tree_placeholder = JPanel(FlowLayout(FlowLayout.CENTER, 8, 40))
         self.full_tree_placeholder.add(JLabel("Cây Sub-folder đang mở ở cửa sổ riêng."))
@@ -5883,6 +6806,45 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.full_tree_tab.add(self.full_tree_content, BorderLayout.CENTER)
         return self.full_tree_tab
 
+    def _on_full_tree_selected(self):
+        self._on_tree_used(self.full_tree)
+        path = self.full_tree.getSelectionPath()
+        kind, payload = self._extract_node_kind_payload(path.getLastPathComponent() if path is not None else None)
+        g, res = tree_entry_for(kind, payload)
+        if res is not None:
+            self._show_tree_entry(g, res)
+
+    def _show_tree_entry(self, g, res):
+        """Show one entry below the tree (read-only, like Proxy history; Burp's own menu still works)."""
+        self._tree_entry = (g, res) if res is not None else None
+        empty = self.helpers.stringToBytes("")
+        if res is None:
+            self.lbl_tree_req.setText(" Request - chọn 1 API / role trong cây")
+            self.lbl_tree_resp.setText(" Response")
+            self.tree_req_viewer.setMessage(empty, True)
+            self.tree_resp_viewer.setMessage(empty, False)
+            self._tree_entry_shown = None
+            return
+        request = res.request
+        response = res.response
+        self.lbl_tree_req.setText(" Request [%s | %s]  %s %s" % (format_group_id(g.gid), res.role_name, g.method,
+                                                                  strip_query(g.path)))
+        st = res.status if res.status is not None else res.state
+        ln = res.length if res.length is not None else "-"
+        self.lbl_tree_resp.setText(" Response [%s | Status: %s | Length: %s]" % (res.role_name, st, ln))
+        self.tree_req_viewer.setMessage(request if request is not None else empty, True)
+        self.tree_resp_viewer.setMessage(response if response is not None else empty, False)
+        self._tree_entry_shown = (id(res), id(response), res.state)
+
+    def _refresh_tree_entry(self):
+        """A response that arrives for the entry under the tree is shown without re-selecting it."""
+        entry = getattr(self, "_tree_entry", None)
+        if not entry or getattr(self, "tree_req_viewer", None) is None:
+            return
+        g, res = entry
+        if (id(res), id(res.response), res.state) != self._tree_entry_shown:
+            self._show_tree_entry(g, res)
+
     def _show_full_tree_menu(self):
         tree = self.full_tree
         menu = JPopupMenu()
@@ -5890,6 +6852,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             ("▶ Gửi mục đang chọn (nhánh / API / role)", lambda: self._on_replay_selected_hierarchy_or_feature(None)),
             ("📤 Đẩy mục đang chọn -> Burp Repeater", lambda: self._on_send_selected_hierarchy_repeater(None)),
             ("🎯 Gửi có chọn Role...", lambda: self._open_push_dialog("send")),
+            ("📋 Copy STT + Path (Ctrl+Shift+C)", lambda: self._on_copy_scope()),
+            ("📋 Copy path nhánh", lambda: self._on_copy_branch_path()),
+            ("🎛 Bật / Tắt Role cho mục đang chọn...", lambda: self._open_scope_for_selection(False)),
             (None, None),
             ("🎯 Đặt làm nhánh đang bắt (Active Path)", lambda: self._on_set_selected_feature_active(None)),
             ("➕ Thêm Sub-folder con...", lambda: self._on_add_subfolder_to_selected_tree(None)),
@@ -5964,7 +6929,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         except (Throwable, Exception):
             pass
         self._ensure_tree_renderers()
-        frame.setSize(Dimension(620, 860))
+        frame.setSize(Dimension(980, 900))
         frame.setLocationRelativeTo(self.main_panel)
         frame.setVisible(True)
         self._tree_window = frame
@@ -6024,7 +6989,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.coverage_table.setAutoCreateRowSorter(True)
         self.coverage_table.addMouseListener(_DoubleClick(self._on_coverage_jump))
         renderer = AuditTableRenderer(self.coverage_model, audit_col=8, method_col=1, bold_cols=(0, 4))
-        for col, width in ((0, 50), (1, 80), (2, 300), (3, 220), (4, 150), (5, 110), (6, 260), (7, 220), (8, 240)):
+        for col, width in ((0, 50), (1, 80), (2, 300), (3, 220), (4, 150), (5, 110), (6, 260), (7, 220), (8, 240),
+                           (9, 230), (10, 380)):
             column = self.coverage_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(renderer)
@@ -6067,8 +7033,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         hit = len([1 for e, found in coverage_rows(targets, groups) if found])
         total = len(targets)
         mode = u"chỉ bắt API trong danh sách" if self.config.get("target_only") else u"bắt mọi API (danh sách chỉ để đối chiếu)"
-        label.setText(u"%s  ·  %d API  ·  Đã bắt %d/%d (%d%%)  ·  Còn %d chưa bắt  ·  Chế độ: %s"
-                      % (targets.source, total, hit, total, (hit * 100 // total) if total else 0, total - hit, mode))
+        outside = len([1 for g in groups if getattr(g, "target", None) is None])
+        copied = len([1 for g in groups if getattr(g, "copied_label", None)])
+        dups = len(targets.duplicates()) if hasattr(targets, "duplicates") else 0
+        extra = []
+        if outside:
+            extra.append(u"%d API ngoài danh sách" % outside)
+        if dups:
+            extra.append(u"%d dòng trùng trong file" % dups)
+        if copied:
+            extra.append(u"📋 đã copy %d" % copied)
+        label.setText(u"%s  ·  %d API  ·  Đã bắt %d/%d (%d%%)  ·  Còn %d chưa bắt%s  ·  Chế độ: %s"
+                      % (targets.source, total, hit, total, (hit * 100 // total) if total else 0, total - hit,
+                         "".join([u"  ·  " + x for x in extra]), mode))
 
     def set_targets(self, targets):
         self.targets = targets if targets else None
@@ -6078,13 +7055,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._print_error("Could not save the Excel API list:\n%s" % u_text(traceback.format_exc()))
         self._retag_groups()
 
+    def _target_match(self, method, path, host=None, cfg=None):
+        targets = self.targets
+        if not targets:
+            return None
+        cfg = cfg or self.config
+        return targets.match(method, path, cfg.get("target_allow_prefix", False), host,
+                             cfg.get("target_ids_as_params", True), cfg.get("target_query_mode", "ignore"))
+
     def _retag_groups(self):
         """Match every already captured API against the current list (after load / option change)."""
         if self.group_model is None:
             return
-        allow_prefix = self.config.get("target_allow_prefix", False)
         for g in self.group_model.all_groups():
-            g.target = self.targets.match(g.method, g.path, allow_prefix) if self.targets else None
+            g.target = self._target_match(g.method, g.path, g.host) if self.targets else None
         self._stale_coverage = True
         self._refresh_feature_views()
 
@@ -6265,7 +7249,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
         try:
-            data = build_api_workbook(groups, self.targets)
+            cfg = self.get_config()
+            data = build_api_workbook(groups, self.targets, cfg.get("copy_format"),
+                                      cfg.get("excel_position_copy_format", True),
+                                      lambda g: self.copy_label_for(g, assign=False))
             out = open(f.getAbsolutePath(), "wb")
             try:
                 out.write(data)
@@ -6351,6 +7338,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.btn_role_more = JButton("⚙ Thao tác Role ▾",
                                      actionPerformed=lambda e: self._show_role_actions_menu(self.btn_role_more))
         role_top_bar.add(self.btn_role_more)
+        btn_scope = JButton("🎛 Bật/Tắt theo phạm vi...", actionPerformed=lambda e: self.open_role_scope_dialog(False))
+        btn_scope.setToolTipText("Tắt / bật role cho toàn bộ, cho từng nhánh hoặc từng API gốc")
+        role_top_bar.add(btn_scope)
 
         north = JPanel(BorderLayout(2, 4))
         north.add(role_top_bar, BorderLayout.NORTH)
@@ -6490,6 +7480,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                         cfg.get("target_use_position", True))
         self.cb_target_prefix = check("Cho phép path thực tế có thêm tiền tố phía trước (vd /api/v1 + /apt/test)",
                                       cfg.get("target_allow_prefix", False))
+        self.cb_target_ids = check("Coi số / UUID / chuỗi hex trong file là tham số (file ghi /users/123 vẫn khớp /users/456)",
+                                   cfg.get("target_ids_as_params", True))
+        self.cb_target_query = JComboBox([label for _, label in TARGET_QUERY_MODES])
+        self.cb_target_query.setSelectedIndex([k for k, _ in TARGET_QUERY_MODES].index(cfg["target_query_mode"]))
+        self.cb_target_query.addActionListener(_Action(on_change))
+        self.tf_copy_format = JTextField(cfg["copy_format"], 30)
+        self.tf_copy_format.addActionListener(_Action(on_change))
+        self.tf_copy_format.addFocusListener(_FocusLost(lambda: self._on_settings_changed(None)))
+        self.cb_copy_fallback = JComboBox([label for _, label in COPY_STT_FALLBACKS])
+        self.cb_copy_fallback.setSelectedIndex([k for k, _ in COPY_STT_FALLBACKS].index(cfg["copy_stt_fallback"]))
+        self.cb_copy_fallback.addActionListener(_Action(on_change))
+        self.lbl_copy_counter = JLabel(" ")
+        self.cb_excel_position_copy = check("Khi xuất Excel: cột POSITION còn trống được ghi theo định dạng copy (vd 200. / > contact > button \"send\")",
+                                            cfg.get("excel_position_copy_format", True))
         self.btn_target_load = JButton("Nạp file Excel (.xlsx)...", actionPerformed=self._on_load_targets)
         self.lbl_target_info = JLabel(" ")
 
@@ -6526,7 +7530,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
              "Xem tiến độ ở tab 'Độ phủ Excel'.",
              [("pair", self.btn_target_load, self.lbl_target_info),
               ("check", self.cb_target_only), ("check", self.cb_target_position),
-              ("check", self.cb_target_prefix)]),
+              ("check", self.cb_target_prefix),
+              ("check", self.cb_target_ids),
+              ("field", "Query trong file Excel:", self.cb_target_query, None)]),
+            ("6.  Copy STT + Path (để dán lên server / báo cáo)", (13, 148, 136),
+             "Chuột phải API / nhánh > 'Copy STT + Path', hoặc Ctrl+Shift+C. STT lấy từ file Excel (dòng khớp); "
+             "không có file thì theo lựa chọn bên dưới. Mẫu dùng được: {stt} {path} {method} {endpoint} {url} {api}.",
+             [("field", "Mẫu copy:", self.tf_copy_format, "mặc định: {stt}. {path}"),
+              ("field", "Khi không có STT từ Excel:", self.cb_copy_fallback, self.lbl_copy_counter),
+              ("pair", JButton("Đặt lại bộ đếm về 1", actionPerformed=self._on_reset_copy_counter), JLabel(" ")),
+              ("check", self.cb_excel_position_copy)]),
             ("5.  Burp Repeater & tên tab", (234, 88, 12),
              "Cách đặt tên tab khi đẩy sang Burp Repeater.",
              [("check", self.cb_number), ("check", self.cb_feat_tab),
@@ -6660,6 +7673,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             idx = self._profile_index(cfg["send_profile"])
             if self.cb_send_profile.getSelectedIndex() != idx:
                 self.cb_send_profile.setSelectedIndex(idx)
+            if getattr(self, "lbl_copy_counter", None) is not None:
+                self.lbl_copy_counter.setText("số tiếp theo nếu đếm tăng dần: %d" % cfg.get("copy_counter", 1))
             delay = cfg["send_delay_ms"]
             if delay > 0:
                 per_min = int(60000.0 / delay * cfg["host_concurrency"])
@@ -6686,11 +7701,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                               ("cb_auto_send_original", "auto_send_original"),
                               ("cb_target_only_mirror", "target_only"),
                               ("cb_target_position", "target_use_position"),
-                              ("cb_target_prefix", "target_allow_prefix")):
+                              ("cb_target_prefix", "target_allow_prefix"),
+                              ("cb_target_ids", "target_ids_as_params"),
+                              ("cb_excel_position_copy", "excel_position_copy_format")):
                 widget = getattr(self, name, None)
                 if widget is not None and widget.isSelected() != bool(cfg.get(key)):
                     widget.setSelected(bool(cfg.get(key)))
-            for name, key in (("tf_static", "static_ext"), ("tf_regex", "api_regex")):
+            for combo, key, options in ((getattr(self, "cb_target_query", None), "target_query_mode", TARGET_QUERY_MODES),
+                                        (getattr(self, "cb_copy_fallback", None), "copy_stt_fallback", COPY_STT_FALLBACKS)):
+                if combo is not None:
+                    idx = [k for k, _ in options].index(cfg.get(key, options[0][0]))
+                    if combo.getSelectedIndex() != idx:
+                        combo.setSelectedIndex(idx)
+            for name, key in (("tf_static", "static_ext"), ("tf_regex", "api_regex"), ("tf_copy_format", "copy_format")):
                 widget = getattr(self, name, None)
                 if widget is not None and u_text(widget.getText()) != u_text(cfg.get(key)):
                     widget.setText(u_text(cfg.get(key)))
@@ -6744,6 +7767,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "target_only": self.cb_target_only.isSelected(),
             "target_use_position": self.cb_target_position.isSelected(),
             "target_allow_prefix": self.cb_target_prefix.isSelected(),
+            "target_ids_as_params": self.cb_target_ids.isSelected(),
+            "target_query_mode": TARGET_QUERY_MODES[max(0, self.cb_target_query.getSelectedIndex())][0],
+            "copy_format": u_text(self.tf_copy_format.getText()),
+            "copy_stt_fallback": COPY_STT_FALLBACKS[max(0, self.cb_copy_fallback.getSelectedIndex())][0],
+            "copy_counter": self.config.get("copy_counter", 1),
+            "excel_position_copy_format": self.cb_excel_position_copy.isSelected(),
         }
 
     def _on_top_filter_toggled(self, event):
@@ -6797,6 +7826,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.cb_target_only.setSelected(d["target_only"])
             self.cb_target_position.setSelected(d["target_use_position"])
             self.cb_target_prefix.setSelected(d["target_allow_prefix"])
+            self.cb_target_ids.setSelected(d["target_ids_as_params"])
+            self.cb_target_query.setSelectedIndex(0)
+            self.tf_copy_format.setText(d["copy_format"])
+            self.cb_copy_fallback.setSelectedIndex(0)
+            self.cb_excel_position_copy.setSelected(d["excel_position_copy_format"])
         finally:
             self._syncing_settings = False
         self._sync_settings_fields(d)
@@ -7064,9 +8098,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         cnt = len(groups)
         menu.add(JMenuItem("▶ Gửi %d API đang chọn (N Roles)" % (cnt or 1), actionPerformed=self._on_replay_all))
         menu.add(JMenuItem("📤 Đẩy %d API đang chọn -> Burp Repeater" % (cnt or 1), actionPerformed=self._on_send_group))
+        menu.add(JMenuItem("📋 Copy STT + Path (%d API)     Ctrl+Shift+C" % (cnt or 1),
+                           actionPerformed=lambda e: (setattr(self, "_scope_source", "table"), self._on_copy_scope())))
         menu.add(JMenuItem("🎯 Đẩy / Gửi %d API có chọn Role (API gốc / role nào)..." % (cnt or 1),
                            actionPerformed=lambda e: self._open_push_dialog(
                                "push", groups or None, "%d API đang chọn" % len(groups))))
+        menu.add(JMenuItem("🎛 Bật / Tắt Role cho %d API đang chọn..." % (cnt or 1),
+                           actionPerformed=lambda e: self.open_role_scope_dialog(False, "api", apis=groups)))
         menu.addSeparator()
         menu.add(JMenuItem("📁 Đổi Group Path cho API đang chọn...", actionPerformed=self._on_move_groups_feature))
         menu.add(JMenuItem("🔄 Rebuild Roles cho API đang chọn", actionPerformed=self._on_rebuild))
@@ -7108,6 +8146,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             (None, None),
             ("✅ Bật tất cả Role (Enable All)", lambda e: self._on_enable_all(True)),
             ("⬜ Tắt tất cả Role (Disable All)", lambda e: self._on_enable_all(False)),
+            ("🎛 Bật / Tắt Role theo phạm vi (nhánh / API)...", lambda e: self.open_role_scope_dialog(False)),
             (None, None),
             ("📂 Import Roles từ JSON...", self._on_import_roles),
             ("💾 Export Roles ra JSON...", self._on_export_roles),
@@ -7323,6 +8362,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                    actionPerformed=self._on_send_selected_hierarchy_repeater))
                 menu.add(JMenuItem("🎯 Đẩy / Gửi Nhánh \"%s\" có chọn Role..." % title,
                                    actionPerformed=lambda e: self._open_push_dialog("push")))
+                menu.add(JMenuItem("📋 Copy path nhánh \"%s\"" % title, actionPerformed=self._on_copy_branch_path))
+                menu.add(JMenuItem("📋 Copy STT + Path của các API trong nhánh", actionPerformed=self._on_copy_scope))
+                menu.add(JMenuItem("🎛 Bật / Tắt Role cho nhánh \"%s\"..." % title,
+                                   actionPerformed=lambda e, p=prefix: self.open_role_scope_dialog(
+                                       False, "branch", branches=[p])))
                 menu.addSeparator()
                 menu.add(JMenuItem("🗑 Xóa Nhánh \"%s\"..." % title,
                                    actionPerformed=self._on_delete_selected_tree_branch))
@@ -7333,8 +8377,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                actionPerformed=lambda e: self.replay(g, self.default_targets(g))))
             menu.add(JMenuItem("📤 Đẩy API #%d sang Burp Repeater (Gọn)" % g.gid,
                                actionPerformed=lambda e: self._dispatch_group_with_selected_mode(g)))
+            menu.add(JMenuItem("📋 Copy STT + Path   (%s)" % self.copy_label_for(g, assign=False)[:60],
+                               actionPerformed=lambda e: self.copy_groups([g])))
             menu.add(JMenuItem("🎯 Đẩy / Gửi API #%d có chọn Role..." % g.gid,
                                actionPerformed=lambda e: self._open_push_dialog("push", [g], format_api_label(g.gid))))
+            menu.add(JMenuItem("🎛 Bật / Tắt Role cho API #%d..." % g.gid,
+                               actionPerformed=lambda e: self.open_role_scope_dialog(False, "api", apis=[g])))
         menu.show(event.getComponent(), event.getX(), event.getY())
 
     def update_status(self):
@@ -7820,6 +8868,92 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 JOptionPane.showMessageDialog(
                     self.main_panel, "Nhánh '%s' chưa có API nào để gửi." % feat.name,
                     EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+
+    # ---- 'Copy STT + Path'
+    def copy_label_for(self, group, assign=True):
+        """
+        'STT. path' line of an API: STT from its Excel row, else the chosen fallback (counter assigned
+        on the first copy and kept, or the API number); path = its branch, e.g. / > contact > button.
+        """
+        cfg = self.config
+        stt = group.target.stt if getattr(group, "target", None) is not None else None
+        if stt is None or u_text(stt).strip() == "":
+            mode = cfg.get("copy_stt_fallback", "none")
+            if mode == "api":
+                stt = group.gid
+            elif mode == "counter":
+                if group.copy_stt is None and assign:
+                    with self._cfg_lock:
+                        group.copy_stt = self.config.get("copy_counter", 1)
+                        self.config["copy_counter"] = group.copy_stt + 1
+                        snapshot = dict(self.config)
+                    self.callbacks.saveExtensionSetting(SETTINGS_KEY_CONFIG, json.dumps(snapshot))
+                stt = group.copy_stt
+        return format_copy_line(cfg.get("copy_format"), stt, group.feature_name, group.method, group.url,
+                                format_api_label(group.gid), "%s %s" % (group.method, strip_query(group.path)))
+
+    def copy_groups(self, groups):
+        """Copy one line per API to the clipboard and mark the APIs as copied (for counting later)."""
+        lines = []
+        for g in sorted(groups, key=lambda x: x.gid):
+            label = self.copy_label_for(g)
+            g.copied_label = label
+            lines.append(label)
+            self._notify_results(g, None)
+        if not lines:
+            return ""
+        text = "\n".join(lines)
+        self._copy_to_clipboard(text)
+        for g, line in zip(sorted(groups, key=lambda x: x.gid), lines):
+            self.log("Đã copy: %s" % line, gid=g.gid)
+        self._mark(structure=True, status=True)
+        if getattr(self, "lbl_copy_counter", None) is not None:
+            ui_call(lambda: self._sync_settings_fields(self.get_config()))
+        return text
+
+    def _on_copy_scope(self, event=None):
+        groups, label = self._groups_in_scope()
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "Chọn API (bảng) hoặc nhánh / API (cây) trước.",
+                                          EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        text = self.copy_groups(groups)
+        self._flash_status("📋 Đã copy %d dòng: %s" % (len(groups), text.split("\n")[0][:80]))
+
+    def _on_copy_branch_path(self, event=None):
+        prefix = self._selected_hierarchy_prefix()
+        if prefix:
+            self._copy_to_clipboard(prefix)
+            self._flash_status("📋 Đã copy path nhánh: %s" % prefix)
+
+    def _flash_status(self, text):
+        label = getattr(self, "status_label", None)
+        if label is not None:
+            label.setText(text)
+
+    def _on_reset_copy_counter(self, event):
+        if JOptionPane.showConfirmDialog(
+                self.main_panel, "Đặt lại bộ đếm STT tăng dần về 1?\nCác API đã được đánh số sẽ được đánh số lại "
+                                 "ở lần copy tiếp theo.", EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+            return
+        for g in self.group_model.all_groups():
+            g.copy_stt = None
+        cfg = self.get_config()
+        cfg["copy_counter"] = 1
+        self.apply_config(cfg)
+        self._sync_settings_fields(self.get_config())
+
+    def _install_copy_shortcut(self, component):
+        component.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke("ctrl shift C"), "tmoc-copy")
+        component.getActionMap().put("tmoc-copy", _KeyAction(lambda: self._on_copy_from(component)))
+
+    def _on_copy_from(self, component):
+        if component is self.group_table:
+            self._scope_source = "table"
+        else:
+            self._menu_tree = component
+            self._scope_source = "tree"
+        self._on_copy_scope()
 
     # ---- 'Đẩy / Gửi có chọn Role'
     def _groups_in_scope(self):
@@ -8563,8 +9697,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._roles_changed(self.roles.move(idx, delta))
 
     def _on_enable_all(self, enabled):
-        self.roles.set_all_enabled(enabled)
-        self._roles_changed(self.role_table.getSelectedRow())
+        """'Bật / Tắt tất cả' asks where: every API, some branches, or some APIs only."""
+        self.open_role_scope_dialog(enabled, "global", roles=[r["name"] for r in self.roles.all()])
 
     def _on_import_roles(self, event):
         chooser = JFileChooser()

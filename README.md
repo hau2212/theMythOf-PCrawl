@@ -148,6 +148,19 @@ How to read results: a low-privilege role that gets a `2xx` with a body length c
 
 ---
 
+### 2.6 Role theo phạm vi, Copy STT + Path, cửa sổ riêng (v1.10)
+
+- **Role chỉ render khi cần:** request của từng role là ảo, chỉ được dựng khi bạn xem / gửi / đẩy sang Repeater.
+- **Bật / Tắt Role theo phạm vi** (tab Roles → `🎛 Bật/Tắt theo phạm vi...`, hoặc `Bật/Tắt tất cả`, hoặc chuột phải trên API / nhánh):
+  - **Toàn bộ:** đổi cờ Enabled của role (mọi API).
+  - **Các nhánh:** quy tắc lưu theo nhánh, áp dụng cho nhánh con và cả API bắt sau này. Nhánh sâu hơn thắng nhánh cha.
+  - **Các API gốc:** chỉ những API chọn.
+  - Thứ tự ưu tiên: Enabled toàn bộ → nhánh → từng API. Tab `Ngoại lệ đã đặt` liệt kê và cho xóa từng quy tắc. Các role còn bật giữ nguyên kết quả đã nhận.
+- **📋 Copy STT + Path** (nút, chuột phải, `Ctrl+Shift+C`): ví dụ `200. / > contact > button "send"`. STT lấy từ dòng Excel khớp; nếu không có file thì tùy chọn: bỏ STT / đếm tăng dần (lưu lại, đặt lại được) / số API. Mẫu dòng chỉnh được trong `Cấu hình` (`{stt} {path} {method} {endpoint} {url} {api}`). API đã copy có cột `📋 Đã copy`; file Excel xuất ra có cột `Path để copy`, `Đã copy` và có thể ghi POSITION theo cùng định dạng.
+- **Đối chiếu Excel chính xác hơn:** chuẩn hóa hai phía (bỏ host / query / `;jsessionid`, gộp `//`, giải mã `%XX` trừ `%2F`), số / UUID trong file được coi là tham số (tùy chọn), dòng có query (`?type=a`) và dòng có host (URL đầy đủ) được ưu tiên khi khớp, path cụ thể thắng path có tham số. Tab Độ phủ có cột gợi ý gần đúng (khác 1 đoạn, thiếu tiền tố), đếm dòng trùng và sheet `API ngoài danh sách`.
+- **Tách cả extension ra cửa sổ riêng:** nút `🗗 Tách ra cửa sổ riêng` ở thanh trên; đóng cửa sổ để gắn lại vào tab Burp.
+- **Tab 🌳 Cây Sub-folder** (cả khi mở cửa sổ riêng) có khung Request / Response bên dưới giống Proxy history: chọn API → xem API gốc, chọn role → xem role đó.
+
 ## 3. Threading & safety design
 
 | Concern | Implementation |

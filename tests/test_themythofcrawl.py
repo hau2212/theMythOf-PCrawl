@@ -1401,5 +1401,197 @@ class RolesOptionalTests(unittest.TestCase):
         self.assertNotIn("G01•01_Admin", pushed)
         self.assertIn("G01•02_User2", pushed)
 
+
+class ExcelMatchingAccuracyTests(unittest.TestCase):
+    """Normalisation on both sides, ids in the file, query / host aware rows, near misses, duplicates."""
+
+    def test_both_sides_are_normalised(self):
+        self.assertEqual(tm.normalize_request_path("https://h.test/a//b;jsessionid=1/?q=1#f"), "/a/b")
+        self.assertEqual(tm.normalize_request_path("/caf%C3%A9/%7Bx%7D/a%2Fb"), u"/caf%C3%A9/{x}/a%2Fb")
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [1, "GET", "/api/users/{id}/"],
+                                   [2, "GET", "/files/a%2Fb"]])
+        self.assertEqual(tl.match("GET", "/api//users/7;v=2?x=1").stt, 1)
+        self.assertEqual(tl.match("GET", "/files/a%2fb").stt, 2)
+        self.assertIsNone(tl.match("GET", "/files/a/b"))      # an encoded '/' is not a separator
+
+    def test_ids_written_in_the_file_are_parameters(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [1, "GET", "/order/12345/items"],
+                                   [2, "GET", "/doc/3f2a9c1e-1111-2222-3333-444455556666"],
+                                   [3, "GET", "/order/me/items"]])
+        self.assertEqual(tl.match("GET", "/order/99/items", ids_as_params=True).stt, 1)
+        self.assertIsNone(tl.match("GET", "/order/99/items", ids_as_params=False))
+        self.assertEqual(tl.match("GET", "/doc/abc", ids_as_params=True).stt, 2)
+        self.assertEqual(tl.match("GET", "/order/me/items", ids_as_params=True).stt, 3)   # literal wins
+
+    def test_query_and_host_aware_rows(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [1, "GET", "/search?type=user"],
+                                   [2, "GET", "/search?type=shop"], [3, "GET", "/search"],
+                                   [4, "GET", "https://admin.test/search"]])
+        self.assertEqual(tl.match("GET", "/search?type=shop&q=1", query_mode="values").stt, 2)
+        self.assertEqual(tl.match("GET", "/search?q=1", query_mode="values").stt, 3)
+        self.assertEqual(tl.match("GET", "/search?type=zzz", query_mode="names").stt in (1, 2), True)
+        self.assertEqual(tl.match("GET", "/search", host="admin.test:443").stt, 4)
+        self.assertNotEqual(tl.match("GET", "/search", host="www.test").stt, 4)
+
+    def test_near_miss_and_duplicates(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [1, "GET", "/v1/users/{id}"],
+                                   [2, "POST", "/orders"], [3, "POST", "/orders"]])
+        g1 = _Fake(gid=1, method="GET", path="/v2/users/5")
+        g2 = _Fake(gid=2, method="POST", path="/api/orders")
+        idx = tm.NearMissIndex([g1, g2])
+        hit, note = idx.suggest(tl.entries[0])
+        self.assertIs(hit, g1)
+        self.assertIn("v1", note)
+        hit, note = idx.suggest(tl.entries[1])
+        self.assertIs(hit, g2)
+        self.assertIn("/api", note)
+        self.assertEqual([(a.stt, b.stt) for a, b in tl.duplicates()], [(3, 2)])
+
+
+class _Fake(object):
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class CopyPathTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def groups(self):
+        out = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (out.append(g), orig(g, i, r, c))[1]
+        return out
+
+    def test_format_copy_line(self):
+        self.assertEqual(tm.format_copy_line("{stt}. {path}", 200, '/ > contact > button "send"'),
+                         '200. / > contact > button "send"')
+        self.assertEqual(tm.format_copy_line("{stt}. {path}", None, "/ > contact"), "/ > contact")
+        self.assertEqual(tm.format_copy_line("[{stt}] {method} {endpoint} - {path}", 7, "/ > a", "GET",
+                                             endpoint="GET /x"), "[7] GET GET /x - / > a")
+
+    def test_stt_from_excel_else_counter_or_api_number(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH", "POSITION"],
+                                   [200, "POST", "/v1/transfer", '/ > contact > button "send"']])
+        self.ext.targets = tl
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False, "auto_send": False})
+        self.ext.apply_config(cfg)
+        groups = self.groups()
+        clipboard = []
+        self.ext._copy_to_clipboard = clipboard.append
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/other"))
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/third"))
+        listed, other, third = groups
+        self.assertEqual(self.ext.copy_label_for(listed), '200. / > contact > button "send"')
+        self.assertEqual(self.ext.copy_label_for(other), other.feature_name)        # 'none': path only
+        cfg = self.ext.get_config()
+        cfg.update({"copy_stt_fallback": "counter", "copy_counter": 5})
+        self.ext.apply_config(cfg)
+        self.assertEqual(self.ext.copy_label_for(other, assign=False), other.feature_name)   # preview: no number used
+        text = self.ext.copy_groups([third, other])
+        self.assertEqual(text.split("\n"), ["5. " + other.feature_name, "6. " + third.feature_name])
+        self.assertEqual(self.ext.copy_groups([other]), "5. " + other.feature_name)    # number kept
+        self.assertEqual(self.ext.get_config()["copy_counter"], 7)
+        self.assertEqual(json.loads(self.cb.settings[tm.SETTINGS_KEY_CONFIG])["copy_counter"], 7)
+        self.assertEqual(other.copied_label, "5. " + other.feature_name)
+        self.assertEqual(clipboard[-1], "5. " + other.feature_name)
+        cfg.update({"copy_stt_fallback": "api"})
+        self.ext.apply_config(cfg)
+        self.assertEqual(self.ext.copy_label_for(groups[2]), "%d. %s" % (third.gid, third.feature_name))
+
+    def test_export_has_copy_columns_and_position_in_copy_format(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [12, "POST", "/v1/transfer"], [13, "GET", "/nope"]])
+        self.ext.targets = tl
+        groups = self.groups()
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/outside"))
+        rows = tm.coverage_export_rows(tl, groups, "{stt}. {path}", True)
+        self.assertEqual(rows[0][3], "12. %s" % groups[0].feature_name)
+        self.assertIn("12. %s" % groups[0].feature_name, rows[0])
+        self.assertEqual(len(tm.outside_list_rows(groups)), 1)
+        data = tm.build_api_workbook(groups, tl, "{stt}. {path}", True, lambda g: self.ext.copy_label_for(g, False))
+        import zipfile, io as _io
+        names = zipfile.ZipFile(_io.BytesIO(data)).namelist()
+        self.assertTrue(len([n for n in names if n.startswith("xl/worksheets/sheet")]) >= 3)
+
+
+class RoleScopeTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def setup_groups(self):
+        out = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (out.append(g), orig(g, i, r, c))[1]
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False, "auto_send": False})
+        self.ext.apply_config(cfg)
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/b"))
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/c"))
+        out[0].feature_name = "/ > contact > button"
+        out[1].feature_name = "/ > contact"
+        out[2].feature_name = "/ > shop"
+        self.ext._ui_tick(None)
+        return out
+
+    def names(self, g):
+        return [r.role_name for r in g.results]
+
+    def test_effective_roles_order_of_precedence(self):
+        roles = [{"name": "A", "enabled": True}, {"name": "B", "enabled": False}, {"name": "C", "enabled": True}]
+        rules = [{"prefix": "/ > contact", "roles": {"A": False, "B": True}},
+                 {"prefix": "/ > contact > button", "roles": {"A": True}}]
+        self.assertEqual([r["name"] for r in tm.effective_roles(roles, "/ > shop", rules)], ["A", "C"])
+        self.assertEqual([r["name"] for r in tm.effective_roles(roles, "/ > contact > x", rules)], ["B", "C"])
+        self.assertEqual([r["name"] for r in tm.effective_roles(roles, "/ > contact > button", rules)],
+                         ["A", "B", "C"])
+        self.assertEqual([r["name"] for r in tm.effective_roles(roles, "/ > contact > button", rules,
+                                                               {"C": False})], ["A", "B"])
+        self.assertEqual([r["_index"] for r in tm.effective_roles(roles, "/ > shop", rules)], [0, 2])
+
+    def test_branch_scope_keeps_results_and_applies_to_later_captures(self):
+        g1, g2, g3 = self.setup_groups()
+        admin = g1.results[0]
+        admin.state = tm.STATE_DONE
+        self.assertEqual(tm.role_scope_preview(self.ext.roles.all(), [g1, g2, g3], [], ["User2", "Guest"], False,
+                                               "branch", ["/ > contact"]), (2, 0, 4))
+        changed = self.ext.apply_role_scope(["User2", "Guest"], False, "branch", ["/ > contact"])
+        self.assertEqual(changed, 2)
+        self.assertEqual(len(g1.results), 8)
+        self.assertIs(g1.results[0], admin)                 # finished result kept
+        self.assertNotIn("10_Guest", self.names(g2))
+        self.assertEqual(len(g3.results), 10)               # other branch untouched
+        self.assertEqual(json.loads(self.cb.settings[tm.SETTINGS_KEY_ROLE_SCOPES]),
+                         [{"prefix": "/ > contact", "roles": {"User2": False, "Guest": False}}])
+        # a sub-branch can switch one back on
+        self.ext.apply_role_scope(["Guest"], True, "branch", ["/ > contact > button"])
+        self.assertIn("10_Guest", self.names(g1))
+        self.assertNotIn("10_Guest", self.names(g2))
+        self.assertEqual(self.ext.remove_branch_rule("/ > contact"), 2)
+        self.assertEqual(len(g2.results), 10)
+
+    def test_api_scope_and_global_scope(self):
+        g1, g2, g3 = self.setup_groups()
+        self.ext.apply_role_scope(["Admin"], False, "api", [g3])
+        self.assertNotIn("01_Admin", self.names(g3))
+        self.assertIn("01_Admin", self.names(g2))
+        self.ext.apply_role_scope([r["name"] for r in self.ext.roles.all()], False, "global", None, True)
+        self.assertEqual([g.results for g in (g1, g2, g3)], [[], [], []])
+        self.assertEqual(self.ext.roles.enabled_count(), 0)
+        self.ext.apply_role_scope(["Admin", "Guest"], True, "global")
+        self.assertEqual(self.names(g1), ["01_Admin", "10_Guest"])
+        self.assertEqual(self.names(g3), ["10_Guest"])         # its own 'Admin off' still wins
+        # without updating captured APIs: only future captures change
+        self.ext.apply_role_scope(["Guest"], False, "global", None, False)
+        self.assertEqual(self.names(g1), ["01_Admin", "10_Guest"])
+
+    def test_branch_prefix_counts(self):
+        g1, g2, g3 = self.setup_groups()
+        self.assertEqual(tm.branch_prefix_counts([g1, g2, g3]),
+                         [("/", 3), ("/ > contact", 2), ("/ > contact > button", 1), ("/ > shop", 1)])
+
 if __name__ == "__main__":
     unittest.main()
