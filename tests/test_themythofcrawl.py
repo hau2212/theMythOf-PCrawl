@@ -1168,5 +1168,146 @@ class SendModeAndExportTests(unittest.TestCase):
         self.assertEqual(self.ext._log_by_gid[7], [("10:00:00", "Bắt từ Proxy")])
         self.assertEqual(list(self.ext._log_system)[-1], ("10:00:01", "Chế độ gửi"))
 
+
+def _xlsx_with_shared_strings(rows):
+    """Workbook laid out like Excel writes it (shared strings + numeric cells), for reader tests."""
+    import io as _io
+    import zipfile
+    strings = []
+    xml_rows = []
+    for r, row in enumerate(rows, 1):
+        cells = []
+        for c, v in enumerate(row):
+            ref = "%s%d" % (chr(65 + c), r)
+            if v is None:
+                continue
+            if isinstance(v, int):
+                cells.append('<c r="%s"><v>%d</v></c>' % (ref, v))
+            else:
+                strings.append(v)
+                cells.append('<c r="%s" t="s"><v>%d</v></c>' % (ref, len(strings) - 1))
+        xml_rows.append('<row r="%d">%s</row>' % (r, "".join(cells)))
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    buf = _io.BytesIO()
+    z = zipfile.ZipFile(buf, "w")
+    z.writestr("xl/workbook.xml", '<workbook %s xmlns:r="%s"><sheets><sheet name="APIs" sheetId="1" r:id="rId9"/>'
+               '</sheets></workbook>' % (ns, rel))
+    z.writestr("xl/_rels/workbook.xml.rels",
+               '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+               '<Relationship Id="rId9" Type="%s/worksheet" Target="worksheets/data.xml"/></Relationships>' % rel)
+    z.writestr("xl/sharedStrings.xml", ('<sst %s>' % ns) + "".join(
+        ['<si><t>%s</t></si>' % s.replace("&", "&amp;").replace("<", "&lt;") for s in strings]) + '</sst>')
+    z.writestr("xl/worksheets/data.xml", '<worksheet %s><sheetData>%s</sheetData></worksheet>' % (ns, "".join(xml_rows)))
+    z.close()
+    return buf.getvalue()
+
+
+class ExcelTargetTests(unittest.TestCase):
+    DEMO = [["STT", "PROTOCOL", "PATH", "POSITION"],
+            [1, "GET", "/apt/test"], [2, "POST", "/apt/test"],
+            [5, "GET", "/apt/test/{id}/me/{session}"], [6, "post", "/apt/test/[id]/me/(sid)"],
+            [7, "", "https://x.test/files/<f>.json?v=1", 'Toppage > contact > button "search"']]
+
+    def write(self, rows):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".xlsx")
+        os.write(fd, _xlsx_with_shared_strings(rows))
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_reads_shared_strings_and_detects_columns(self):
+        path = self.write(self.DEMO)
+        self.assertEqual(tm.xlsx_sheet_names(path), ["APIs"])
+        sheet, rows = tm.read_xlsx_rows(path)
+        self.assertEqual(sheet, "APIs")
+        tl = tm.build_target_list(rows, "demo.xlsx", sheet)
+        self.assertEqual(tl.headers, ["STT", "PROTOCOL", "PATH", "POSITION"])
+        self.assertEqual([e.stt for e in tl.entries], [1, 2, 5, 6, 7])
+        self.assertEqual(tl.entries[3].methods, ["POST"])
+        self.assertEqual(tl.entries[4].methods, ["ANY"])
+        self.assertEqual(tl.entries[4].position, 'Toppage > contact > button "search"')
+
+    def test_vietnamese_headers_and_headerless_files(self):
+        tl = tm.build_target_list([["Số thứ tự", "Phương thức", "Đường dẫn", "Vị trí"], [1, "GET, PUT", "/a/b"]])
+        self.assertEqual(tl.entries[0].methods, ["GET", "PUT"])
+        tl = tm.build_target_list([[1, "DELETE", "/x/{id}", "/ > c"], [2, "GET", "/y"]])
+        self.assertEqual([e.path for e in tl.entries], ["/x/{id}", "/y"])
+        self.assertEqual(tl.entries[0].position, "/ > c")
+
+    def test_any_bracket_style_is_a_wildcard_segment(self):
+        tl = tm.build_target_list(self.DEMO)
+        self.assertEqual(tl.match("GET", "/apt/test/").stt, 1)
+        self.assertEqual(tl.match("GET", "/apt/test/42/me/s3ss10n?x=1").stt, 5)
+        self.assertEqual(tl.match("POST", "/APT/TEST/42/me/abc").stt, 6)
+        self.assertEqual(tl.match("PATCH", "/files/report.json").stt, 7)
+        self.assertIsNone(tl.match("PATCH", "/apt/test"))
+        self.assertIsNone(tl.match("GET", "/apt/test/42/me"))
+        self.assertIsNone(tl.match("GET", "/api/v1/apt/test"))
+        self.assertEqual(tl.match("GET", "/api/v1/apt/test", allow_prefix=True).stt, 1)
+        tl2 = tm.TargetList.from_json(tl.to_json())
+        self.assertEqual(tl2.match("GET", "/apt/test/1/me/2").stt, 5)
+
+    def test_literal_rows_beat_templates(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [1, "GET", "/u/{id}"], [2, "GET", "/u/me"]])
+        self.assertEqual(tl.match("GET", "/u/me").stt, 2)
+        self.assertEqual(tl.match("GET", "/u/42").stt, 1)
+
+    def test_rejects_xml_with_doctype(self):
+        import io as _io
+        import zipfile
+        buf = _io.BytesIO()
+        z = zipfile.ZipFile(buf, "w")
+        z.writestr("xl/workbook.xml", '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><workbook/>')
+        z.close()
+        path = self.write([])
+        with open(path, "wb") as fh:
+            fh.write(buf.getvalue())
+        with self.assertRaises(ValueError):
+            tm.read_xlsx_rows(path)
+
+
+class TargetCaptureTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def groups(self):
+        out = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (out.append(g), orig(g, i, r, c))[1]
+        return out
+
+    def test_target_only_mode_skips_unlisted_and_files_by_position(self):
+        tl = tm.build_target_list([["STT", "PROTOCOL", "PATH", "POSITION"],
+                                   [1, "POST", "/v1/transfer/{id}", '/ > contact > button "search"'],
+                                   [2, "GET", "/v1/other"]])
+        self.ext.targets = tl
+        cfg = self.ext.get_config()
+        cfg.update({"target_only": True, "api_regex_enabled": True, "api_regex": "^/never$"})
+        self.ext.apply_config(cfg)
+        groups = self.groups()
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/transfer/77?x=1"))
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/unlisted"))
+        self.assertEqual(len(groups), 1)                       # regex ignored, unlisted skipped
+        self.assertIs(groups[0].target, tl.entries[0])
+        self.assertEqual(groups[0].feature_name, '/ > contact > button "search"')
+        rows = tm.coverage_export_rows(tl, groups)
+        self.assertEqual(rows[0][:5], [1, "POST", "/v1/transfer/{id}", '/ > contact > button "search"', "Đã bắt"])
+        self.assertEqual(rows[1][4], "Chưa bắt")
+
+    def test_list_without_target_mode_only_tags(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [3, "POST", "/v1/transfer"]])
+        self.ext.targets = tl
+        groups = self.groups()
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/elsewhere"))
+        self.assertEqual(len(groups), 2)
+        self.assertIs(groups[0].target, tl.entries[0])
+        self.assertIsNone(groups[1].target)
+        rows = tm.coverage_export_rows(tl, groups)
+        self.assertEqual(rows[0][2], "/v1/transfer")
+        self.assertEqual(rows[0][3], tm.DEFAULT_HIERARCHY_PATH)  # empty POSITION filled with where it was found
+
 if __name__ == "__main__":
     unittest.main()

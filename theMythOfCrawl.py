@@ -111,9 +111,10 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.7.0"
+EXT_VERSION = "1.8.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
+SETTINGS_KEY_TARGETS = "tmoc.targets.v1"
 
 REMOVE_TOKEN = "[REMOVE]"
 MODE_REPLACE = "REPLACE"              # overwrite first occurrence (drop duplicates) or add if missing
@@ -175,6 +176,10 @@ DEFAULT_CONFIG = {
     "send_jitter_pct": 40,
     "host_concurrency": 1,
     "max_retries": 3,
+    # Target API list imported from Excel (see TargetList)
+    "target_only": False,
+    "target_use_position": True,
+    "target_allow_prefix": False,
 }
 
 # (key, label, delay_ms, jitter_pct, per-host concurrency); CUSTOM keeps the user's numbers.
@@ -869,6 +874,7 @@ class HierarchyStats(object):
         self.flagged = 0
         self.ok = 0
         self.info_exact = 0
+        self.target_hits = set()
         seen = set()
         for f in self.features:
             np = normalize_hierarchy_path(f.name)
@@ -877,6 +883,8 @@ class HierarchyStats(object):
                 self.paths.append(np)
         for g in self.groups:
             self.by_fid.setdefault(getattr(g, "fid", 1), []).append(g)
+            if getattr(g, "target", None) is not None:
+                self.target_hits.add(id(g.target))
             lvl = _group_level(g)
             is_flagged = lvl in (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR)
             is_ok = (lvl == AUDIT_OK)
@@ -1103,6 +1111,327 @@ def groups_to_matrix_json(groups, features=None):
     }, indent=2)
 
 
+# ----------------------------------------------------------------------------- Excel import (target list)
+
+HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT")
+ANY_METHOD = "ANY"
+
+# A path parameter is any bracketed token, whatever its name: {id} [id] (id) <id> ${id} {{id}} %id%,
+# a whole ":name" segment, or "*".
+_PLACEHOLDER_RE = re.compile(r"\{\{[^{}/]*\}\}|\$\{[^{}/]*\}|\{[^{}/]*\}|\[[^\[\]/]*\]|"
+                             r"\([^()/]*\)|<[^<>/]*>|%[A-Za-z_][A-Za-z0-9_\-]*%|\*")
+
+_HEADER_ALIASES = {
+    "stt": ("stt", "no", "no.", "#", "so thu tu", "so tt", "index", "idx", "order", "id"),
+    "method": ("method", "protocol", "phuong thuc", "http method", "verb", "methods", "request method"),
+    "path": ("path", "url", "endpoint", "api", "uri", "duong dan", "link", "route", "api path"),
+    "position": ("position", "vi tri", "location", "vi tri tim thay", "man hinh", "screen", "feature",
+                 "chuc nang", "nhanh", "branch"),
+}
+
+
+def _fold(text):
+    """Lower-case, accent-free form used to recognise column headers ('Vị trí' -> 'vi tri')."""
+    t = u_text(text).strip().lower().replace(u"đ", u"d")
+    try:
+        import unicodedata
+        t = u"".join([ch for ch in unicodedata.normalize("NFD", t) if unicodedata.category(ch) != "Mn"])
+    except Exception:
+        pass
+    return u" ".join(t.replace(u"_", u" ").split())
+
+
+def normalize_target_path(raw):
+    """'https://h/a/b/?q#f' -> '/a/b' ; keeps placeholders untouched."""
+    p = u_text(raw).strip()
+    low = p.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        idx = p.find("/", p.find("://") + 3)
+        p = p[idx:] if idx >= 0 else "/"
+    for sep in ("?", "#"):
+        p = p.split(sep, 1)[0]
+    p = p.strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    while "//" in p:
+        p = p.replace("//", "/")
+    if len(p) > 1 and p.endswith("/"):
+        p = p[:-1]
+    return p
+
+
+def compile_path_template(raw_path):
+    """
+    (exact_regex, prefixed_regex, literal_segments) for a documented path. Placeholders match one
+    segment. `prefixed_regex` also accepts extra leading segments (an unknown base path like /api/v1).
+    """
+    path = normalize_target_path(raw_path)
+    segs = [x for x in path.split("/") if x]
+    parts = []
+    literal = 0
+    for seg in segs:
+        if seg.startswith(":") and len(seg) > 1:
+            parts.append(u"[^/]+")
+            continue
+        out = []
+        pos = 0
+        has_param = False
+        for m in _PLACEHOLDER_RE.finditer(seg):
+            out.append(re.escape(seg[pos:m.start()]))
+            out.append(u"[^/]*" if m.group(0) == u"*" else u"[^/]+")
+            pos = m.end()
+            has_param = True
+        out.append(re.escape(seg[pos:]))
+        parts.append(u"".join(out))
+        if not has_param:
+            literal += 1
+    body = u"/" + u"/".join(parts) if parts else u""
+    exact = re.compile(u"^" + (body or u"") + u"/?$", re.IGNORECASE)
+    prefixed = re.compile(u"^(?:/[^/]+)*" + (body or u"") + u"/?$", re.IGNORECASE)
+    return exact, prefixed, literal
+
+
+def parse_methods(raw):
+    """'GET' / 'get, post' / 'GET/POST' / '' / 'ANY' -> ['GET'] / ['GET','POST'] / ['ANY']"""
+    words = [w.strip().upper() for w in re.split(r"[\s,;/|]+", u_text(raw)) if w.strip()]
+    methods = [w for w in words if w in HTTP_METHODS]
+    return methods or [ANY_METHOD]
+
+
+class TargetEntry(object):
+    def __init__(self, stt, methods, path, position, row_no):
+        self.stt = stt
+        self.methods = list(methods)
+        self.path = u_text(path)
+        self.position = u_text(position or "").strip()
+        self.row_no = row_no
+        self.exact, self.prefixed, self.literal = compile_path_template(path)
+
+    def method_label(self):
+        return ", ".join(self.methods)
+
+    def to_dict(self):
+        return {"stt": self.stt, "methods": self.methods, "path": self.path,
+                "position": self.position, "row": self.row_no}
+
+
+class TargetList(object):
+    """API list from the user's Excel file; answers 'which row does METHOD /path belong to?'."""
+
+    def __init__(self, entries, source="", sheet="", headers=None):
+        self.entries = list(entries)
+        self.source = u_text(source)
+        self.sheet = u_text(sheet)
+        self.headers = list(headers or ["STT", "PROTOCOL", "PATH", "POSITION"])
+        self._by_method = {}
+        for e in self.entries:
+            for m in e.methods:
+                self._by_method.setdefault(m, []).append(e)
+
+    def __len__(self):
+        return len(self.entries)
+
+    def match(self, method, path, allow_prefix=False):
+        """Best row for this request: exact beats prefixed, then most literal segments, then file order."""
+        p = normalize_target_path(strip_query(path))
+        candidates = self._by_method.get((method or "").upper(), []) + self._by_method.get(ANY_METHOD, [])
+        best = None
+        best_key = None
+        for e in candidates:
+            if e.exact.match(p):
+                key = (2, e.literal, -e.row_no)
+            elif allow_prefix and e.prefixed.match(p):
+                key = (1, e.literal, -e.row_no)
+            else:
+                continue
+            if best_key is None or key > best_key:
+                best, best_key = e, key
+        return best
+
+    def to_json(self):
+        return json.dumps({"source": self.source, "sheet": self.sheet, "headers": self.headers,
+                           "entries": [e.to_dict() for e in self.entries]})
+
+    @staticmethod
+    def from_json(text):
+        data = json.loads(text)
+        entries = [TargetEntry(d.get("stt"), d.get("methods") or [ANY_METHOD], d.get("path", "/"),
+                               d.get("position", ""), d.get("row", i + 1))
+                   for i, d in enumerate(data.get("entries", []))]
+        return TargetList(entries, data.get("source", ""), data.get("sheet", ""), data.get("headers"))
+
+
+_XLSX_MAX_PART = 40 * 1024 * 1024
+
+
+def _xml_local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xlsx_part(z, name):
+    info = z.getinfo(name)
+    if info.file_size > _XLSX_MAX_PART:
+        raise ValueError("Excel part %s is too large" % name)
+    data = z.read(name)
+    # Spreadsheet parts never declare a DTD; refusing them rules out entity-expansion tricks.
+    head = data[:4096].lower()
+    if b"<!doctype" in head or b"<!entity" in data.lower():
+        raise ValueError("Unsupported XML in %s" % name)
+    import xml.etree.ElementTree as ET
+    return ET.fromstring(data)
+
+
+def _xlsx_col_index(ref):
+    n = 0
+    for ch in ref:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+        elif "a" <= ch <= "z":
+            n = n * 26 + (ord(ch) - 96)
+        else:
+            break
+    return n - 1
+
+
+def read_xlsx_rows(path, sheet_index=0):
+    """(sheet_name, rows) of one worksheet; each row is a list of cell values (None for blanks)."""
+    import zipfile
+    z = zipfile.ZipFile(path)
+    try:
+        names = set(z.namelist())
+        wb = _xlsx_part(z, "xl/workbook.xml")
+        sheets = [el for el in wb.iter() if _xml_local(el.tag) == "sheet"]
+        if not sheets:
+            raise ValueError("The workbook has no worksheet")
+        sheet_el = sheets[min(sheet_index, len(sheets) - 1)]
+        sheet_name = sheet_el.get("name", "Sheet1")
+        rel_id = None
+        for k, v in sheet_el.attrib.items():
+            if k.startswith("{") and _xml_local(k) == "id":
+                rel_id = v
+        target = "worksheets/sheet%d.xml" % (sheet_index + 1)
+        if rel_id and "xl/_rels/workbook.xml.rels" in names:
+            for rel in _xlsx_part(z, "xl/_rels/workbook.xml.rels").iter():
+                if _xml_local(rel.tag) == "Relationship" and rel.get("Id") == rel_id:
+                    target = rel.get("Target")
+        part = target.lstrip("/") if target.startswith("/") else "xl/" + target
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            for si in _xlsx_part(z, "xl/sharedStrings.xml"):
+                if _xml_local(si.tag) == "si":
+                    shared.append(u"".join([t.text or u"" for t in si.iter() if _xml_local(t.tag) == "t"]))
+        rows = []
+        for row_el in _xlsx_part(z, part).iter():
+            if _xml_local(row_el.tag) != "row":
+                continue
+            cells = {}
+            seq = 0
+            for c in row_el:
+                if _xml_local(c.tag) != "c":
+                    continue
+                ref = c.get("r")
+                col = _xlsx_col_index(ref) if ref else seq
+                seq = col + 1
+                kind = c.get("t")
+                v = None
+                for child in c:
+                    if _xml_local(child.tag) == "v":
+                        v = child.text
+                if kind == "s":
+                    value = shared[int(v)] if v is not None and int(v) < len(shared) else None
+                elif kind == "inlineStr":
+                    value = u"".join([t.text or u"" for t in c.iter() if _xml_local(t.tag) == "t"])
+                elif kind == "b":
+                    value = (v == "1")
+                elif kind in ("str", "e"):
+                    value = v
+                elif v is None:
+                    value = None
+                else:
+                    try:
+                        f = float(v)
+                        value = int(f) if f == int(f) else f
+                    except ValueError:
+                        value = v
+                cells[col] = value
+            if cells:
+                width = max(cells.keys()) + 1
+                rows.append([cells.get(i) for i in range(width)])
+            else:
+                rows.append([])
+        return sheet_name, rows
+    finally:
+        z.close()
+
+
+def xlsx_sheet_names(path):
+    import zipfile
+    z = zipfile.ZipFile(path)
+    try:
+        wb = _xlsx_part(z, "xl/workbook.xml")
+        return [el.get("name", "Sheet") for el in wb.iter() if _xml_local(el.tag) == "sheet"]
+    finally:
+        z.close()
+
+
+def detect_target_columns(rows):
+    """(header_row_index or -1, {field: column}, header_texts) from the first rows of the sheet."""
+    for r_idx, row in enumerate(rows[:15]):
+        cols = {}
+        for c_idx, value in enumerate(row):
+            if value is None:
+                continue
+            folded = _fold(value)
+            for field, aliases in _HEADER_ALIASES.items():
+                if field not in cols and folded in aliases:
+                    cols[field] = c_idx
+        if "path" in cols:
+            headers = [u_text(v) if v is not None else u"" for v in row]
+            return r_idx, cols, headers
+    # No header row: the documented layout STT | METHOD | PATH | POSITION
+    return -1, {"stt": 0, "method": 1, "path": 2, "position": 3}, ["STT", "PROTOCOL", "PATH", "POSITION"]
+
+
+def build_target_list(rows, source="", sheet=""):
+    header_idx, cols, header_texts = detect_target_columns(rows)
+    entries = []
+    for r_idx in range(header_idx + 1, len(rows)):
+        row = rows[r_idx]
+
+        def cell(field):
+            c = cols.get(field)
+            return row[c] if c is not None and c < len(row) else None
+        raw_path = cell("path")
+        if raw_path is None or not u_text(raw_path).strip():
+            continue
+        text_path = u_text(raw_path).strip()
+        if "/" not in text_path and not text_path.lower().startswith("http"):
+            continue
+        stt = cell("stt")
+        if stt is None or u_text(stt).strip() == "":
+            stt = len(entries) + 1
+        entries.append(TargetEntry(stt, parse_methods(cell("method") or ""), text_path,
+                                   cell("position"), r_idx + 1))
+    def header_for(field, default):
+        c = cols.get(field)
+        if header_idx >= 0 and c is not None and c < len(header_texts) and header_texts[c]:
+            return header_texts[c]
+        return default
+    headers = [header_for("stt", "STT"), header_for("method", "PROTOCOL"),
+               header_for("path", "PATH"), header_for("position", "POSITION")]
+    return TargetList(entries, source, sheet, headers)
+
+
+def coverage_rows(targets, groups):
+    """Per Excel row: (entry, [matched groups])."""
+    by_entry = {}
+    for g in groups or []:
+        e = getattr(g, "target", None)
+        if e is not None:
+            by_entry.setdefault(id(e), []).append(g)
+    return [(e, by_entry.get(id(e), [])) for e in (targets.entries if targets else [])]
+
+
 # ----------------------------------------------------------------------------- Excel export
 
 EXPORT_API_HEADER = ["STT", "Method", "Path", "Vị trí tìm thấy", "Host", "URL đầy đủ",
@@ -1244,12 +1573,39 @@ def build_xlsx(sheets):
     return buf.getvalue()
 
 
-def build_api_workbook(groups):
+COVERAGE_EXTRA_HEADER = ["Trạng thái", "Số lần bắt", "API #", "Path thực tế", "Vị trí tìm thấy", "Đánh giá"]
+COVERAGE_WIDTHS = [6, 12, 48, 44, 12, 11, 10, 48, 44, 40]
+
+
+def coverage_export_rows(targets, groups):
+    """Rows mirroring the user's file (STT, method, path, position) + what was found for each row."""
+    out = []
+    for e, found in coverage_rows(targets, groups):
+        found = sorted(found, key=lambda g: g.gid)
+        first = found[0] if found else None
+        found_positions = []
+        for g in found:
+            if g.feature_name not in found_positions:
+                found_positions.append(g.feature_name)
+        position = e.position or u"; ".join(found_positions)
+        out.append([e.stt, e.method_label(), e.path, position or None,
+                    u"Đã bắt" if found else u"Chưa bắt", len(found),
+                    u", ".join([format_api_label(g.gid) for g in found]) or None,
+                    strip_query(first.path) if first else None,
+                    u"; ".join(found_positions) or None,
+                    (getattr(first, "_audit_summary", None) or evaluate_group_audit(first)[1]) if first else None])
+    return out
+
+
+def build_api_workbook(groups, targets=None):
     api_rows, role_rows = api_export_rows(groups)
-    return build_xlsx([
-        (u"API", EXPORT_API_HEADER, api_rows, EXPORT_API_WIDTHS),
-        (u"Kết quả Role", EXPORT_ROLE_HEADER, role_rows, EXPORT_ROLE_WIDTHS),
-    ])
+    sheets = []
+    if targets is not None and len(targets):
+        sheets.append((u"Độ phủ", list(targets.headers) + COVERAGE_EXTRA_HEADER,
+                       coverage_export_rows(targets, groups), COVERAGE_WIDTHS))
+    sheets.append((u"API", EXPORT_API_HEADER, api_rows, EXPORT_API_WIDTHS))
+    sheets.append((u"Kết quả Role", EXPORT_ROLE_HEADER, role_rows, EXPORT_ROLE_WIDTHS))
+    return build_xlsx(sheets)
 
 
 def build_history_summary_text(features, groups):
@@ -1769,6 +2125,7 @@ class ApiGroup(object):
         self.orig_result.state = STATE_ORIGIN if self.has_orig_response else STATE_NOT_SENT
         self.orig_result.tab_name = repeater_tab_name(gid, method, path, "00_Original_Crawl")
         self.results = []
+        self.target = None      # TargetEntry of the imported Excel list this API matched, if any
         self._audit_level = None
         self._audit_summary = None
 
@@ -2359,6 +2716,70 @@ class ResultTableModel(AbstractTableModel):
         return ""
 
 
+class CoverageTableModel(AbstractTableModel):
+    """One row per line of the imported Excel list, with what was captured for it."""
+    COLS = ["STT", "Method", "Path (trong file)", "POSITION", "Trạng thái", "API #", "Path thực tế",
+            "Vị trí tìm thấy", "Đánh giá"]
+    FILTERS = ["Tất cả dòng", "Chưa bắt", "Đã bắt"]
+
+    def __init__(self):
+        self._rows = []
+        self._filter = 0
+
+    def reload(self, targets, groups, filter_idx=None):
+        if filter_idx is not None:
+            self._filter = filter_idx
+        rows = []
+        for e, found in coverage_rows(targets, groups):
+            if (self._filter == 1 and found) or (self._filter == 2 and not found):
+                continue
+            found = sorted(found, key=lambda g: g.gid)
+            first = found[0] if found else None
+            if first is None:
+                level, state = AUDIT_NONE, u"Chưa bắt"
+            else:
+                level = _group_level(first)
+                sent = any([r.state in (STATE_DONE, STATE_ERROR) for r in first.results])
+                state = u"Đã bắt · %s" % (u"đã gửi" if sent else u"chưa gửi")
+                if len(found) > 1:
+                    state += u" (%d lần)" % len(found)
+                if level == AUDIT_NONE:
+                    level = AUDIT_REDIRECT  # captured but not sent yet: blue, distinct from "not captured"
+            positions = []
+            for g in found:
+                if g.feature_name not in positions:
+                    positions.append(g.feature_name)
+            cells = [u_text(e.stt), e.method_label(), e.path, e.position, state,
+                     u", ".join([format_api_label(g.gid) for g in found[:4]]) + (u" ..." if len(found) > 4 else u""),
+                     strip_query(first.path) if first else u"",
+                     u"; ".join(positions),
+                     (getattr(first, "_audit_summary", None) or evaluate_group_audit(first)[1]) if first else u""]
+            rows.append((cells, level, found))
+        self._rows = rows
+        self.fireTableDataChanged()
+
+    def groups_at(self, r):
+        return self._rows[r][2] if 0 <= r < len(self._rows) else []
+
+    def audit_level_at(self, r):
+        return self._rows[r][1] if 0 <= r < len(self._rows) else AUDIT_NONE
+
+    def accent_key_at(self, r):
+        return None
+
+    def getRowCount(self):
+        return len(self._rows)
+
+    def getColumnCount(self):
+        return len(self.COLS)
+
+    def getColumnName(self, c):
+        return self.COLS[c]
+
+    def getValueAt(self, r, c):
+        return self._rows[r][0][c]
+
+
 def _mix(c1, c2, t):
     """Blend colour c1 towards c2 by t (0..1)."""
     return Color(int(c1.getRed() + (c2.getRed() - c1.getRed()) * t),
@@ -2857,6 +3278,8 @@ class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
     """
     ARC = 10
     STRONG = ("ROOT", "FOLDER", "GROUP", "LOGBRANCH", "LOGAPI", "LOGSYS")
+    report = None          # set by the extension: logs the first rendering error to Burp's Errors tab
+    _reported = False
 
     def __init__(self):
         JLabel.__init__(self)
@@ -2879,6 +3302,14 @@ class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
                 self.setText(u_text(getattr(value, "label", None) or value))
             except (Exception, Throwable):
                 pass
+            cls = HierarchyTreeRenderer
+            if not cls._reported and cls.report is not None:
+                cls._reported = True
+                try:
+                    cls.report("Tree renderer error (rows fall back to plain text):\n%s"
+                               % u_text(traceback.format_exc()))
+                except (Exception, Throwable):
+                    pass
         return self
 
     def _configure(self, tree, value, selected):
@@ -2891,15 +3322,19 @@ class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
             label = u_text(uobj) if uobj is not None else ""
         self.setText(u_text(label or ""))
         self._fill = self._edge = self._dot = None
-        bg = tree.getBackground() if tree is not None else None
-        fg = tree.getForeground() if bg is not None else None
-        if bg is None or fg is None:
+        if tree is None:
             return
+        # Some themes report no tree colours: fall back to the look-and-feel's, then plain white/black.
+        bg = (tree.getBackground() or UIManager.getColor("Tree.background")
+              or UIManager.getColor("Panel.background") or Color(255, 255, 255))
+        fg = (UIManager.getColor("Tree.textForeground") or tree.getForeground()
+              or UIManager.getColor("Label.foreground") or Color(20, 20, 20))
         pal = RowPalette.of(bg, fg)
-        font = tree.getFont()
-        if self._fonts[0] != font:
-            self._fonts = (font, font.deriveFont(Font.BOLD))
-        self.setFont(self._fonts[1] if kind in self.STRONG else font)
+        font = tree.getFont() or UIManager.getFont("Tree.font")
+        if font is not None:
+            if self._fonts[0] != font:
+                self._fonts = (font, font.deriveFont(Font.BOLD))
+            self.setFont(self._fonts[1] if kind in self.STRONG else font)
 
         fill = edge = dot = icon = None
         text = fg
@@ -3663,6 +4098,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._persist_failures = 0
 
         self.config = merge_config(self._load_json_setting(SETTINGS_KEY_CONFIG, {}))
+        self.targets = None
+        self._stale_coverage = True
+        try:
+            raw_targets = callbacks.loadExtensionSetting(SETTINGS_KEY_TARGETS)
+            if raw_targets:
+                self.targets = TargetList.from_json(raw_targets)
+        except Exception as e:
+            callbacks.printError("Could not load the stored Excel API list: %s" % u_text(e))
         regex_err = self._recompile_filters(self.config)
         try:
             stored_roles = self._load_json_setting(SETTINGS_KEY_ROLES, None)
@@ -3736,6 +4179,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._print_error("Error registering listeners:\n%s" % u_text(traceback.format_exc()))
 
         self.log("%s %s loaded - %d role(s) configured." % (EXT_NAME, EXT_VERSION, self.roles.count()))
+        HierarchyTreeRenderer.report = self._print_error
+        self._ensure_tree_renderers()
         self._start_ui_timer()
         self._refresh_feature_views()
         self.update_status()
@@ -3855,6 +4300,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._flush_log(lines)
         if self.group_model is None or self.group_table is None:
             return
+        self._ensure_tree_renderers()
         if new_groups:
             self.group_model.add_many(new_groups)
             if self.group_table.getSelectedRow() < 0 and self.group_table.getRowCount() > 0:
@@ -3868,10 +4314,27 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._stale_left = True
             self._stale_history = True
             self._stale_log = True
+            self._stale_coverage = True
         self._refresh_send_controls()
         self._refresh_stale_views(force)
         if status or structure:
             self._do_update_status()
+
+    def _ensure_tree_renderers(self):
+        """
+        Burp's customizeUiComponent (and theme switches) can replace a JTree's cell renderer with
+        Burp's own, which drops the level colours. Put ours back whenever that happens.
+        """
+        for name in ("left_hierarchy_tree", "history_tree", "log_tree"):
+            tree = getattr(self, name, None)
+            if tree is None:
+                continue
+            try:
+                if not isinstance(tree.getCellRenderer(), HierarchyTreeRenderer):
+                    tree.setCellRenderer(HierarchyTreeRenderer())
+                    tree.setRowHeight(26)
+            except (Exception, Throwable):
+                pass
 
     def _apply_dirty_groups(self, dirty, done_res):
         cur = self.result_model.group()
@@ -3906,6 +4369,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             if self._rebuild_tree("history", tree, self.history_tree_model, label, stats, force):
                 self._stale_history = False
                 self._refresh_history_summary_only()
+        table = getattr(self, "coverage_table", None)
+        if self._stale_coverage and table is not None and table.isShowing():
+            self._stale_coverage = False
+            self._reload_coverage()
         tree = getattr(self, "log_tree", None)
         if self._stale_log and tree is not None and tree.isShowing():
             if self._rebuild_tree("log", tree, self.log_tree_model, "Nhật ký", stats, force,
@@ -4194,7 +4661,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         with self._cfg_lock:
             old_threads = self.config["threads"]
             was_sending = self.config.get("auto_send", False)
+            old_prefix = self.config.get("target_allow_prefix", False)
             self.config = new_cfg
+        if old_prefix != new_cfg.get("target_allow_prefix", False) and self.targets:
+            self._retag_groups()
         if was_sending and not new_cfg.get("auto_send", False):
             self.cancel_pending_sends("Đã DỪNG gửi")
         n = new_cfg["threads"]
@@ -4207,6 +4677,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 pool.setCorePoolSize(n)
                 pool.setMaximumPoolSize(n)
         self.callbacks.saveExtensionSetting(SETTINGS_KEY_CONFIG, json.dumps(new_cfg))
+        if not getattr(self, "_collecting_settings", False):
+            # Changed from code (send toggle, Excel mode, ...): make the form show the real config,
+            # otherwise the next form edit would write the stale widget values back.
+            ui_call(lambda: self._sync_settings_ui(new_cfg))
         self.update_status()
         return err
 
@@ -4235,12 +4709,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                         self._skipped_count += 1
                         self._last_skip_reason = "static extension"
                     return
-                rx = self._api_regex
-                if cfg.get("api_regex_enabled") and rx is not None and not rx.search(strip_query(fast_path)):
-                    with self._state_lock:
-                        self._skipped_count += 1
-                        self._last_skip_reason = "API path regex mismatch"
-                    return
+                targets = self.targets
+                if cfg.get("target_only") and targets:
+                    # The Excel list replaces the path regex: only documented APIs are copied.
+                    if targets.match(fast_method, fast_path, cfg.get("target_allow_prefix")) is None:
+                        with self._state_lock:
+                            self._skipped_count += 1
+                            self._last_skip_reason = "không có trong danh sách Excel"
+                        return
+                else:
+                    rx = self._api_regex
+                    if cfg.get("api_regex_enabled") and rx is not None and not rx.search(strip_query(fast_path)):
+                        with self._state_lock:
+                            self._skipped_count += 1
+                            self._last_skip_reason = "API path regex mismatch"
+                        return
             service = messageInfo.getHttpService()
             resp = messageInfo.getResponse()
             req_copy = Arrays.copyOf(req, len(req))
@@ -4304,8 +4787,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return items
 
     # -------------------------------------------------------------- filtering
-    def _filter_reason(self, cfg, url, method, path):
+    def _filter_reason(self, cfg, url, method, path, target=None):
         """None if the request passes every filter, otherwise the reason it was skipped."""
+        target_mode = bool(cfg.get("target_only") and self.targets)
         if cfg["ignore_options_head"] and method in ("OPTIONS", "HEAD"):
             return "method %s ignored" % method
         if cfg["in_scope_only"] and not self.callbacks.isInScope(url):
@@ -4315,7 +4799,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             rx = self._api_regex
         if cfg["ignore_static"] and is_static_path(path, exts):
             return "static extension"
-        if cfg["api_regex_enabled"] and rx is not None and not rx.search(strip_query(path)):
+        if target_mode:
+            if target is None:
+                return "không có trong danh sách Excel"
+        elif cfg["api_regex_enabled"] and rx is not None and not rx.search(strip_query(path)):
             return "API path regex mismatch"
         return None
 
@@ -4330,9 +4817,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         method = ("%s" % (info.getMethod() or "GET")).upper()
         path = url.getFile() or "/"
         feat = self.get_feature(target_fid) or self.active_feature()
+        targets = self.targets
+        target = targets.match(method, path, cfg.get("target_allow_prefix")) if targets else None
+        if target is not None and target.position and cfg.get("target_use_position", True):
+            feat = self.find_or_create_feature_by_path(target.position)
 
         if apply_filters:
-            reason = self._filter_reason(cfg, url, method, path)
+            reason = self._filter_reason(cfg, url, method, path, target)
             if reason:
                 with self._state_lock:
                     self._skipped_count += 1
@@ -4371,6 +4862,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         group = ApiGroup(gid, service, method, path, "%s" % url, req, resp, source,
                          feat.fid, feat.name)
         group.message_builder = self._build_message
+        group.target = target
         if resp is not None:
             try:
                 rinfo = self.helpers.analyzeResponse(resp)
@@ -4385,8 +4877,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         with self._ui_lock:
             self._p_new.append(group)
-        self.log("Bắt từ %s: %s %s -> 1 API gốc + %d role" %
-                 (source, method, url, len(group.results)), gid=gid)
+        self.log("Bắt từ %s: %s %s -> 1 API gốc + %d role%s" %
+                 (source, method, url, len(group.results),
+                  (" (khớp dòng STT %s trong file Excel)" % target.stt) if target is not None else ""), gid=gid)
         if cfg["auto_repeater"]:
             self._dispatch_repeater(group, group.results)
         if cfg["auto_send"]:
@@ -4688,7 +5181,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         left_header.add(self.btn_path_menu)
         left_header.add(self.lbl_feature_counter)
 
-        right_header = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 1))
+        # Second header row: never competes for width with the controls above (no overlap).
+        right_header = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
         self.status_label = JLabel("")
         self.status_label.setFont(Font("Dialog", Font.PLAIN, 11))
         right_header.add(self.status_label)
@@ -4700,8 +5194,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                                 AuditTableRenderer.BG_OK, AuditTableRenderer.FG_OK))
 
         self._rebuild_subfolder_chips(self.active_feature().name)
-        top_container.add(left_header, BorderLayout.WEST)
-        top_container.add(right_header, BorderLayout.EAST)
+        top_container.add(left_header, BorderLayout.NORTH)
+        top_container.add(right_header, BorderLayout.SOUTH)
         self.main_panel.add(top_container, BorderLayout.NORTH)
 
         self.tabs = JTabbedPane()
@@ -4710,11 +5204,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.tabs.addTab("Roles (Profiles)", self._build_roles_tab())
         self.tabs.addTab("Cấu hình & Bộ lọc", self._build_settings_tab(cfg))
         self.tabs.addTab("Log", self._build_log_tab())
+        self.tabs.addTab("Độ phủ Excel", self._build_coverage_tab())
         # A tree that was hidden while APIs arrived is rebuilt the moment its tab is opened.
         self.tabs.addChangeListener(_Change(lambda e: self._ui_tick(None)))
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
         try:
             self.callbacks.customizeUiComponent(self.main_panel)
+            self._ensure_tree_renderers()
         except (Throwable, Exception):
             try:
                 self.callbacks.printError("Warning: customizeUiComponent failed:\n%s" % u_text(traceback.format_exc()))
@@ -4953,6 +5449,197 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         panel.add(master_split, BorderLayout.CENTER)
         return panel
 
+    # ---- "Độ phủ Excel" tab: which documented APIs were captured
+    def _build_coverage_tab(self):
+        panel = JPanel(BorderLayout(4, 4))
+        bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        btn_load = JButton("Nạp file Excel (.xlsx)...", actionPerformed=self._on_load_targets)
+        btn_load.setFont(btn_load.getFont().deriveFont(Font.BOLD))
+        btn_load.setBackground(Color(219, 39, 119))
+        btn_load.setForeground(Color(255, 255, 255))
+        bar.add(btn_load)
+        self.btn_target_clear = JButton("Bỏ danh sách", actionPerformed=self._on_clear_targets)
+        bar.add(self.btn_target_clear)
+        btn_export = JButton("Xuất Excel độ phủ (.xlsx)...", actionPerformed=self._on_export_excel)
+        bar.add(btn_export)
+        bar.add(JButton("Gửi các API đã bắt trong danh sách", actionPerformed=self._on_send_target_groups))
+        self.cb_target_only_mirror = JCheckBox("Chỉ bắt API có trong danh sách",
+                                               self.config.get("target_only", False))
+        self.cb_target_only_mirror.addActionListener(_Action(self._on_target_only_mirror))
+        bar.add(self.cb_target_only_mirror)
+        bar.add(JLabel("   Xem:"))
+        self.cb_coverage_filter = JComboBox(CoverageTableModel.FILTERS)
+        self.cb_coverage_filter.addActionListener(_Action(lambda e: self._reload_coverage()))
+        bar.add(self.cb_coverage_filter)
+
+        self.lbl_coverage = JLabel(" ")
+        self.lbl_coverage.setFont(_font_resized(self.lbl_coverage.getFont(), Font.BOLD, 1))
+        self.lbl_coverage.setBorder(BorderFactory.createEmptyBorder(2, 8, 4, 8))
+        top = JPanel(BorderLayout())
+        top.add(bar, BorderLayout.NORTH)
+        top.add(self.lbl_coverage, BorderLayout.SOUTH)
+        panel.add(top, BorderLayout.NORTH)
+
+        self.coverage_model = CoverageTableModel()
+        self.coverage_table = JTable(self.coverage_model)
+        style_data_table(self.coverage_table)
+        self.coverage_table.setAutoCreateRowSorter(True)
+        self.coverage_table.addMouseListener(_DoubleClick(self._on_coverage_jump))
+        renderer = AuditTableRenderer(self.coverage_model, audit_col=8, method_col=1, bold_cols=(0, 4))
+        for col, width in ((0, 50), (1, 80), (2, 300), (3, 220), (4, 150), (5, 110), (6, 260), (7, 220), (8, 240)):
+            column = self.coverage_table.getColumnModel().getColumn(col)
+            column.setPreferredWidth(width)
+            column.setCellRenderer(renderer)
+        panel.add(JScrollPane(self.coverage_table), BorderLayout.CENTER)
+        self.coverage_panel = panel
+        self._refresh_target_controls()
+        return panel
+
+    def _reload_coverage(self):
+        model = getattr(self, "coverage_model", None)
+        if model is None:
+            return
+        groups = self.group_model.all_groups() if self.group_model is not None else []
+        model.reload(self.targets, groups, self.cb_coverage_filter.getSelectedIndex())
+        self._refresh_target_controls(groups)
+
+    def _refresh_target_controls(self, groups=None):
+        targets = self.targets
+        loaded = bool(targets)
+        info = getattr(self, "lbl_target_info", None)
+        if info is not None:
+            info.setText((u"Đã nạp %d API từ %s (sheet %s)" % (len(targets), targets.source, targets.sheet))
+                         if loaded else u"Chưa nạp file - extension bắt API như bình thường")
+        for name in ("cb_target_only", "cb_target_only_mirror", "btn_target_clear"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(loaded)
+        mirror = getattr(self, "cb_target_only_mirror", None)
+        if mirror is not None:
+            mirror.setSelected(bool(self.config.get("target_only", False)))
+        label = getattr(self, "lbl_coverage", None)
+        if label is None:
+            return
+        if not loaded:
+            label.setText(u"Chưa nạp file. Bấm 'Nạp file Excel' - file cần các cột STT | PROTOCOL (method) | PATH | "
+                          u"POSITION (tùy chọn); tham số {id} [id] (id) <id> :id * trong path được hiểu là giá trị bất kỳ.")
+            return
+        if groups is None:
+            groups = self.group_model.all_groups() if self.group_model is not None else []
+        hit = len([1 for e, found in coverage_rows(targets, groups) if found])
+        total = len(targets)
+        mode = u"chỉ bắt API trong danh sách" if self.config.get("target_only") else u"bắt mọi API (danh sách chỉ để đối chiếu)"
+        label.setText(u"%s  ·  %d API  ·  Đã bắt %d/%d (%d%%)  ·  Còn %d chưa bắt  ·  Chế độ: %s"
+                      % (targets.source, total, hit, total, (hit * 100 // total) if total else 0, total - hit, mode))
+
+    def set_targets(self, targets):
+        self.targets = targets if targets else None
+        try:
+            self.callbacks.saveExtensionSetting(SETTINGS_KEY_TARGETS, targets.to_json() if targets else "")
+        except (Throwable, Exception):
+            self._print_error("Could not save the Excel API list:\n%s" % u_text(traceback.format_exc()))
+        self._retag_groups()
+
+    def _retag_groups(self):
+        """Match every already captured API against the current list (after load / option change)."""
+        if self.group_model is None:
+            return
+        allow_prefix = self.config.get("target_allow_prefix", False)
+        for g in self.group_model.all_groups():
+            g.target = self.targets.match(g.method, g.path, allow_prefix) if self.targets else None
+        self._stale_coverage = True
+        self._refresh_feature_views()
+
+    def _on_load_targets(self, event):
+        chooser = JFileChooser()
+        chooser.setFileFilter(FileNameExtensionFilter("Excel (.xlsx)", "xlsx"))
+        if chooser.showOpenDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
+            return
+        f = chooser.getSelectedFile()
+        try:
+            sheet_names = xlsx_sheet_names(f.getAbsolutePath())
+            index = 0
+            if len(sheet_names) > 1:
+                pick = JOptionPane.showInputDialog(
+                    self.main_panel, "File có %d sheet. Chọn sheet chứa danh sách API:" % len(sheet_names),
+                    EXT_NAME, JOptionPane.QUESTION_MESSAGE, None, sheet_names, sheet_names[0])
+                if pick is None:
+                    return
+                index = list(sheet_names).index(pick)
+            sheet, rows = read_xlsx_rows(f.getAbsolutePath(), index)
+            targets = build_target_list(rows, f.getName(), sheet)
+        except (Throwable, Exception) as e:
+            JOptionPane.showMessageDialog(self.main_panel, "Không đọc được file Excel: %s" % u_text(e), EXT_NAME,
+                                          JOptionPane.ERROR_MESSAGE)
+            return
+        if not len(targets):
+            JOptionPane.showMessageDialog(
+                self.main_panel, "Không tìm thấy dòng API nào. File cần có cột PATH (hoặc URL / Endpoint) chứa "
+                                 "đường dẫn bắt đầu bằng '/'.", EXT_NAME, JOptionPane.WARNING_MESSAGE)
+            return
+        self.set_targets(targets)
+        groups = self.group_model.all_groups()
+        already = len([1 for e, found in coverage_rows(targets, groups) if found])
+        self.log("Đã nạp %d API từ file Excel %s (sheet %s); khớp sẵn %d API đã bắt."
+                 % (len(targets), targets.source, targets.sheet, already))
+        choice = JOptionPane.showConfirmDialog(
+            self.main_panel,
+            "Đã nạp %d API từ %s.\n%d API trong danh sách đã được bắt từ trước.\n\n"
+            "Bật chế độ 'Chỉ bắt API có trong danh sách'?\n(Không: vẫn bắt mọi API, danh sách chỉ để theo dõi độ phủ)"
+            % (len(targets), targets.source, already), EXT_NAME, JOptionPane.YES_NO_OPTION)
+        self._set_target_only(choice == JOptionPane.YES_OPTION)
+        self.tabs.setSelectedComponent(self.coverage_panel)
+
+    def _on_clear_targets(self, event):
+        if not self.targets:
+            return
+        if JOptionPane.showConfirmDialog(self.main_panel, "Bỏ danh sách API từ file %s?" % self.targets.source,
+                                         EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+            return
+        self._set_target_only(False)
+        self.set_targets(None)
+        self.log("Đã bỏ danh sách API từ file Excel.")
+        self._ui_tick(None)
+
+    def _set_target_only(self, enabled):
+        cb = getattr(self, "cb_target_only", None)
+        if cb is not None:
+            cb.setSelected(bool(enabled))
+            self._on_settings_changed(None)
+        else:
+            cfg = self.get_config()
+            cfg["target_only"] = bool(enabled)
+            self.apply_config(cfg)
+        self._stale_coverage = True
+        self._ui_tick(None)
+
+    def _on_target_only_mirror(self, event):
+        self._set_target_only(self.cb_target_only_mirror.isSelected())
+
+    def _on_send_target_groups(self, event):
+        groups = [g for g in self.group_model.all_groups() if getattr(g, "target", None) is not None]
+        pending = [(g, [r for r in g.results if r.state == STATE_NOT_SENT]) for g in groups]
+        pending = [(g, rs) for g, rs in pending if rs]
+        if not pending:
+            JOptionPane.showMessageDialog(self.main_panel, "Không có API nào trong danh sách đang chờ gửi.",
+                                          EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        for g, rs in pending:
+            self.replay(g, rs)
+        self.log("Xếp hàng gửi %d API thuộc danh sách Excel." % len(pending))
+
+    def _on_coverage_jump(self):
+        vr = self.coverage_table.getSelectedRow()
+        if vr < 0:
+            return
+        groups = self.coverage_model.groups_at(self.coverage_table.convertRowIndexToModel(vr))
+        if not groups:
+            return
+        self.group_model.set_feature_filter(None)
+        self.group_model.set_hierarchy_filter(None)
+        self.tabs.setSelectedIndex(0)
+        self._select_group_in_table(groups[0])
+
     # ---- Log tab: grouped, collapsed, loaded on expand
     def _build_log_tab(self):
         panel = JPanel(BorderLayout(4, 4))
@@ -5023,7 +5710,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def _on_export_excel(self, event):
         groups = self.group_model.all_groups() if self.group_model is not None else []
-        if not groups:
+        if not groups and not self.targets:
             JOptionPane.showMessageDialog(self.main_panel, "Chưa có API nào để xuất.", EXT_NAME,
                                           JOptionPane.INFORMATION_MESSAGE)
             return
@@ -5040,7 +5727,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
         try:
-            data = build_api_workbook(groups)
+            data = build_api_workbook(groups, self.targets)
             out = open(f.getAbsolutePath(), "wb")
             try:
                 out.write(data)
@@ -5190,6 +5877,15 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                  cfg.get("include_feature_in_tab", False))
         self.tf_pathlen = self._num_field(cfg["short_path_len"])
 
+        self.cb_target_only = check("Chỉ bắt API có trong danh sách Excel (thay cho bộ lọc Regex)",
+                                    cfg.get("target_only", False))
+        self.cb_target_position = check("Tự xếp API vào nhánh theo cột POSITION của file (nếu ô đó có giá trị)",
+                                        cfg.get("target_use_position", True))
+        self.cb_target_prefix = check("Cho phép path thực tế có thêm tiền tố phía trước (vd /api/v1 + /apt/test)",
+                                      cfg.get("target_allow_prefix", False))
+        self.btn_target_load = JButton("Nạp file Excel (.xlsx)...", actionPerformed=self._on_load_targets)
+        self.lbl_target_info = JLabel(" ")
+
         content = JPanel()
         content.setLayout(BoxLayout(content, BoxLayout.Y_AXIS))
         content.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12))
@@ -5216,7 +5912,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
               ("field", "Tự gửi lại khi gặp 429 / 503 (lần):", self.tf_retries, None),
               ("field", "Tổng số luồng gửi (mọi host):", self.tf_threads, None),
               ("check", self.cb_store_disk)]),
-            ("4.  Burp Repeater & tên tab", (234, 88, 12),
+            ("4.  Danh sách API từ file Excel (tùy chọn)", (219, 39, 119),
+             "Nạp file .xlsx gồm các cột STT | PROTOCOL (method) | PATH | POSITION. Tham số trong path như "
+             "{id}, [id], (id), <id>, :id, * được hiểu là giá trị bất kỳ. Không nạp file thì extension chạy như bình thường. "
+             "Xem tiến độ ở tab 'Độ phủ Excel'.",
+             [("pair", self.btn_target_load, self.lbl_target_info),
+              ("check", self.cb_target_only), ("check", self.cb_target_position),
+              ("check", self.cb_target_prefix)]),
+            ("5.  Burp Repeater & tên tab", (234, 88, 12),
              "Cách đặt tên tab khi đẩy sang Burp Repeater.",
              [("check", self.cb_number), ("check", self.cb_feat_tab),
               ("field", "Độ dài tối đa của path trong tên tab:", self.tf_pathlen, None)]),
@@ -5358,6 +6061,36 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         finally:
             self._syncing_settings = False
 
+    def _sync_settings_ui(self, cfg):
+        """Show `cfg` in every settings widget (setSelected/setText fire no action events)."""
+        if getattr(self, "cb_send_profile", None) is None:
+            return
+        self._syncing_settings = True
+        try:
+            for name, key in (("cb_capture", "capture_enabled"), ("cb_auto_send", "auto_send"),
+                              ("cb_auto_repeater", "auto_repeater"), ("cb_scope", "in_scope_only"),
+                              ("cb_top_scope", "in_scope_only"), ("cb_static", "ignore_static"),
+                              ("cb_regex", "api_regex_enabled"), ("cb_top_regex", "api_regex_enabled"),
+                              ("cb_options", "ignore_options_head"), ("cb_dedup", "dedup"),
+                              ("cb_dedup_ids", "dedup_normalize_ids"), ("cb_dedup_feature", "dedup_per_feature"),
+                              ("cb_number", "number_roles_in_tab"), ("cb_feat_tab", "include_feature_in_tab"),
+                              ("cb_store_disk", "store_on_disk"), ("cb_target_only", "target_only"),
+                              ("cb_target_only_mirror", "target_only"),
+                              ("cb_target_position", "target_use_position"),
+                              ("cb_target_prefix", "target_allow_prefix")):
+                widget = getattr(self, name, None)
+                if widget is not None and widget.isSelected() != bool(cfg.get(key)):
+                    widget.setSelected(bool(cfg.get(key)))
+            for name, key in (("tf_static", "static_ext"), ("tf_regex", "api_regex")):
+                widget = getattr(self, name, None)
+                if widget is not None and u_text(widget.getText()) != u_text(cfg.get(key)):
+                    widget.setText(u_text(cfg.get(key)))
+        finally:
+            self._syncing_settings = False
+        self._sync_settings_fields(cfg)
+        self._refresh_send_controls()
+        self._refresh_target_controls()
+
     def _on_send_profile_changed(self, event):
         if getattr(self, "_syncing_settings", False):
             return
@@ -5398,6 +6131,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "send_jitter_pct": jitter,
             "host_concurrency": conc,
             "max_retries": self._read_int(self.tf_retries, "max_retries"),
+            "target_only": self.cb_target_only.isSelected(),
+            "target_use_position": self.cb_target_position.isSelected(),
+            "target_allow_prefix": self.cb_target_prefix.isSelected(),
         }
 
     def _on_top_filter_toggled(self, event):
@@ -5414,7 +6150,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.cb_top_scope.setSelected(self.cb_scope.isSelected())
         if getattr(self, "cb_top_regex", None) is not None:
             self.cb_top_regex.setSelected(self.cb_regex.isSelected())
-        err = self.apply_config(self._collect_settings())
+        self._collecting_settings = True
+        try:
+            err = self.apply_config(self._collect_settings())
+        finally:
+            self._collecting_settings = False
         if err and self.cb_regex.isSelected():
             self.regex_error.setText("Regex không hợp lệ - bộ lọc path đang tắt: %s" % err)
         else:
@@ -5422,6 +6162,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._sync_settings_fields(self.get_config())
         self.lbl_settings_saved.setText("Đã lưu lúc %s" % time.strftime("%H:%M:%S"))
         self._refresh_send_controls()
+        self._refresh_target_controls()
 
     def _on_restore_defaults(self, event):
         d = merge_config({})
@@ -5442,6 +6183,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.cb_auto_repeater.setSelected(d["auto_repeater"])
             self.cb_store_disk.setSelected(d["store_on_disk"])
             self.cb_send_profile.setSelectedIndex(self._profile_index(d["send_profile"]))
+            self.cb_target_only.setSelected(d["target_only"])
+            self.cb_target_position.setSelected(d["target_use_position"])
+            self.cb_target_prefix.setSelected(d["target_allow_prefix"])
         finally:
             self._syncing_settings = False
         self._sync_settings_fields(d)
@@ -5982,10 +6726,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             stats = HierarchyStats(self.features_list(), [])
         act = self.active_feature()
         mode_str = "Gửi: BẬT" if cfg.get("auto_send") else "Chỉ crawl"
+        excel = ""
+        if self.targets:
+            excel = " | Excel: %d/%d" % (len([e for e in self.targets.entries if id(e) in stats.target_hits]),
+                                         len(self.targets))
         self.status_label.setText(
-            "%s | Roles: %d/%d | Nhánh: %d | API: %d (Vàng: %d)"
+            "%s | Roles: %d/%d | Nhánh: %d | API: %d (Vàng: %d)%s"
             % (mode_str, self.roles.enabled_count(), self.roles.count(),
-               len(self.features_list()), stats.total, stats.info_exact))
+               len(self.features_list()), stats.total, stats.info_exact, excel))
         if getattr(self, "lbl_active_feature", None) is not None:
             parts = split_hierarchy_path(act.name)
             self.lbl_active_feature.setText("Path [#%d | %d cấp]:" % (act.fid, len(parts)))
