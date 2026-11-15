@@ -927,11 +927,12 @@ class EngineTests(unittest.TestCase):
 
     def test_swing_constructors_avoid_jython_unsafe_listener_kwargs(self):
         import ast
-        src_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "theMythOfCrawl.py")
-        with open(src_path, "rb") as fh:
-            tree = ast.parse(fh.read().decode("utf-8"))
+        nodes = []
+        for name in ("theMythOfCrawl.py", "tmoc_core.py"):
+            with open(os.path.join(ROOT, name), "rb") as fh:
+                nodes.extend(ast.walk(ast.parse(fh.read().decode("utf-8"))))
         unsafe = []
-        for node in ast.walk(tree):
+        for node in nodes:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 fname = node.func.id
                 kw_names = {kw.arg for kw in node.keywords if kw.arg}
@@ -942,6 +943,14 @@ class EngineTests(unittest.TestCase):
                 if fname == "JSpinner" and "stateChanged" in kw_names:
                     unsafe.append((node.lineno, fname, "stateChanged"))
         self.assertEqual(unsafe, [])
+
+    def test_each_module_stays_well_below_the_jython_size_limit(self):
+        # Jython compiles one .py file into one Java class; the single-file version broke at ~11500 lines
+        # ("Module or method too large"). Keep every module far below that, split again if needed.
+        for name in ("theMythOfCrawl.py", "tmoc_core.py"):
+            with open(os.path.join(ROOT, name), "rb") as fh:
+                lines = fh.read().decode("utf-8").count("\n")
+            self.assertLess(lines, 9000, "%s has %d lines: move code to another module" % (name, lines))
 
     def test_hierarchy_tree_node_and_renderer_safety(self):
         node = tm.HierarchyTreeNode("ROOT", "", "Tất cả Group & API", audit_level=tm.AUDIT_NONE)
@@ -1658,6 +1667,160 @@ class ExcelHitTests(unittest.TestCase):
         self.assertIn(u"POST [Excel #200] /v1/transfer", label)
         self.assertIn(u"API gốc", label)
         self.assertNotIn(u"Chỉ", label)
+
+
+class PlacementTests(unittest.TestCase):
+    """Fixed capture destination, pending confirmation, moves with audit / revert, 'giữ chỗ'."""
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def groups(self):
+        out = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (out.append(g), orig(g, i, r, c))[1]
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False, "auto_send": False})
+        self.ext.apply_config(cfg)
+        return out
+
+    def go(self, path):
+        feat = self.ext.find_or_create_feature_by_path(path, make_active=True)
+        self.ext.set_active_feature(feat.fid)
+
+    def tick(self):
+        self.ext._ui_tick(None)
+
+    def actions(self):
+        return [e["action"] for e in self.ext.places.log]
+
+    def test_new_api_waits_for_confirmation_in_the_destination(self):
+        groups = self.groups()
+        self.go("/ > a > b")
+        self.capture()
+        self.tick()
+        g = groups[0]
+        self.assertTrue(g.pending)
+        self.assertEqual(g.feature_name, "/ > a > b")
+        self.assertEqual(tm.display_level(g), tm.AUDIT_PENDING)
+        self.assertIsNone(self.ext.places.get(g.book_key)["place"])     # not remembered until confirmed
+        self.assertEqual(self.ext.confirm_groups([g]), 1)
+        self.assertFalse(g.pending)
+        self.assertEqual(self.ext.places.get(g.book_key)["place"], "/ > a > b")
+        self.assertEqual(self.actions(), ["pending", "confirm"])
+
+    def test_confirmation_can_be_switched_off(self):
+        cfg = self.ext.get_config()
+        cfg["confirm_new_apis"] = False
+        self.ext.apply_config(cfg)
+        groups = self.groups()
+        self.capture()
+        self.assertFalse(groups[0].pending)
+        self.assertEqual(self.ext.places.get(groups[0].book_key)["place"], groups[0].feature_name)
+
+    def test_move_many_then_revert_with_audit(self):
+        groups = self.groups()
+        self.go("/ > a")
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/other"))
+        self.tick()
+        self.assertEqual(self.ext.move_groups_to_path(groups, "/ > x > y"), 2)
+        self.assertEqual([g.feature_name for g in groups], ["/ > x > y"] * 2)
+        self.assertFalse(any([g.pending for g in groups]))                 # an explicit move confirms
+        self.assertEqual(self.ext.places.get(groups[0].book_key)["place"], "/ > x > y")
+        self.ext.move_groups_to_path(groups[:1], "/ > z")
+        self.assertEqual(self.ext.revert_groups(groups[:1]), 1)
+        self.assertEqual(groups[0].feature_name, "/ > x > y")
+        self.assertEqual(self.ext.revert_groups(groups[:1]), 1)
+        self.assertEqual(groups[0].feature_name, "/ > a")
+        self.assertEqual(self.ext.revert_groups(groups[:1]), 0)               # nothing older
+        moves = [e for e in self.ext.places.log if e["gid"] == groups[0].gid and e["action"] in ("move", "revert")]
+        self.assertEqual([(e["action"], e["src"], e["dst"]) for e in moves],
+                         [("move", "/ > a", "/ > x > y"), ("move", "/ > x > y", "/ > z"),
+                          ("revert", "/ > z", "/ > x > y"), ("revert", "/ > x > y", "/ > a")])
+        ev = [e for e in self.ext.places.log if e["action"] == "move" and e["gid"] == groups[1].gid][0]
+        self.assertIn("/ > a", self.ext.revert_event(ev))
+        self.assertEqual(groups[1].feature_name, "/ > a")
+
+    def test_deleted_api_returns_to_its_old_place_and_shows_where_it_was_met(self):
+        groups = self.groups()
+        self.go("/ > a > b")
+        self.capture()
+        self.tick()
+        self.ext.confirm_groups(groups)
+        old = groups[0]
+        self.ext.group_model.remove_groups([old])
+        self.ext.on_groups_removed([old])
+        rec = self.ext.places.get(old.book_key)
+        self.assertEqual((rec["place"], rec["gid"], rec["deleted"]), ("/ > a > b", None, 1))
+        # crawl again from another branch: it comes back to / > a > b, waiting, with both places
+        self.go("/ > s > f")
+        self.capture()
+        self.tick()
+        g = groups[1]
+        self.assertEqual(g.feature_name, "/ > a > b")
+        self.assertTrue(g.pending)
+        self.assertEqual(g.place_hint["found"], "/ > s > f")
+        self.assertFalse(g.place_hint["old_missing"])
+        self.assertEqual(self.actions()[-1], "return")
+        # choose the new place instead
+        self.ext.move_groups_to_path([g], g.place_hint["found"])
+        self.assertEqual(self.ext.places.get(g.book_key)["place"], "/ > s > f")
+
+    def test_old_branch_deleted_is_recreated_and_clear_all_keeps_places(self):
+        groups = self.groups()
+        self.go("/ > a > b")
+        self.capture()
+        self.tick()
+        self.ext.confirm_groups(groups)
+        self.ext.delete_hierarchy_prefix("/ > a", delete_apis=True)
+        self.assertIsNone(self.ext.feature_by_name("/ > a > b"))
+        self.ext.on_groups_removed(self.ext.group_model.all_groups(), u"Xóa toàn bộ")
+        self.ext.group_model.clear()
+        with self.ext._state_lock:
+            self.ext._seen_keys.clear()
+        self.go("/ > new")
+        self.capture()
+        self.tick()
+        g = groups[-1]
+        self.assertEqual(g.feature_name, "/ > a > b")
+        self.assertTrue(g.place_hint["old_missing"])
+        self.assertIsNotNone(self.ext.feature_by_name("/ > a > b"))
+
+    def test_places_survive_reload_and_can_be_edited(self):
+        groups = self.groups()
+        self.go("/ > a > b")
+        self.capture()
+        self.tick()
+        self.ext.confirm_groups(groups)
+        key = groups[0].book_key
+        self.ext._save_places(True)
+        book = tm.PlacementBook()
+        book.load_json(self.cb.settings[tm.SETTINGS_KEY_PLACES])
+        self.assertEqual(book.get(key)["place"], "/ > a > b")
+        self.assertIsNone(book.get(key)["gid"])
+        self.assertTrue(self.ext.edit_place(key, "/ > c"))
+        ev = self.ext.places.log[-1]
+        self.assertEqual((ev["action"], ev["src"], ev["dst"]), ("edit", "/ > a > b", "/ > c"))
+        self.ext.revert_event(ev)
+        self.assertEqual(self.ext.places.get(key)["place"], "/ > a > b")
+        manual = self.ext.add_manual_place("GET", "api.example.test", "/v1/manual", "/ > m")
+        self.assertEqual(self.ext.places.get(manual)["place"], "/ > m")
+        self.assertTrue(self.ext.forget_place(manual))
+        self.assertIsNone(self.ext.places.get(manual))
+        # renaming a branch renames the remembered places too
+        self.ext.rename_hierarchy_prefix("/ > a", "/ > A2")
+        self.assertEqual(self.ext.places.get(key)["place"], "/ > A2 > b")
+
+    def test_skipped_duplicates_are_counted_and_recapture_is_allowed(self):
+        groups = self.groups()
+        self.capture()
+        self.capture()
+        self.capture()
+        rec = self.ext.places.get(groups[0].book_key)
+        self.assertEqual((rec["seen"], rec["skipped"]), (3, 2))
+        self.assertEqual(self.ext.allow_recapture(groups[0].book_key), 1)
+        self.capture()
+        self.assertEqual(len(groups), 2)
 
 if __name__ == "__main__":
     unittest.main()

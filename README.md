@@ -11,6 +11,10 @@ For every API endpoint it matches, the extension makes **one copy of the request
 
 ## 1. Setup
 
+> **Từ v1.11 extension gồm 2 file: `theMythOfCrawl.py` (file nạp vào Burp) và `tmoc_core.py`.**
+> Giữ 2 file trong cùng một thư mục (cứ `git pull` cả repo) và chỉ chọn `theMythOfCrawl.py` khi Add extension.
+> Lý do: Jython biên dịch mỗi file .py thành một class Java, và một class không được vượt giới hạn kích thước của JVM.
+
 1. **Get Jython standalone.** Download `jython-standalone-2.7.3.jar` (or newer 2.7.x) from https://www.jython.org/download.
 2. **Point Burp at Jython.** Go to Burp → **Extensions → Extensions settings** (older builds: *Extender → Options*) → **Python environment** → *Location of Jython standalone JAR file* → select the jar.
 3. **Load the extension.** Go to **Extensions → Installed → Add**:
@@ -160,6 +164,28 @@ How to read results: a low-privilege role that gets a `2xx` with a body length c
 - **Đối chiếu Excel chính xác hơn:** chuẩn hóa hai phía (bỏ host / query / `;jsessionid`, gộp `//`, giải mã `%XX` trừ `%2F`), số / UUID trong file được coi là tham số (tùy chọn), dòng có query (`?type=a`) và dòng có host (URL đầy đủ) được ưu tiên khi khớp, path cụ thể thắng path có tham số. Tab Độ phủ có cột gợi ý gần đúng (khác 1 đoạn, thiếu tiền tố), đếm dòng trùng và sheet `API ngoài danh sách`.
 - **Tách cả extension ra cửa sổ riêng:** nút `🗗 Tách ra cửa sổ riêng` ở thanh trên; đóng cửa sổ để gắn lại vào tab Burp.
 - **Tab 🌳 Cây Sub-folder** (cả khi mở cửa sổ riêng) có khung Request / Response bên dưới giống Proxy history: chọn API → xem API gốc, chọn role → xem role đó.
+
+### 2.7 Đích bắt, chờ xác nhận, chuyển / hoàn tác, giữ chỗ (v1.11)
+
+- **➜ Request mới sẽ vào:** thanh thứ 2 ở trên cùng luôn hiện đích của request mới. Đích chỉ đổi khi bạn chọn lại
+  (nút cam: danh sách đường dẫn có lọc / nhập mới; `🌳 Lấy nhánh đang chọn trong cây`; `＋ Nhánh mới...`;
+  chuột phải nhánh → `Đặt làm ĐÍCH`). Bấm chọn chỗ khác trong cây / bảng **không** đổi đích.
+- **⏳ Chờ xác nhận** (tùy chọn `Hỏi xác nhận vị trí API mới`, mặc định bật): API mới nằm trong nhánh đích nhưng
+  màu xám. Xác nhận từng API, nhiều API (Ctrl / Shift + click trong cây hoặc bảng), cả nhánh hoặc tất cả
+  (nút `⏳ Chờ xác nhận: N`). Chuyển sang đường dẫn khác cũng tính là xác nhận.
+- **↪ Chuyển / ↶ Hoàn tác:** chọn nhiều API → chuyển sang đường dẫn khác; `Về vị trí trước` quay lại từng bước.
+  Mọi thay đổi ghi vào nhật ký.
+- **Giữ chỗ:** mỗi endpoint (method + host + path) nhớ vị trí đã xác nhận, kể cả sau khi xóa API, `Xóa toàn bộ`,
+  reset dedup hay nạp lại extension. Khi gặp lại, API **quay về chỗ cũ** (nhánh cũ đã bị xóa thì được tạo lại),
+  chờ xác nhận, và có 2 dòng con: `📍 Vị trí cũ` và `🆕 Vừa gặp tại ...` (chuột phải để giữ / chuyển).
+  Nhánh nào có API đã xóa sẽ hiện `👻 N đã xóa (giữ chỗ)`.
+- **Tab 🧭 Vị trí & Audit:** bảng mọi endpoint đã nhớ (vị trí giữ chỗ, API hiện tại, số lần xóa, số lần gặp,
+  số lần bị bỏ qua do trùng, nơi gặp lần cuối) với Thêm / Sửa / Quên giữ chỗ / Cho phép bắt lại, và nhật ký
+  (bắt mới, quay về chỗ cũ, xác nhận, chuyển, hoàn tác, xóa, đổi tên nhánh, sửa giữ chỗ) với nút hoàn tác từng dòng.
+  Cả hai được xuất vào file Excel.
+- **Xóa API giờ cho bắt lại được:** xóa API hoặc nhánh sẽ xóa luôn khóa chống trùng của chúng.
+- **Excel:** mỗi API có icon copy và cột `Excel #STT · gặp N` (bấm để mở dòng đó trong tab Độ phủ Excel). Tab Độ phủ
+  có bộ đếm lượt gặp từng dòng và bảng chi tiết từng lần gặp (path thực tế, vị trí, kết quả).
 
 ## 3. Threading & safety design
 
