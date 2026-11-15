@@ -628,9 +628,11 @@ class EngineTests(unittest.TestCase):
                 return FakeService()
         self.ext.processHttpMessage(self.cb.TOOL_PROXY, False, Msg())
         self.assertEqual(len(self.cb.repeater), 0)
+        # All roles off: the API is still captured; auto-Repeater pushes the original only.
         self.ext.roles.set_all_enabled(False)
         self.capture(source="Manual", filters=False)
-        self.assertEqual(len(self.cb.repeater), 0)
+        self.assertEqual([r[4] for r in self.cb.repeater], ["[G01:POST /v1/transfer] 00_Original_Crawl"])
+        self.assertEqual(len(self.cb.sent), 0)   # nothing re-sent: the original already has its response
 
     def test_feature_batching_and_sequential_api_history(self):
         captured = []
@@ -1308,6 +1310,96 @@ class TargetCaptureTests(unittest.TestCase):
         rows = tm.coverage_export_rows(tl, groups)
         self.assertEqual(rows[0][2], "/v1/transfer")
         self.assertEqual(rows[0][3], tm.DEFAULT_HIERARCHY_PATH)  # empty POSITION filled with where it was found
+
+
+class RolesOptionalTests(unittest.TestCase):
+    """Capture never depends on roles; API gốc has its own editable profile; push / send by choice."""
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def groups(self):
+        out = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (out.append(g), orig(g, i, r, c))[1]
+        return out
+
+    def test_all_roles_off_still_captures_and_works(self):
+        self.ext.roles.set_all_enabled(False)
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False})
+        self.ext.apply_config(cfg)
+        groups = self.groups()
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/accounts"))
+        self.assertEqual(len(groups), 2)                     # nothing skipped
+        g = groups[0]
+        self.assertEqual(g.results, [])
+        self.assertEqual(tm.evaluate_group_audit(g), (tm.AUDIT_OK, "Chỉ API gốc (200) - 0 role"))
+        self.assertEqual(self.ext.default_targets(g), [g.orig_result])
+        self.assertEqual(len(self.cb.sent), 0)               # auto-send has no role to send
+        self.ext.replay(g, self.ext.default_targets(g))      # "Gửi API" on a role-less API
+        self.assertEqual(len(self.cb.sent), 1)
+        self.assertEqual(g.orig_result.state, tm.STATE_DONE)
+        self.ext.rebuild_group(g)                            # rebuild works with 0 roles
+        self.assertEqual(g.results, [])
+
+    def test_auto_send_original_option(self):
+        self.ext.roles.set_all_enabled(False)
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False, "auto_send_original": True})
+        self.ext.apply_config(cfg)
+        self.capture()
+        self.assertEqual(len(self.cb.sent), 1)               # only the original went out
+
+    def test_original_profile_rules_apply_to_the_original(self):
+        self.ext.original_profile = {"name": tm.ORIGINAL_PROFILE_NAME, "enabled": True,
+                                     "headers": [{"name": "X-Crawler", "value": "acc-1", "mode": "REPLACE"},
+                                                 {"name": "Cookie", "value": "[REMOVE]", "mode": "REMOVE"}]}
+        groups = self.groups()
+        self.capture()
+        orig = groups[0].orig_result
+        lines, off = _split(orig.request)
+        self.assertIn("X-Crawler: acc-1", lines)
+        self.assertFalse([l for l in lines if l.lower().startswith("cookie:")])
+        self.assertEqual(lines[0], "POST /v1/transfer?x=1 HTTP/1.1")
+        self.assertEqual(orig.request[off:], b"{\"amount\":10}")
+        self.assertIn("profile (2 rule)", orig.role_name)
+        self.assertIn("Cookie: sid=orig", _split(groups[0].orig_request)[0])   # the capture itself is kept
+        # profile switched off: later captures keep the original untouched
+        self.ext.original_profile = dict(self.ext.original_profile, enabled=False)
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/other"))
+        self.assertEqual(groups[1].orig_result.request, groups[1].orig_request)
+        self.assertEqual(groups[1].orig_result.role_name, tm.ORIGINAL_LABEL)
+
+    def test_choose_roles_to_push_or_send(self):
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False, "auto_send": False})
+        self.ext.apply_config(cfg)
+        groups = self.groups()
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/accounts"))
+        names = tm.role_names_in(groups)
+        self.assertEqual(names[0], ("01_Admin", 2))
+        self.assertEqual(len(names), 10)
+        only_orig = {"action": "push", "orig": True, "roles": set(), "only_flagged": False, "compact": True}
+        self.assertEqual(self.ext.run_push_choice(groups, only_orig), 2)
+        self.assertEqual([r[4] for r in self.cb.repeater], ["G01•00_GOC", "G02•00_GOC"])
+        two_roles = dict(only_orig, orig=False, roles={"01_Admin", "10_Guest"}, compact=False)
+        self.ext.run_push_choice(groups[:1], two_roles)
+        self.assertEqual([r[4] for r in self.cb.repeater[2:]],
+                         ["[G01:POST /v1/transfer] 01_Admin", "[G01:POST /v1/transfer] 10_Guest"])
+        everything_but_guest = dict(only_orig, action="send", orig=False,
+                                    roles=set([n for n, _ in names if n != "10_Guest"]))
+        self.assertEqual(self.ext.run_push_choice(groups, everything_but_guest), 18)
+        self.assertEqual(len(self.cb.sent), 18)
+        for g in groups:
+            g.recalc_audit()
+        flagged = dict(only_orig, orig=False, roles=set([n for n, _ in names]), only_flagged=True)
+        before = len(self.cb.repeater)
+        self.ext.run_push_choice(groups[:1], flagged)        # admin 200 OK is not flagged, the 403s are
+        pushed = [r[4] for r in self.cb.repeater[before:]]
+        self.assertNotIn("G01•01_Admin", pushed)
+        self.assertIn("G01•02_User2", pushed)
 
 if __name__ == "__main__":
     unittest.main()

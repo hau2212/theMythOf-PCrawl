@@ -48,7 +48,7 @@ from burp import IHttpRequestResponse
 from java.awt import (BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, GridLayout,
                       Insets, Dimension, Color, Font, Toolkit, RenderingHints)
 from java.awt.datatransfer import StringSelection
-from java.awt.event import MouseAdapter, ActionListener, FocusAdapter
+from java.awt.event import MouseAdapter, ActionListener, FocusAdapter, WindowAdapter
 from java.lang import Runnable, Boolean, Integer, String, Throwable
 from java.util import ArrayList, Arrays
 from java.util.concurrent import Executors, TimeUnit
@@ -58,7 +58,7 @@ from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable,
                          JSplitPane, JTabbedPane, JTextArea, JMenuItem, JPopupMenu, JOptionPane,
                          JFileChooser, JDialog, JComboBox, JSpinner, SpinnerNumberModel,
                          ListSelectionModel, SwingUtilities, BorderFactory, DefaultCellEditor,
-                         BoxLayout, Box, JTree)
+                         BoxLayout, Box, JTree, JRadioButton, ButtonGroup, JFrame)
 from javax.swing import Timer, UIManager, Icon, Scrollable
 from javax.swing.event import (ListSelectionListener, TreeSelectionListener, ChangeListener,
                                TreeWillExpandListener)
@@ -112,8 +112,11 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.8.1"
+EXT_VERSION = "1.9.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
+SETTINGS_KEY_ORIGINAL = "tmoc.original_profile.v1"
+ORIGINAL_PROFILE_NAME = "00_API GỐC (Acc Crawl)"
+ORIGINAL_LABEL = "[API GỐC] 00_Original (Acc Crawl)"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
 SETTINGS_KEY_TARGETS = "tmoc.targets.v1"
 
@@ -172,6 +175,7 @@ DEFAULT_CONFIG = {
     "short_path_len": 40,
     "store_on_disk": True,
     # Outgoing request pacing (see SendDispatcher)
+    "auto_send_original": False,
     "send_profile": "HUMAN",
     "send_delay_ms": 700,
     "send_jitter_pct": 40,
@@ -779,8 +783,26 @@ def evaluate_group_audit(group):
       - If not replayed yet -> returns (AUDIT_NONE, "Chưa Gửi (1 Gốc + N Role)").
     Caches on group._audit_level / group._audit_summary for O(1) Swing table rendering.
     """
-    if group is None or not getattr(group, "results", None):
-        return AUDIT_NONE, "Chưa có Role"
+    if group is None:
+        return AUDIT_NONE, "-"
+    if not getattr(group, "results", None):
+        # No role was enabled at capture time: the API stands on its original request alone.
+        orig = getattr(group, "orig_result", None)
+        status = orig.status if orig is not None else None
+        if status is None:
+            lvl, summary = AUDIT_NONE, "Chỉ API gốc (chưa có response)"
+        else:
+            code = int(status)
+            if 200 <= code < 300:
+                lvl = AUDIT_OK
+            elif 300 <= code < 400:
+                lvl = AUDIT_REDIRECT
+            else:
+                lvl = AUDIT_INFO
+            summary = "Chỉ API gốc (%d) - 0 role" % code
+        group._audit_level = lvl
+        group._audit_summary = summary
+        return lvl, summary
     done = [r for r in group.results if r.status is not None or r.state == STATE_ERROR]
     if not done:
         lvl, summary = AUDIT_NONE, "Chưa Gửi (1 Gốc + %d Role)" % len(group.results)
@@ -2161,7 +2183,7 @@ class RoleResult(object):
         g = self._group
         if g is None:
             return None
-        if self.is_original:
+        if self.is_original and not self.rules:
             return g.orig_request
         return g.build_request(self)
 
@@ -3245,6 +3267,14 @@ class _ViewportWidthPanel(JPanel, Scrollable):
         return False
 
 
+class _WindowClosing(WindowAdapter):
+    def __init__(self, fn):
+        self._fn = fn
+
+    def windowClosing(self, event):
+        self._fn()
+
+
 class _FocusLost(FocusAdapter):
     def __init__(self, fn):
         self._fn = fn
@@ -3755,6 +3785,197 @@ class _EditorController(IMessageEditorController):
 # =============================================================================
 
 
+FLAGGED_LEVELS = (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR)
+
+
+def role_names_in(groups):
+    """[(role_name, number_of_APIs_having_it)] in role order, across the given API groups."""
+    order = []
+    counts = {}
+    for g in groups:
+        for r in g.results:
+            if r.role_name not in counts:
+                counts[r.role_name] = 0
+                order.append((r.role_index, len(order), r.role_name))
+            counts[r.role_name] += 1
+    order.sort()
+    return [(name, counts[name]) for _, _, name in order]
+
+
+def select_push_targets(group, include_original, role_names, only_flagged=False):
+    """Entries of one API to push / send: optionally the original, then the chosen roles."""
+    out = [group.orig_result] if include_original else []
+    for r in group.results:
+        if r.role_name not in role_names:
+            continue
+        if only_flagged and (getattr(r, "_audit_level", None) or evaluate_role_result(group, r)[0]) not in FLAGGED_LEVELS:
+            continue
+        out.append(r)
+    return out
+
+
+class PushTargetsDialog(object):
+    """
+    'Đẩy / Gửi có chọn Role': for one API, several APIs or a whole branch, choose the action
+    (push to Burp Repeater / send), the API gốc and any subset of roles, an optional
+    'only failing / diverging roles' filter and the Repeater tab naming. Shows how many tabs /
+    requests that makes before running, and remembers the last choice.
+    """
+
+    def __init__(self, parent, groups, scope_label, memory, action):
+        self._groups = list(groups)
+        self._result = None
+        owner = SwingUtilities.getWindowAncestor(parent) if parent is not None else None
+        self.dialog = JDialog(owner) if owner is not None else JDialog()
+        self.dialog.setTitle("Đẩy / Gửi có chọn Role - %s" % scope_label)
+        self.dialog.setModal(True)
+        self.dialog.setLayout(BorderLayout(6, 6))
+        bg, fg = _ui_colors()
+        pal = RowPalette.of(bg, fg)
+
+        head = JPanel(BorderLayout(4, 4))
+        head.setBorder(BorderFactory.createEmptyBorder(8, 10, 2, 10))
+        branches = len(set([g.feature_name for g in self._groups]))
+        info = JLabel("%s  ·  %d API  ·  %d nhánh" % (scope_label, len(self._groups), branches))
+        info.setFont(info.getFont().deriveFont(Font.BOLD))
+        head.add(info, BorderLayout.NORTH)
+        actions = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        self.rb_push = JRadioButton("📤 Đẩy sang Burp Repeater", action != "send")
+        self.rb_send = JRadioButton("▶ Gửi request (hàng đợi chống 429)", action == "send")
+        grp = ButtonGroup()
+        grp.add(self.rb_push)
+        grp.add(self.rb_send)
+        for rb in (self.rb_push, self.rb_send):
+            rb.addActionListener(_Action(lambda e: self._update()))
+            actions.add(rb)
+        head.add(actions, BorderLayout.SOUTH)
+        self.dialog.add(head, BorderLayout.NORTH)
+
+        listing = JPanel()
+        listing.setLayout(BoxLayout(listing, BoxLayout.Y_AXIS))
+        listing.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8))
+        self.cb_orig = JCheckBox("📌 API GỐC (Acc Crawl) - request đã bắt, áp profile API gốc nếu bật",
+                                 bool(memory.get("orig", False)))
+        self.cb_orig.setFont(self.cb_orig.getFont().deriveFont(Font.BOLD))
+        self.cb_orig.setForeground(pal.orig_fg)
+        self.cb_orig.addActionListener(_Action(lambda e: self._update()))
+        listing.add(self.cb_orig)
+        listing.add(Box.createVerticalStrut(4))
+        self.role_boxes = []
+        unchecked = set(memory.get("unchecked", []))
+        names = role_names_in(self._groups)
+        if not names:
+            none = JLabel("   (Các API này không có role nào - chỉ có thể đẩy / gửi API gốc)")
+            none.setForeground(pal.muted)
+            listing.add(none)
+        for name, count in names:
+            box = JCheckBox("%s      (có ở %d/%d API)" % (name, count, len(self._groups)), name not in unchecked)
+            box.addActionListener(_Action(lambda e: self._update()))
+            self.role_boxes.append((name, box))
+            listing.add(box)
+        scroll = JScrollPane(listing)
+        scroll.setBorder(BorderFactory.createTitledBorder("Đối tượng (API gốc và / hoặc các Role)"))
+        scroll.getVerticalScrollBar().setUnitIncrement(16)
+
+        quick = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        for label, fn in (("Tất cả", self._all), ("Chỉ API gốc", self._only_orig), ("Chỉ các Role", self._only_roles),
+                          ("Bỏ chọn hết", self._none), ("Đảo chọn", self._invert)):
+            quick.add(JButton(label, actionPerformed=fn))
+        options = JPanel()
+        options.setLayout(BoxLayout(options, BoxLayout.Y_AXIS))
+        options.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 8))
+        self.cb_flagged = JCheckBox("Chỉ lấy role đang Lỗi / Lệch / Nghi bypass (Vàng / Cam / Đỏ) ở từng API",
+                                    bool(memory.get("only_flagged", False)))
+        self.cb_flagged.addActionListener(_Action(lambda e: self._update()))
+        self.rb_compact = JRadioButton("Tên tab gọn: G01•01_Admin (+ copy tên Group vào clipboard)",
+                                       memory.get("compact", True))
+        self.rb_full = JRadioButton("Tên tab đầy đủ: [G01:METHOD /path] 01_Admin", not memory.get("compact", True))
+        naming = ButtonGroup()
+        naming.add(self.rb_compact)
+        naming.add(self.rb_full)
+        for c in (self.cb_flagged, self.rb_compact, self.rb_full):
+            c.setAlignmentX(0.0)
+            options.add(c)
+        center = JPanel(BorderLayout(4, 4))
+        center.add(quick, BorderLayout.NORTH)
+        center.add(scroll, BorderLayout.CENTER)
+        center.add(options, BorderLayout.SOUTH)
+        self.dialog.add(center, BorderLayout.CENTER)
+
+        bottom = JPanel(BorderLayout())
+        bottom.setBorder(BorderFactory.createEmptyBorder(4, 10, 8, 10))
+        self.lbl_summary = JLabel(" ")
+        self.lbl_summary.setFont(self.lbl_summary.getFont().deriveFont(Font.BOLD))
+        bottom.add(self.lbl_summary, BorderLayout.CENTER)
+        btns = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+        self.btn_ok = JButton("Thực hiện", actionPerformed=self._on_ok)
+        self.btn_ok.setFont(self.btn_ok.getFont().deriveFont(Font.BOLD))
+        btns.add(self.btn_ok)
+        btns.add(JButton("Hủy", actionPerformed=lambda e: self.dialog.dispose()))
+        bottom.add(btns, BorderLayout.EAST)
+        self.dialog.add(bottom, BorderLayout.SOUTH)
+        self.dialog.setSize(Dimension(720, 560))
+        self.dialog.setLocationRelativeTo(owner)
+        self._update()
+
+    def _set_all(self, orig, roles):
+        self.cb_orig.setSelected(orig)
+        for _, box in self.role_boxes:
+            box.setSelected(roles)
+        self._update()
+
+    def _all(self, e):
+        self._set_all(True, True)
+
+    def _only_orig(self, e):
+        self._set_all(True, False)
+
+    def _only_roles(self, e):
+        self._set_all(False, True)
+
+    def _none(self, e):
+        self._set_all(False, False)
+
+    def _invert(self, e):
+        self.cb_orig.setSelected(not self.cb_orig.isSelected())
+        for _, box in self.role_boxes:
+            box.setSelected(not box.isSelected())
+        self._update()
+
+    def choice(self):
+        names = set([n for n, box in self.role_boxes if box.isSelected()])
+        return {
+            "action": "send" if self.rb_send.isSelected() else "push",
+            "orig": self.cb_orig.isSelected(),
+            "roles": names,
+            "unchecked": [n for n, box in self.role_boxes if not box.isSelected()],
+            "only_flagged": self.cb_flagged.isSelected(),
+            "compact": self.rb_compact.isSelected(),
+        }
+
+    def _update(self):
+        c = self.choice()
+        total = 0
+        apis = 0
+        for g in self._groups:
+            n = len(select_push_targets(g, c["orig"], c["roles"], c["only_flagged"]))
+            total += n
+            apis += 1 if n else 0
+        verb = "Sẽ gửi %d request" if c["action"] == "send" else "Sẽ tạo %d tab Repeater"
+        self.lbl_summary.setText((verb % total) + " cho %d / %d API" % (apis, len(self._groups)))
+        self.btn_ok.setEnabled(total > 0)
+        self.rb_compact.setEnabled(c["action"] == "push")
+        self.rb_full.setEnabled(c["action"] == "push")
+
+    def _on_ok(self, e):
+        self._result = self.choice()
+        self.dialog.dispose()
+
+    def show(self):
+        self.dialog.setVisible(True)
+        return self._result
+
+
 MODE_HINTS = [
     (MODE_REPLACE, "ghi đè hoặc thêm header"),
     (MODE_ADD, "thêm 1 dòng header mới"),
@@ -3908,6 +4129,11 @@ class RoleEditorPanel(JPanel):
         toolbar.add(JButton("Remove Rule(s)", actionPerformed=self._on_remove))
         self.add(toolbar, BorderLayout.SOUTH)
         self._refresh_jwt_preview()
+
+    def set_original_mode(self, original):
+        """Editing the API gốc profile: fixed name, the checkbox means 'apply to the original'."""
+        self.name_field.setEditable(not original)
+        self.enabled_box.setText("Áp dụng profile này cho API gốc" if original else "Enabled")
 
     def load_role(self, role):
         self.stop_editing()
@@ -4185,8 +4411,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._stale_left = True
         self._stale_history = True
         self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state(),
-                             "log": self._new_tree_state()}
+                             "log": self._new_tree_state(), "full": self._new_tree_state()}
         self._stale_log = True
+        self._stale_full = True
+        self._menu_tree = None
+        self._scope_source = "table"
+        self._push_memory = None
+        self._tree_window = None
         self._log_lock = threading.Lock()
         self._log_system = deque(maxlen=LOG_SYSTEM_MAX)
         self._log_by_gid = {}
@@ -4197,7 +4428,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._path_combo_state = None
         self._persist_failures = 0
 
+        self._inline_target = ("role", 0)
         self.config = merge_config(self._load_json_setting(SETTINGS_KEY_CONFIG, {}))
+        self.original_profile = self._load_original_profile()
         self.targets = None
         self._stale_coverage = True
         try:
@@ -4304,6 +4537,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def extensionUnloaded(self):
         self._unloaded = True
+        try:
+            if self._tree_window is not None:
+                self._tree_window.dispose()
+        except (Throwable, Exception):
+            pass
         try:
             if self._ui_timer is not None:
                 self._ui_timer.stop()
@@ -4415,6 +4653,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._stale_history = True
             self._stale_log = True
             self._stale_coverage = True
+            self._stale_full = True
         self._refresh_send_controls()
         self._refresh_stale_views(force)
         if status or structure:
@@ -4425,7 +4664,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         Burp's customizeUiComponent (and theme switches) can replace a JTree's cell renderer with
         Burp's own, which drops the level colours. Put ours back whenever that happens.
         """
-        for name in ("left_hierarchy_tree", "history_tree", "log_tree"):
+        for name in ("left_hierarchy_tree", "history_tree", "log_tree", "full_tree"):
             tree = getattr(self, name, None)
             if tree is None:
                 continue
@@ -4469,6 +4708,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             if self._rebuild_tree("history", tree, self.history_tree_model, label, stats, force):
                 self._stale_history = False
                 self._refresh_history_summary_only()
+        tree = getattr(self, "full_tree", None)
+        if self._stale_full and tree is not None and tree.isShowing():
+            label = "Tất cả Group & API (%d Nhánh | %d API)" % (len(stats.features), stats.total)
+            if self._rebuild_tree("full", tree, self.full_tree_model, label, stats, force):
+                self._stale_full = False
+                self._update_full_tree_header()
         table = getattr(self, "coverage_table", None)
         if self._stale_coverage and table is not None and table.isShowing():
             self._stale_coverage = False
@@ -4715,7 +4960,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         """
         matched = self.groups_for_hierarchy_prefix(prefix_path, groups_override=groups_override)
         for g in matched:
-            targets = ([g.orig_result] + list(g.results)) if include_original else list(g.results)
+            targets = self.default_targets(g, include_original)
             self.replay(g, targets)
         if matched:
             self.log("Manual Send Hierarchy '%s': queued %d API group(s)." % (u_text(prefix_path), len(matched)))
@@ -4726,7 +4971,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         """Send all APIs inside a hierarchical group prefix to Burp Repeater."""
         matched = self.groups_for_hierarchy_prefix(prefix_path, groups_override=groups_override)
         for g in matched:
-            targets = ([g.orig_result] + list(g.results)) if include_original else list(g.results)
+            targets = self.default_targets(g, include_original)
             self.send_to_repeater(g, targets, compact=compact, copy_group_name=copy_group_name)
         return matched
 
@@ -4739,6 +4984,24 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             return json.loads(raw)
         except Exception:
             return default
+
+    def _load_original_profile(self):
+        stored = self._load_json_setting(SETTINGS_KEY_ORIGINAL, None)
+        prof = {"name": ORIGINAL_PROFILE_NAME, "enabled": False, "headers": []}
+        if isinstance(stored, dict):
+            try:
+                prof = normalize_role(stored, 0)
+            except Exception:
+                pass
+        prof["name"] = ORIGINAL_PROFILE_NAME
+        return prof
+
+    def save_original_profile(self, profile):
+        prof = normalize_role(profile, 0)
+        prof["name"] = ORIGINAL_PROFILE_NAME
+        self.original_profile = prof
+        self.callbacks.saveExtensionSetting(SETTINGS_KEY_ORIGINAL, json.dumps(prof))
+        self._refresh_original_profile_bar()
 
     def save_roles(self):
         self.callbacks.saveExtensionSetting(SETTINGS_KEY_ROLES, json.dumps(self.roles.all()))
@@ -4946,14 +5209,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                         return
                     self._seen_keys.add(key)
 
+        # Roles are optional: with none enabled the API is still captured, stored and shown
+        # ("1 API gốc + 0 role") and every send / Repeater action falls back to the original.
         roles = self.roles.enabled()
-        if not roles:
-            with self._state_lock:
-                self._skipped_count += 1
-                self._last_skip_reason = "0 roles"
-            self.log("No enabled roles - skipped %s %s" % (method, url))
-            self.update_status()
-            return
 
         with self._state_lock:
             gid = self._next_gid
@@ -4972,18 +5230,45 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 pass
         group.sync_original_meta(cfg["short_path_len"], cfg.get("include_feature_in_tab", False))
         group.results = self._clone_for_roles(group, info, roles, cfg)
+        self._apply_original_profile(group)
         group.recalc_audit()
         group.attach_store(self._persist(service, req, resp))
 
         with self._ui_lock:
             self._p_new.append(group)
+        note = ""
+        if not group.results:
+            note += " (không có role nào bật - chỉ lưu API gốc)"
+        if group.orig_result.rules:
+            note += " (API gốc áp profile: %d rule)" % len(group.orig_result.rules)
+        if target is not None:
+            note += " (khớp dòng STT %s trong file Excel)" % target.stt
         self.log("Bắt từ %s: %s %s -> 1 API gốc + %d role%s" %
-                 (source, method, url, len(group.results),
-                  (" (khớp dòng STT %s trong file Excel)" % target.stt) if target is not None else ""), gid=gid)
+                 (source, method, url, len(group.results), note), gid=gid)
         if cfg["auto_repeater"]:
-            self._dispatch_repeater(group, group.results)
+            self._dispatch_repeater(group, self.default_targets(group))
         if cfg["auto_send"]:
-            self.replay(group, group.results)
+            targets = list(group.results)
+            if cfg.get("auto_send_original"):
+                targets.insert(0, group.orig_result)
+            if targets:
+                self.replay(group, targets)
+
+    def default_targets(self, group, include_original=False):
+        """What a plain Send / Push acts on: every role, or the original when the API has no role."""
+        if not group.results:
+            return [group.orig_result]
+        if include_original:
+            return [group.orig_result] + list(group.results)
+        return list(group.results)
+
+    def _apply_original_profile(self, group):
+        """Snapshot the original profile's rules onto the API gốc (like role rules at capture time)."""
+        prof = self.original_profile
+        rules = [dict(h) for h in prof.get("headers", [])] if prof.get("enabled") else []
+        orig = group.orig_result
+        orig.rules = rules or None
+        orig.role_name = ORIGINAL_LABEL + (("  + profile (%d rule)" % len(rules)) if rules else "")
 
     def _clone_for_roles(self, group, info, roles, cfg):
         """
@@ -5033,15 +5318,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         """Re-clone a group's original request with the *current* enabled roles."""
         def work():
             roles = self.roles.enabled()
-            if not roles:
-                self.log("No enabled roles - cannot rebuild %s" % format_group_id(group.gid))
-                return
             cfg = self.get_config()
             info = self.helpers.analyzeRequest(group.service, group.orig_request)
             new_results = self._clone_for_roles(group, info, roles, cfg)
 
             def apply():
                 group.results = new_results
+                self._apply_original_profile(group)
                 group.sync_original_meta(cfg["short_path_len"], cfg.get("include_feature_in_tab", False))
                 group.recalc_audit()
                 self.group_model.refresh_group(group)
@@ -5305,6 +5588,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.tabs.addTab("Cấu hình & Bộ lọc", self._build_settings_tab(cfg))
         self.tabs.addTab("Log", self._build_log_tab())
         self.tabs.addTab("Độ phủ Excel", self._build_coverage_tab())
+        self.tabs.addTab("🌳 Cây Sub-folder", self._build_tree_tab())
         # A tree that was hidden while APIs arrived is rebuilt the moment its tab is opened.
         self.tabs.addChangeListener(_Change(lambda e: self._ui_tick(None)))
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
@@ -5386,9 +5670,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.left_hierarchy_tree.addTreeWillExpandListener(_LazyTreeLoader(
             lambda node: self._lazy_load_tree_node("left", self.left_hierarchy_tree_model, node)))
         self.left_hierarchy_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
-        self.left_hierarchy_tree.addTreeSelectionListener(_TreeListener(self._on_left_hierarchy_tree_selected))
+        self.left_hierarchy_tree.addTreeSelectionListener(
+            _TreeListener(lambda: self._on_tree_used(self.left_hierarchy_tree)))
         self.left_hierarchy_tree.addMouseListener(
-            _TreePopupListener(self.left_hierarchy_tree, self._show_left_tree_popup))
+            _TreePopupListener(self.left_hierarchy_tree,
+                               lambda e: self._tree_popup_from(self.left_hierarchy_tree, e)))
 
         self.feature_model = FeatureTableModel(self)
         self.feature_table = JTable(self.feature_model)
@@ -5548,6 +5834,158 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         master_split.setResizeWeight(0.36)
         panel.add(master_split, BorderLayout.CENTER)
         return panel
+
+    # ---- "Cây Sub-folder" tab: the branch tree alone, full size, can pop out into its own window
+    def _build_tree_tab(self):
+        self.full_tree_model = DefaultTreeModel(HierarchyTreeNode("ROOT", "", "Tất cả Group & API", key=("ROOT",)))
+        self.full_tree = JTree(self.full_tree_model)
+        self.full_tree.setRowHeight(26)
+        self.full_tree.setLargeModel(True)
+        self.full_tree.setCellRenderer(HierarchyTreeRenderer())
+        self.full_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
+        self.full_tree.addTreeSelectionListener(_TreeListener(lambda: self._on_tree_used(self.full_tree)))
+        self.full_tree.addTreeWillExpandListener(_LazyTreeLoader(
+            lambda node: self._lazy_load_tree_node("full", self.full_tree_model, node)))
+        self.full_tree.addMouseListener(_TreePopupListener(self.full_tree, lambda e: self._tree_popup_from(self.full_tree, e)))
+
+        bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        self.btn_tree_window = JButton("🗗 Mở cửa sổ riêng", actionPerformed=self._on_toggle_tree_window)
+        self.btn_tree_window.setFont(self.btn_tree_window.getFont().deriveFont(Font.BOLD))
+        bar.add(self.btn_tree_window)
+        push = JButton("🎯 Đẩy / Gửi có chọn Role...",
+                       actionPerformed=lambda e: self._tree_action(self.full_tree, lambda: self._open_push_dialog("push")))
+        bar.add(push)
+        self.btn_full_tree_more = JButton("Thao tác ▾", actionPerformed=lambda e: self._show_full_tree_menu())
+        bar.add(self.btn_full_tree_more)
+        # Few, short buttons: the bar must still fit when the tree is popped out into a narrow window.
+        expand = JButton("+", actionPerformed=lambda e: self._expand_folders(self.full_tree, True))
+        expand.setToolTipText("Mở tất cả các nhánh")
+        collapse = JButton("−", actionPerformed=lambda e: self._expand_folders(self.full_tree, False))
+        collapse.setToolTipText("Thu gọn tất cả")
+        bar.add(expand)
+        bar.add(collapse)
+        self.lbl_full_tree = JLabel(" ")
+        bg, fg = _ui_colors()
+        self.lbl_full_tree.setForeground(_mix(fg, bg, 0.42))
+        self.lbl_full_tree.setBorder(BorderFactory.createEmptyBorder(0, 8, 2, 8))
+        head = JPanel(BorderLayout())
+        head.add(bar, BorderLayout.NORTH)
+        head.add(self.lbl_full_tree, BorderLayout.SOUTH)
+        # The tree + its toolbar move as one piece between the tab and the separate window.
+        self.full_tree_content = JPanel(BorderLayout())
+        self.full_tree_content.add(head, BorderLayout.NORTH)
+        self.full_tree_content.add(JScrollPane(self.full_tree), BorderLayout.CENTER)
+
+        self.full_tree_placeholder = JPanel(FlowLayout(FlowLayout.CENTER, 8, 40))
+        self.full_tree_placeholder.add(JLabel("Cây Sub-folder đang mở ở cửa sổ riêng."))
+        self.full_tree_placeholder.add(JButton("Gắn lại vào tab", actionPerformed=lambda e: self._close_tree_window()))
+        self.full_tree_tab = JPanel(BorderLayout())
+        self.full_tree_tab.add(self.full_tree_content, BorderLayout.CENTER)
+        return self.full_tree_tab
+
+    def _show_full_tree_menu(self):
+        tree = self.full_tree
+        menu = JPopupMenu()
+        for label, fn in [
+            ("▶ Gửi mục đang chọn (nhánh / API / role)", lambda: self._on_replay_selected_hierarchy_or_feature(None)),
+            ("📤 Đẩy mục đang chọn -> Burp Repeater", lambda: self._on_send_selected_hierarchy_repeater(None)),
+            ("🎯 Gửi có chọn Role...", lambda: self._open_push_dialog("send")),
+            (None, None),
+            ("🎯 Đặt làm nhánh đang bắt (Active Path)", lambda: self._on_set_selected_feature_active(None)),
+            ("➕ Thêm Sub-folder con...", lambda: self._on_add_subfolder_to_selected_tree(None)),
+            ("✏ Đổi tên nhánh...", lambda: self._on_rename_selected_feature(None)),
+            ("🗑 Xóa nhánh...", lambda: self._on_delete_selected_tree_branch(None)),
+        ]:
+            if label is None:
+                menu.addSeparator()
+                continue
+            item = JMenuItem(label)
+            item.addActionListener(_Action(lambda e, f=fn: self._tree_action(tree, f)))
+            menu.add(item)
+        btn = self.btn_full_tree_more
+        menu.show(btn, 0, btn.getHeight())
+
+    def _update_full_tree_header(self):
+        label = getattr(self, "lbl_full_tree", None)
+        if label is None:
+            return
+        stats = self._stats
+        total = stats.total if stats is not None else 0
+        label.setText("Nhánh đang bắt: %s   ·   %d nhánh, %d API   ·   Chuột phải để Gửi / Đẩy / Thêm / Sửa / Xóa; "
+                      "chọn 1 API để xem ở tab API Groups" % (self.active_feature().name, len(self.features_list()), total))
+
+    def _tree_action(self, tree, fn):
+        """Run a tree action against this tree's selection (not the other tree's)."""
+        self._menu_tree = tree
+        self._scope_source = "tree"
+        fn()
+
+    def _expand_folders(self, tree, expand):
+        state = self._tree_states["full"]
+        rows = range(tree.getRowCount() - 1, -1, -1) if not expand else None
+        if expand:
+            i = 0
+            while i < tree.getRowCount():
+                node = tree.getPathForRow(i).getLastPathComponent()
+                if getattr(node, "kind", None) in ("ROOT", "FOLDER"):
+                    tree.expandRow(i)
+                i += 1
+            state["collapsed"] = set()
+        else:
+            for i in rows:
+                if i > 0:
+                    tree.collapseRow(i)
+            state["expanded"] = set()
+
+    def _on_toggle_tree_window(self, event):
+        if self._tree_window is not None:
+            self._close_tree_window()
+        else:
+            self._open_tree_window()
+
+    def _open_tree_window(self):
+        frame = JFrame("theMythOfCrawl - Cây Sub-folder")
+        frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE)
+        frame.addWindowListener(_WindowClosing(lambda: self._close_tree_window()))
+        self.full_tree_tab.remove(self.full_tree_content)
+        self.full_tree_tab.add(self.full_tree_placeholder, BorderLayout.CENTER)
+        self.full_tree_tab.revalidate()
+        self.full_tree_tab.repaint()
+        window_bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        pin = JCheckBox("📌 Luôn nằm trên các cửa sổ khác")
+        pin.addActionListener(_Action(lambda e: frame.setAlwaysOnTop(pin.isSelected())))
+        window_bar.add(pin)
+        root = JPanel(BorderLayout())
+        root.add(window_bar, BorderLayout.NORTH)
+        root.add(self.full_tree_content, BorderLayout.CENTER)
+        frame.getContentPane().add(root)
+        try:
+            self.callbacks.customizeUiComponent(root)
+        except (Throwable, Exception):
+            pass
+        self._ensure_tree_renderers()
+        frame.setSize(Dimension(620, 860))
+        frame.setLocationRelativeTo(self.main_panel)
+        frame.setVisible(True)
+        self._tree_window = frame
+        self.btn_tree_window.setText("🗗 Gắn lại vào tab")
+        self._stale_full = True
+        self._ui_tick(None)
+
+    def _close_tree_window(self):
+        frame = self._tree_window
+        if frame is None:
+            return
+        self._tree_window = None
+        frame.getContentPane().removeAll()
+        frame.dispose()
+        self.full_tree_tab.remove(self.full_tree_placeholder)
+        self.full_tree_tab.add(self.full_tree_content, BorderLayout.CENTER)
+        self.full_tree_tab.revalidate()
+        self.full_tree_tab.repaint()
+        self.btn_tree_window.setText("🗗 Mở cửa sổ riêng")
+        self._stale_full = True
+        self._ui_tick(None)
 
     # ---- "Độ phủ Excel" tab: which documented APIs were captured
     def _build_coverage_tab(self):
@@ -5914,7 +6352,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                      actionPerformed=lambda e: self._show_role_actions_menu(self.btn_role_more))
         role_top_bar.add(self.btn_role_more)
 
-        left_panel.add(role_top_bar, BorderLayout.NORTH)
+        north = JPanel(BorderLayout(2, 4))
+        north.add(role_top_bar, BorderLayout.NORTH)
+        north.add(self._build_original_profile_bar(), BorderLayout.SOUTH)
+        left_panel.add(north, BorderLayout.NORTH)
         left_panel.add(JScrollPane(self.role_table), BorderLayout.CENTER)
 
         first_role = self.roles.get(0) if self.roles.count() > 0 else {
@@ -5930,6 +6371,69 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if self.roles.count() > 0:
             self.role_table.setRowSelectionInterval(0, 0)
         return panel
+
+    def _build_original_profile_bar(self):
+        """Pinned 'API gốc' profile above the role list: always present, never deleted or moved."""
+        bg, fg = _ui_colors()
+        pal = RowPalette.of(bg, fg)
+        bar = JPanel(BorderLayout(6, 2))
+        bar.setBackground(_mix(bg, pal.orig_accent, 0.08))
+        bar.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 4, 0, 0, pal.orig_accent),
+            BorderFactory.createEmptyBorder(5, 8, 5, 8)))
+        title = JLabel("📌 " + ORIGINAL_PROFILE_NAME)
+        title.setFont(title.getFont().deriveFont(Font.BOLD))
+        title.setForeground(pal.orig_fg)
+        self.lbl_original_profile = JLabel(" ")
+        self.lbl_original_profile.setForeground(pal.muted)
+        text = JPanel(BorderLayout())
+        text.setOpaque(False)
+        text.add(title, BorderLayout.NORTH)
+        text.add(self.lbl_original_profile, BorderLayout.SOUTH)
+        bar.add(text, BorderLayout.CENTER)
+        buttons = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0))
+        buttons.setOpaque(False)
+        self.cb_original_profile = JCheckBox("Áp dụng", bool(self.original_profile.get("enabled")))
+        self.cb_original_profile.setOpaque(False)
+        self.cb_original_profile.setToolTipText("Bật: rule của profile này được áp vào API gốc khi xem / gửi lại / đẩy Repeater")
+        self.cb_original_profile.addActionListener(_Action(self._on_toggle_original_profile))
+        buttons.add(self.cb_original_profile)
+        buttons.add(JButton("✏ Sửa profile API gốc", actionPerformed=self._on_edit_original_profile))
+        bar.add(buttons, BorderLayout.EAST)
+        self._refresh_original_profile_bar()
+        return bar
+
+    def _refresh_original_profile_bar(self):
+        label = getattr(self, "lbl_original_profile", None)
+        if label is None:
+            return
+        prof = self.original_profile
+        n = len(prof.get("headers", []))
+        if not n:
+            label.setText("Chưa có rule - API gốc được gửi đúng như lúc bắt")
+        elif prof.get("enabled"):
+            label.setText("Đang áp dụng %d rule cho API gốc (API bắt từ giờ; API cũ: 'Rebuild Roles')" % n)
+        else:
+            label.setText("%d rule - đang TẮT, API gốc được gửi đúng như lúc bắt" % n)
+        cb = getattr(self, "cb_original_profile", None)
+        if cb is not None and cb.isSelected() != bool(prof.get("enabled")):
+            cb.setSelected(bool(prof.get("enabled")))
+
+    def _on_toggle_original_profile(self, event):
+        prof = dict(self.original_profile)
+        prof["enabled"] = self.cb_original_profile.isSelected()
+        self.save_original_profile(prof)
+        if self._inline_target[0] == "orig":
+            self.inline_role_editor.enabled_box.setSelected(prof["enabled"])
+        self.log("Profile API gốc: %s." % ("BẬT" if prof["enabled"] else "TẮT"))
+
+    def _on_edit_original_profile(self, event):
+        self._inline_target = ("orig",)
+        self.role_table.clearSelection()
+        self.inline_role_editor.set_original_mode(True)
+        self.inline_role_editor.load_role(self.original_profile)
+        self.inline_role_editor.setBorder(BorderFactory.createTitledBorder(
+            "Đang sửa: Profile API GỐC (Acc Crawl) - rule áp vào request gốc khi xem / gửi lại / đẩy Repeater"))
 
     # ---- Settings tab
     def _build_settings_tab(self, cfg):
@@ -5968,6 +6472,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.tf_retries = self._num_field(cfg["max_retries"])
         self.tf_threads = self._num_field(cfg["threads"])
         self.lbl_pacing = JLabel(" ")
+        self.cb_auto_send_original = check(
+            "Khi tự động gửi: gửi lại cả API gốc (đã áp profile API gốc nếu bật)",
+            cfg.get("auto_send_original", False))
         self.cb_store_disk = check("Lưu request / response vào file tạm của Burp thay vì RAM (khuyên dùng khi bắt nhiều API)",
                                    cfg.get("store_on_disk", True))
 
@@ -6011,6 +6518,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
               ("field", "Số request song song mỗi host:", self.tf_conc, "1 = lần lượt như người thật"),
               ("field", "Tự gửi lại khi gặp 429 / 503 (lần):", self.tf_retries, None),
               ("field", "Tổng số luồng gửi (mọi host):", self.tf_threads, None),
+              ("check", self.cb_auto_send_original),
               ("check", self.cb_store_disk)]),
             ("4.  Danh sách API từ file Excel (tùy chọn)", (219, 39, 119),
              "Nạp file .xlsx gồm các cột STT | PROTOCOL (method) | PATH | POSITION. Tham số trong path như "
@@ -6175,6 +6683,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                               ("cb_dedup_ids", "dedup_normalize_ids"), ("cb_dedup_feature", "dedup_per_feature"),
                               ("cb_number", "number_roles_in_tab"), ("cb_feat_tab", "include_feature_in_tab"),
                               ("cb_store_disk", "store_on_disk"), ("cb_target_only", "target_only"),
+                              ("cb_auto_send_original", "auto_send_original"),
                               ("cb_target_only_mirror", "target_only"),
                               ("cb_target_position", "target_use_position"),
                               ("cb_target_prefix", "target_allow_prefix")):
@@ -6226,6 +6735,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "threads": self._read_int(self.tf_threads, "threads"),
             "short_path_len": self._read_int(self.tf_pathlen, "short_path_len"),
             "store_on_disk": self.cb_store_disk.isSelected(),
+            "auto_send_original": self.cb_auto_send_original.isSelected(),
             "send_profile": key,
             "send_delay_ms": delay,
             "send_jitter_pct": jitter,
@@ -6282,6 +6792,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.cb_auto_send.setSelected(d["auto_send"])
             self.cb_auto_repeater.setSelected(d["auto_repeater"])
             self.cb_store_disk.setSelected(d["store_on_disk"])
+            self.cb_auto_send_original.setSelected(d["auto_send_original"])
             self.cb_send_profile.setSelectedIndex(self._profile_index(d["send_profile"]))
             self.cb_target_only.setSelected(d["target_only"])
             self.cb_target_position.setSelected(d["target_use_position"])
@@ -6455,6 +6966,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def _show_send_dropdown_menu(self, btn):
         menu = JPopupMenu()
+        menu.add(JMenuItem("🎯 Gửi có chọn Role (API gốc / role nào / bỏ role nào)...",
+                           actionPerformed=lambda e: self._open_push_dialog("send")))
+        menu.addSeparator()
         menu.add(JMenuItem("▶ Gửi API đang chọn (Tất cả Roles)", actionPerformed=self._on_replay_all))
         menu.add(JMenuItem("▶ Gửi lại Role đang chọn", actionPerformed=self._on_replay_selected))
         menu.add(JMenuItem("▶▶ Gửi toàn bộ Nhánh đang chọn (Đệ quy tất cả cấp con)",
@@ -6463,11 +6977,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         menu.add(JMenuItem("▶ Gửi tất cả request CHƯA GỬI (crawl lúc đang dừng)", actionPerformed=self._on_send_all_unsent))
         menu.add(JMenuItem("✖ Hủy hàng đợi gửi", actionPerformed=self._on_cancel_queue))
         menu.add(JMenuItem("▶▶ Gửi tất cả API đã bắt (%d API)" % len(self.group_model.all_groups()),
-                           actionPerformed=lambda e: [self.replay(g, g.results) for g in self.group_model.all_groups()]))
+                           actionPerformed=lambda e: [self.replay(g, self.default_targets(g)) for g in self.group_model.all_groups()]))
         menu.show(btn, 0, btn.getHeight())
 
     def _show_repeater_dropdown_menu(self, btn):
         menu = JPopupMenu()
+        menu.add(JMenuItem("🎯 Đẩy có chọn Role (API gốc / role nào / bỏ role nào)...",
+                           actionPerformed=lambda e: self._open_push_dialog("push")))
+        menu.addSeparator()
         menu.add(JMenuItem("📤 Đẩy API đang chọn -> Burp Repeater", actionPerformed=self._on_send_group))
         menu.add(JMenuItem("📤 Đẩy Role đang chọn -> Burp Repeater", actionPerformed=self._on_send_role))
         menu.add(JMenuItem("📤 Đẩy cả Nhánh đang chọn -> Burp Repeater",
@@ -6507,6 +7024,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for label, handler in [
             ("▶ Gửi toàn bộ Nhánh đang chọn", self._on_replay_selected_hierarchy_or_feature),
             ("📤 Đẩy Nhánh đang chọn -> Burp Repeater", self._on_send_selected_hierarchy_repeater),
+            ("🎯 Đẩy / Gửi Nhánh có chọn Role...", lambda e: self._open_push_dialog("push")),
             ("🎯 Đặt làm Nhánh đang bắt (Active Path)", self._on_set_selected_feature_active),
             ("➕ Thêm Sub-folder con vào Nhánh đang chọn...", self._on_add_subfolder_to_selected_tree),
             ("✏ Đổi tên Nhánh đang chọn...", self._on_rename_selected_feature),
@@ -6530,6 +7048,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for label, handler in [
             ("▶ Gửi toàn bộ Nhánh đang chọn", self._on_replay_selected_hierarchy_or_feature),
             ("📤 Đẩy Nhánh đang chọn -> Burp Repeater", self._on_send_selected_hierarchy_repeater),
+            ("🎯 Đẩy / Gửi Nhánh có chọn Role...", lambda e: self._open_push_dialog("push")),
             ("🎯 Đặt làm Nhánh đang bắt (Active Path)", self._on_set_selected_feature_active),
             ("➕ Thêm Sub-folder con...", self._on_add_subfolder_to_selected_tree),
             ("✏ Đổi tên Nhánh...", self._on_rename_selected_feature),
@@ -6545,6 +7064,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         cnt = len(groups)
         menu.add(JMenuItem("▶ Gửi %d API đang chọn (N Roles)" % (cnt or 1), actionPerformed=self._on_replay_all))
         menu.add(JMenuItem("📤 Đẩy %d API đang chọn -> Burp Repeater" % (cnt or 1), actionPerformed=self._on_send_group))
+        menu.add(JMenuItem("🎯 Đẩy / Gửi %d API có chọn Role (API gốc / role nào)..." % (cnt or 1),
+                           actionPerformed=lambda e: self._open_push_dialog(
+                               "push", groups or None, "%d API đang chọn" % len(groups))))
         menu.addSeparator()
         menu.add(JMenuItem("📁 Đổi Group Path cho API đang chọn...", actionPerformed=self._on_move_groups_feature))
         menu.add(JMenuItem("🔄 Rebuild Roles cho API đang chọn", actionPerformed=self._on_rebuild))
@@ -6799,15 +7321,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                    actionPerformed=self._on_rename_selected_feature))
                 menu.add(JMenuItem("📤 Đẩy Nhánh \"%s\" sang Burp Repeater" % title,
                                    actionPerformed=self._on_send_selected_hierarchy_repeater))
+                menu.add(JMenuItem("🎯 Đẩy / Gửi Nhánh \"%s\" có chọn Role..." % title,
+                                   actionPerformed=lambda e: self._open_push_dialog("push")))
                 menu.addSeparator()
                 menu.add(JMenuItem("🗑 Xóa Nhánh \"%s\"..." % title,
                                    actionPerformed=self._on_delete_selected_tree_branch))
         elif kind in ("GROUP", "ORIG", "ROLE"):
             g = payload if kind == "GROUP" else payload[0]
-            menu.add(JMenuItem("▶ Gửi API #%d (%d Roles)" % (g.gid, len(g.results)),
-                               actionPerformed=lambda e: self.replay(g, g.results)))
+            menu.add(JMenuItem(("▶ Gửi API #%d (%d Roles)" % (g.gid, len(g.results))) if g.results
+                               else ("▶ Gửi API #%d (API gốc - 0 role)" % g.gid),
+                               actionPerformed=lambda e: self.replay(g, self.default_targets(g))))
             menu.add(JMenuItem("📤 Đẩy API #%d sang Burp Repeater (Gọn)" % g.gid,
                                actionPerformed=lambda e: self._dispatch_group_with_selected_mode(g)))
+            menu.add(JMenuItem("🎯 Đẩy / Gửi API #%d có chọn Role..." % g.gid,
+                               actionPerformed=lambda e: self._open_push_dialog("push", [g], format_api_label(g.gid))))
         menu.show(event.getComponent(), event.getX(), event.getY())
 
     def update_status(self):
@@ -6844,7 +7371,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.lbl_feature_counter.setText("(%d API)" % len(stats.groups_of(act.fid)))
         g, _ = self.current_selection()
         count = len(g.results) if g is not None else self.roles.enabled_count()
-        self.btn_replay_all.setText("▶ Gửi API (%d Roles)" % count)
+        self.btn_replay_all.setText(("▶ Gửi API (%d Roles)" % count) if count else "▶ Gửi API gốc (0 role)")
 
     # ---------------------------------------- feature & history view helpers
     def _refresh_history_summary_only(self):
@@ -7185,9 +7712,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return None, None
 
     def _selected_left_tree_payload(self):
-        if getattr(self, "left_hierarchy_tree", None) is None:
+        """Selection of the tree the user last used: the small one in 'API Groups' or the full-tab one."""
+        tree = getattr(self, "_menu_tree", None) or getattr(self, "left_hierarchy_tree", None)
+        if tree is None:
             return None, None
-        path = self.left_hierarchy_tree.getSelectionPath()
+        path = tree.getSelectionPath()
         if path is None:
             return None, None
         return self._extract_node_kind_payload(path.getLastPathComponent())
@@ -7202,6 +7731,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             return getattr(payload[0], "feature_name", None)
         feat = self._selected_feature_from_table()
         return feat.name if feat is not None else None
+
+    def _on_tree_used(self, tree):
+        if self._restoring_tree:
+            return
+        self._menu_tree = tree
+        self._on_left_hierarchy_tree_selected()
+        # set after: selecting the matching table row above fires the table listener too
+        self._scope_source = "tree"
+
+    def _tree_popup_from(self, tree, event):
+        self._menu_tree = tree
+        self._scope_source = "tree"
+        self._show_left_tree_popup(event)
 
     def _on_left_hierarchy_tree_selected(self):
         if self._restoring_tree:
@@ -7255,7 +7797,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if kind == "ROOT":
             all_g = self.group_model.all_groups()
             for g in all_g:
-                self.replay(g, g.results)
+                self.replay(g, self.default_targets(g))
             return
         if kind == "FOLDER" and payload:
             sent = self.replay_hierarchy_prefix(payload)
@@ -7265,7 +7807,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
             return
         if kind == "GROUP" and payload is not None:
-            self.replay(payload, payload.results)
+            self.replay(payload, self.default_targets(payload))
             return
         if kind == "ROLE" and payload is not None:
             g, r = payload
@@ -7279,6 +7821,62 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     self.main_panel, "Nhánh '%s' chưa có API nào để gửi." % feat.name,
                     EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
 
+    # ---- 'Đẩy / Gửi có chọn Role'
+    def _groups_in_scope(self):
+        """(groups, label): selected rows of the API table, else the selected tree node / branch."""
+        groups = self._selected_groups() if self.group_table is not None else []
+        if groups and getattr(self, "_scope_source", "table") == "table":
+            return groups, ("%d API đang chọn" % len(groups)) if len(groups) > 1 else format_api_label(groups[0].gid)
+        kind, payload = self._selected_left_tree_payload()
+        if kind == "ROOT":
+            return self.group_model.all_groups(), "Tất cả API"
+        if kind == "FOLDER" and payload:
+            return self.groups_for_hierarchy_prefix(payload), "Nhánh \"%s\"" % payload
+        if kind == "GROUP" and payload is not None:
+            return [payload], format_api_label(payload.gid)
+        if kind in ("ROLE", "ORIG") and payload is not None:
+            return [payload[0]], format_api_label(payload[0].gid)
+        if groups:
+            return groups, "%d API đang chọn" % len(groups)
+        feat = self._selected_feature_from_table()
+        if feat is not None:
+            return self.groups_for_hierarchy_prefix(feat.name), "Nhánh \"%s\"" % feat.name
+        return [], ""
+
+    def _open_push_dialog(self, action="push", groups=None, label=None):
+        if groups is None:
+            groups, label = self._groups_in_scope()
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "Chọn API (bảng) hoặc nhánh / API (cây) trước.",
+                                          EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+            return
+        memory = getattr(self, "_push_memory", None) or {"orig": False, "unchecked": [], "compact": True}
+        choice = PushTargetsDialog(self.main_panel, groups, label, memory, action).show()
+        if choice is None:
+            return
+        self._push_memory = choice
+        self.run_push_choice(groups, choice, label)
+
+    def run_push_choice(self, groups, choice, label=""):
+        total = 0
+        apis = 0
+        for g in groups:
+            targets = select_push_targets(g, choice["orig"], choice["roles"], choice["only_flagged"])
+            if not targets:
+                continue
+            apis += 1
+            total += len(targets)
+            if choice["action"] == "send":
+                self.replay(g, targets)
+            else:
+                self.send_to_repeater(g, targets, compact=choice["compact"],
+                                      copy_group_name=choice["compact"] and len(groups) == 1)
+        what = "gửi %d request" % total if choice["action"] == "send" else "đẩy %d tab sang Repeater" % total
+        parts = (["API gốc"] if choice["orig"] else []) + sorted(choice["roles"])
+        self.log("%s: %s cho %d API (%s%s)." % (label or "Chọn Role", what, apis, ", ".join(parts) or "-",
+                                                 ", chỉ role lỗi/lệch" if choice["only_flagged"] else ""))
+        return total
+
     def _dispatch_group_with_selected_mode(self, group):
         if group is None:
             return
@@ -7290,14 +7888,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 if (getattr(r, "_audit_level", None) or evaluate_role_result(group, r)[0])
                 in (AUDIT_INFO, AUDIT_WARN, AUDIT_ERROR)
             ]
-            targets = interesting if interesting else list(group.results)
+            targets = interesting if interesting else self.default_targets(group)
             self.send_to_repeater(group, targets, compact=True, copy_group_name=True)
         elif mode_idx == 0:
             # Compact tab names (G01•01_Admin) + copy group title to clipboard
-            self.send_to_repeater(group, group.results, compact=True, copy_group_name=True)
+            self.send_to_repeater(group, self.default_targets(group), compact=True, copy_group_name=True)
         else:
             # Classic full tab names
-            self.send_to_repeater(group, group.results, compact=False, copy_group_name=False)
+            self.send_to_repeater(group, self.default_targets(group), compact=False, copy_group_name=False)
 
     def _on_send_selected_hierarchy_repeater(self, event):
         kind, payload = self._selected_left_tree_payload()
@@ -7484,15 +8082,15 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self.replay_hierarchy_prefix(payload)
         elif kind == "FEATURE":
             for g in self.group_model.groups_for_feature(payload.fid):
-                self.replay(g, g.results)
+                self.replay(g, self.default_targets(g))
         elif kind == "GROUP":
-            self.replay(payload, payload.results)
+            self.replay(payload, self.default_targets(payload))
         elif kind == "ROLE":
             g, r = payload
             self.replay(g, [r])
         elif kind == "ORIG":
             g, _ = payload
-            self.replay(g, g.results)
+            self.replay(g, self.default_targets(g))
         else:
             JOptionPane.showMessageDialog(
                 self.main_panel, "Hãy chọn một Nhánh, API hoặc Role trong cây.",
@@ -7617,7 +8215,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         g, _ = self.current_selection()
         if g is not None:
             menu.add(JMenuItem("▶▶ Gửi (Send) toàn bộ %d Roles của %s" % (len(g.results), format_group_id(g.gid)),
-                               actionPerformed=lambda e: self.replay(g, g.results)))
+                               actionPerformed=lambda e: self.replay(g, self.default_targets(g))))
             menu.add(JMenuItem("📤 Đẩy Group %s sang Burp Repeater (Tên gọn + Copy tên Group)"
                                % format_group_id(g.gid),
                                actionPerformed=lambda e: self._dispatch_group_with_selected_mode(g)))
@@ -7682,6 +8280,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return g, res
 
     def _on_group_selected(self):
+        self._scope_source = "table"
         groups = self._selected_groups()
         g = groups[0] if groups else None
         if g is not self.result_model.group():
@@ -7763,7 +8362,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._require_group()
             return
         for g in groups:
-            self.replay(g, g.results)
+            self.replay(g, self.default_targets(g))
             self.log("Xếp hàng gửi %d role." % len(g.results), gid=g.gid)
 
     def _on_replay_selected(self, event):
@@ -7775,7 +8374,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             # If user selected only the original row and clicked replay role, replay all roles for convenience
             _, cur_res = self.current_selection()
             if cur_res is not None and getattr(cur_res, "is_original", False):
-                self.replay(g, g.results)
+                self.replay(g, self.default_targets(g))
                 return
             JOptionPane.showMessageDialog(self.main_panel, "Hãy chọn ít nhất 1 dòng Role để gửi.", EXT_NAME,
                                           JOptionPane.INFORMATION_MESSAGE)
@@ -7853,7 +8452,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._p_dirty = {}
             self._p_done_res = set()
         self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state(),
-                             "log": self._new_tree_state()}
+                             "log": self._new_tree_state(), "full": self._new_tree_state()}
         with self._log_lock:
             self._log_by_gid = {}
         self.group_model.set_feature_filter(None)
@@ -7884,12 +8483,24 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if self.inline_role_editor is None or self.role_table is None:
             return
         idx = self.role_table.getSelectedRow()
+        if idx < 0 and self._inline_target[0] == "orig":
+            return  # the API gốc profile stays in the editor until a role row is picked
+        self._inline_target = ("role", idx)
+        self.inline_role_editor.set_original_mode(False)
+        self.inline_role_editor.setBorder(BorderFactory.createTitledBorder(
+            "Chỉnh sửa Profile đang chọn (Header / Cookie / Session / JWT - Bấm 'Save Profile Changes' để lưu)"))
         if 0 <= idx < self.roles.count():
             self.inline_role_editor.load_role(self.roles.get(idx))
         else:
             self.inline_role_editor.load_role(None)
 
     def _on_save_inline_role(self, updated_role):
+        if self._inline_target[0] == "orig":
+            self.save_original_profile(updated_role)
+            self.log("Đã lưu profile API gốc (%d rule, %s)." % (
+                len(self.original_profile.get("headers", [])),
+                "đang áp dụng" if self.original_profile.get("enabled") else "đang tắt"))
+            return
         idx = self.role_table.getSelectedRow()
         if idx < 0 or idx >= self.roles.count():
             idx = self.roles.add(updated_role)
