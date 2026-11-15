@@ -117,10 +117,30 @@ class _SyncExecutor(object):
         pass
 
 
+class _RecordingScheduler(object):
+    """Delayed tasks are only recorded; tests drive the clock and run them explicitly."""
+
+    def __init__(self):
+        self.tasks = []
+
+    def schedule(self, task, delay, unit):
+        self.tasks.append((delay, task))
+
+    def shutdownNow(self):
+        return []
+
+    def awaitTermination(self, *a):
+        return True
+
+
 class _Executors(object):
     @staticmethod
     def newSingleThreadExecutor():
         return _SyncExecutor(1)
+
+    @staticmethod
+    def newSingleThreadScheduledExecutor():
+        return _RecordingScheduler()
 
     @staticmethod
     def newFixedThreadPool(n):
@@ -139,6 +159,35 @@ class _SwingUtilities(object):
         _SwingUtilities.queued.append(task)  # UI work is not executed in tests
 
 
+class _Color(object):
+    """Just enough of java.awt.Color for the palette maths."""
+
+    def __init__(self, r, g, b, *a):
+        self.r, self.g, self.b = int(r), int(g), int(b)
+
+    def getRed(self):
+        return self.r
+
+    def getGreen(self):
+        return self.g
+
+    def getBlue(self):
+        return self.b
+
+    def getRGB(self):
+        return (self.r << 16) | (self.g << 8) | self.b
+
+
+class _UIManager(object):
+    @staticmethod
+    def getColor(key):
+        return None
+
+
+import java.awt  # noqa: E402
+
+java.awt.Color = _Color
+javax.swing.UIManager = _UIManager
 java.lang.Throwable = _Throwable
 java.util.ArrayList = _ArrayList
 java.util.Arrays = _Arrays
@@ -206,6 +255,9 @@ class FakeRespInfo(object):
 
     def getStatusCode(self):
         return int(self.lines[0].split(" ")[1])
+
+    def getHeaders(self):
+        return list(self.lines)
 
     def getBodyOffset(self):
         return self.offset
@@ -465,6 +517,9 @@ class EngineTests(unittest.TestCase):
             "capture_enabled": True,
             "auto_send": True,
             "auto_repeater": True,
+            "send_profile": "CUSTOM",
+            "send_delay_ms": 0,
+            "send_jitter_pct": 0,
         })
         self.ext = tm.BurpExtender()
         self.ext.registerExtenderCallbacks(self.cb)
@@ -899,6 +954,219 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(comp)
         self.assertEqual(non_sel_bg_calls, [])
 
+
+
+class _ManualExecutor(object):
+    def __init__(self):
+        self.tasks = []
+
+    def execute(self, task):
+        self.tasks.append(task)
+
+
+class _Grp(object):
+    def __init__(self, host="a.test"):
+        self.protocol, self.host, self.port = "https", host, 443
+
+
+class DispatcherTests(unittest.TestCase):
+    """Per-host pacing, 429 / Retry-After handling, retries and cancellation (fake clock)."""
+
+    def setUp(self):
+        self.now = [100.0]
+        self.cfg = {"send_delay_ms": 1000, "send_jitter_pct": 0, "host_concurrency": 1, "max_retries": 2}
+        self.ran = []
+        self.ex = _ManualExecutor()
+        self.sched = _RecordingScheduler()
+        self.d = tm.SendDispatcher(self.ran.append, self.ex, self.sched, lambda: dict(self.cfg),
+                                   clock=lambda: self.now[0], rand=lambda: 0.5)
+
+    def jobs(self, n, host="a.test"):
+        g = _Grp(host)
+        return [tm._SendJob(g, object()) for _ in range(n)]
+
+    def run_dispatched(self):
+        tasks, self.ex.tasks = self.ex.tasks, []
+        for t in tasks:
+            t.run()
+        out, self.ran[:] = list(self.ran), []
+        return out
+
+    def fire_scheduled(self):
+        tasks, self.sched.tasks = self.sched.tasks, []
+        for _, t in tasks:
+            t.run()
+
+    def test_one_at_a_time_with_human_gap(self):
+        jobs = self.jobs(3)
+        self.d.submit(jobs)
+        self.assertEqual(self.run_dispatched(), [jobs[0]])
+        self.now[0] = 100.3
+        self.assertTrue(self.d.done(jobs[0], 200))
+        self.assertEqual(self.run_dispatched(), [])      # gap counted from the answer
+        self.assertEqual(len(self.sched.tasks), 1)
+        self.assertAlmostEqual(self.sched.tasks[0][0], 1001, delta=2)
+        self.now[0] = 101.31
+        self.fire_scheduled()
+        self.assertEqual(self.run_dispatched(), [jobs[1]])
+
+    def test_hosts_are_independent(self):
+        a = self.jobs(1, "a.test")
+        b = self.jobs(1, "b.test")
+        self.d.submit(a + b)
+        self.assertEqual(self.run_dispatched(), a + b)
+
+    def test_429_pauses_host_honours_retry_after_and_retries(self):
+        jobs = self.jobs(2)
+        self.d.submit(jobs)
+        self.run_dispatched()
+        self.assertTrue(self.d.will_retry(jobs[0], 429))
+        self.assertFalse(self.d.done(jobs[0], 429, retry_after=5.0))
+        queued, inflight, penalty, wait = self.d.snapshot()
+        self.assertEqual((queued, inflight, penalty), (2, 0, 2.0))
+        self.assertAlmostEqual(wait, 5.0, delta=0.01)
+        self.now[0] = 104.0
+        self.fire_scheduled()
+        self.assertEqual(self.run_dispatched(), [])      # still paused
+        self.now[0] = 105.01
+        self.fire_scheduled()
+        self.assertEqual(self.run_dispatched(), [jobs[0]])  # retried first, before the next request
+        self.assertEqual(jobs[0].retries, 1)
+
+    def test_backoff_without_retry_after_and_retry_limit(self):
+        job = self.jobs(1)[0]
+        self.d.submit([job])
+        for attempt in range(3):
+            self.run_dispatched()
+            finished = self.d.done(job, 503)
+            self.now[0] += 100
+            self.fire_scheduled()
+        self.assertTrue(finished)                        # gave up after max_retries
+        self.assertEqual(job.retries, 2)
+        self.assertEqual(self.d.snapshot()[2], 8.0)       # 3 x 503 -> 8x slower
+
+    def test_recovers_speed_after_successes(self):
+        jobs = self.jobs(1 + tm.SendDispatcher.RECOVER_AFTER)
+        self.d.submit(jobs)
+        self.run_dispatched()
+        self.d.done(jobs[0], 429, retry_after=0.0)
+        for j in range(tm.SendDispatcher.RECOVER_AFTER + 1):
+            self.now[0] += 60
+            self.fire_scheduled()
+            for job in self.run_dispatched():
+                self.d.done(job, 200)
+        self.assertEqual(self.d.snapshot()[2], 1.0)
+
+    def test_cancel_all_drops_only_queued(self):
+        jobs = self.jobs(4)
+        self.d.submit(jobs)
+        self.run_dispatched()
+        dropped = self.d.cancel_all()
+        self.assertEqual(dropped, jobs[1:])
+        self.assertEqual(self.d.snapshot()[:2], (0, 1))
+
+    def test_parse_retry_after(self):
+        self.assertEqual(tm.parse_retry_after(["HTTP/1.1 429 Too Many", "Retry-After: 7"]), 7.0)
+        self.assertEqual(tm.parse_retry_after(["retry-after:  99999"]), 300.0)
+        self.assertIsNone(tm.parse_retry_after(["X-Other: 1"]))
+        now = 1700000000.0
+        self.assertAlmostEqual(tm.parse_retry_after(["Retry-After: Tue, 14 Nov 2023 22:13:30 GMT"], now=now),
+                               10.0, delta=1.0)
+
+
+class SendModeAndExportTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def test_stop_sending_cancels_queue_and_keeps_crawling(self):
+        cfg = self.ext.get_config()
+        cfg.update({"send_profile": "CUSTOM", "send_delay_ms": 5000, "auto_repeater": False})
+        self.ext.apply_config(cfg)
+        groups = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (groups.append(g), orig(g, i, r, c))[1]
+        self.capture()
+        g = groups[0]
+        self.assertEqual(g.results[0].state, tm.STATE_DONE)            # first request went out
+        self.assertEqual([r.state for r in g.results[1:]], [tm.STATE_QUEUED] * 9)  # rest paced
+        cfg = self.ext.get_config()
+        cfg["auto_send"] = False
+        self.ext.apply_config(cfg)                                   # STOP
+        self.assertEqual([r.state for r in g.results[1:]], [tm.STATE_NOT_SENT] * 9)
+        self.assertEqual(self.ext.dispatcher.snapshot()[0], 0)
+        self.capture(BASE_REQ.replace(b"/v1/transfer", b"/v1/other"))  # still crawls ...
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(r.state == tm.STATE_NOT_SENT for r in groups[1].results))  # ... but sends nothing
+        self.assertEqual(len(self.cb.sent), 1)
+
+    def test_429_marks_retry_and_resends(self):
+        calls = []
+        real = self.cb.makeHttpRequest
+
+        def limited(service, req):
+            calls.append(req)
+            if len(calls) == 1:
+                return FakeRR(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\n\r\nslow down")
+            return real(service, req)
+        self.cb.makeHttpRequest = limited
+        clock = [1000.0]
+        self.ext.dispatcher._clock = lambda: clock[0]
+        groups = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (groups.append(g), orig(g, i, r, c))[1]
+        self.capture()
+        admin = groups[0].results[0]
+        self.assertEqual(admin.state, tm.STATE_RETRY)
+        self.assertEqual(admin.status, 429)
+        self.assertEqual(len(calls), 1)                               # whole host paused
+        clock[0] += 3.1
+        for _, task in list(self.ext.send_scheduler.tasks):
+            task.run()
+        self.assertEqual(admin.state, tm.STATE_DONE)
+        self.assertEqual(admin.status, 200)
+        self.assertEqual(len(calls), 11)                              # 1 x 429 + 10 roles
+
+    def test_excel_export_is_valid_xlsx(self):
+        import io as _io
+        import zipfile
+        import xml.etree.ElementTree as ET
+        groups = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (groups.append(g), orig(g, i, r, c))[1]
+        self.ext.rename_feature(1, '/ > contact > button "a"')
+        self.capture()
+        data = tm.build_api_workbook(groups)
+        z = zipfile.ZipFile(_io.BytesIO(data))
+        names = set(z.namelist())
+        for part in ("[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels",
+                     "xl/styles.xml", "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"):
+            self.assertIn(part, names)
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+        def rows(part):
+            root = ET.fromstring(z.read(part))
+            out = []
+            for row in root.findall(".//m:sheetData/m:row", ns):
+                vals = []
+                for c in row.findall("m:c", ns):
+                    t = c.find(".//m:t", ns)
+                    v = c.find("m:v", ns)
+                    vals.append(t.text if t is not None else (v.text if v is not None else None))
+                out.append(vals)
+            return out
+        api = rows("xl/worksheets/sheet1.xml")
+        self.assertEqual(api[0][:4], ["STT", "Method", "Path", "Vị trí tìm thấy"])
+        self.assertEqual(api[1][:4], ["1", "POST", "/v1/transfer", '/ > contact > button "a"'])
+        roles = rows("xl/worksheets/sheet2.xml")
+        self.assertEqual(len(roles), 11)
+        self.assertEqual(roles[1][5], "01_Admin")
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        self.assertEqual([s.get("name") for s in wb.findall(".//m:sheet", ns)], ["API", "Kết quả Role"])
+
+    def test_log_lines_are_filed_per_api(self):
+        self.ext._flush_log([("10:00:00", "Bắt từ Proxy", 7), ("10:00:01", "Chế độ gửi", None)])
+        self.assertEqual(self.ext._log_by_gid[7], [("10:00:00", "Bắt từ Proxy")])
+        self.assertEqual(list(self.ext._log_system)[-1], ("10:00:01", "Chế độ gửi"))
 
 if __name__ == "__main__":
     unittest.main()

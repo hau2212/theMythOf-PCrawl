@@ -29,10 +29,12 @@ Threading model
 
 import base64
 import json
+import random
 import re
 import threading
 import time
 import traceback
+from collections import deque
 
 from burp import IBurpExtender
 from burp import ITab
@@ -43,9 +45,9 @@ from burp import IMessageEditorController
 from burp import IHttpRequestResponse
 
 from java.awt import (BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, GridLayout,
-                      Insets, Dimension, Color, Font, Toolkit)
+                      Insets, Dimension, Color, Font, Toolkit, RenderingHints)
 from java.awt.datatransfer import StringSelection
-from java.awt.event import MouseAdapter, ActionListener
+from java.awt.event import MouseAdapter, ActionListener, FocusAdapter
 from java.lang import Runnable, Boolean, Integer, String, Throwable
 from java.util import ArrayList, Arrays
 from java.util.concurrent import Executors, TimeUnit
@@ -56,12 +58,12 @@ from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable,
                          JFileChooser, JDialog, JComboBox, JSpinner, SpinnerNumberModel,
                          ListSelectionModel, SwingUtilities, BorderFactory, DefaultCellEditor,
                          BoxLayout, Box, JTree)
-from javax.swing import Timer, UIManager
+from javax.swing import Timer, UIManager, Icon, Scrollable
 from javax.swing.event import (ListSelectionListener, TreeSelectionListener, ChangeListener,
                                TreeWillExpandListener)
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from javax.swing.tree import (DefaultMutableTreeNode, DefaultTreeModel, DefaultTreeCellRenderer,
-                              TreeSelectionModel, TreePath)
+                              TreeSelectionModel, TreePath, TreeCellRenderer)
 from javax.swing.filechooser import FileNameExtensionFilter
 
 try:
@@ -109,7 +111,7 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.6.0"
+EXT_VERSION = "1.7.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
 
@@ -165,17 +167,34 @@ DEFAULT_CONFIG = {
     "number_roles_in_tab": True,
     "include_feature_in_tab": False,
     "threads": 5,
-    "throttle_ms": 0,
     "short_path_len": 40,
     "store_on_disk": True,
+    # Outgoing request pacing (see SendDispatcher)
+    "send_profile": "HUMAN",
+    "send_delay_ms": 700,
+    "send_jitter_pct": 40,
+    "host_concurrency": 1,
+    "max_retries": 3,
 }
+
+# (key, label, delay_ms, jitter_pct, per-host concurrency); CUSTOM keeps the user's numbers.
+SEND_PROFILES = [
+    ("HUMAN", "Như người dùng thật - an toàn (khuyên dùng)", 700, 40, 1),
+    ("BALANCED", "Cân bằng", 250, 30, 2),
+    ("FAST", "Nhanh - dễ bị chặn 429", 60, 10, 4),
+    ("CUSTOM", "Tùy chỉnh", None, None, None),
+]
+RETRYABLE_STATUS = (429, 503)
 
 # One Swing timer flushes every pending UI change; nothing else repaints tables or trees.
 UI_TICK_MS = 200
+LOG_SYSTEM_MAX = 3000      # system / action lines kept for the Log tab
+LOG_PER_API_MAX = 200      # log lines kept per captured API
 
 STATE_ORIGIN = "GỐC (Proxy)"
 STATE_NOT_SENT = "Not sent"
 STATE_QUEUED = "Queued"
+STATE_RETRY = "Chờ thử lại"
 STATE_SENDING = "Sending"
 STATE_DONE = "Done"
 STATE_ERROR = "Error"
@@ -893,6 +912,17 @@ class HierarchyStats(object):
         return self.by_fid.get(fid, [])
 
 
+def group_tree_label(g, audit_summary):
+    return "%s   ·   %s %s   ·   1 gốc + %d role   ·   %s" % (
+        format_api_label(g.gid), g.method, short_path(g.path, 48), len(g.results), audit_summary)
+
+
+def result_tree_label(r, badge):
+    status = r.status if r.status is not None else r.state
+    length = ("%d B" % r.length) if r.length is not None else "-"
+    return "%s   ·   %s   ·   %s   ·   %s" % (r.role_name, status, length, badge)
+
+
 def build_feature_rows(stats, active_fid):
     """Rows of the branch table: (cells, audit_level, feature_or_None); row 0 is [All]."""
     groups = stats.groups
@@ -1073,6 +1103,155 @@ def groups_to_matrix_json(groups, features=None):
     }, indent=2)
 
 
+# ----------------------------------------------------------------------------- Excel export
+
+EXPORT_API_HEADER = ["STT", "Method", "Path", "Vị trí tìm thấy", "Host", "URL đầy đủ",
+                     "Status gốc", "Đánh giá", "Đã gửi", "Nguồn", "Thời gian"]
+EXPORT_API_WIDTHS = [6, 9, 48, 44, 26, 70, 11, 40, 9, 9, 10]
+EXPORT_ROLE_HEADER = ["STT", "API #", "Method", "Path", "Vị trí tìm thấy", "Role", "Trạng thái",
+                      "Status", "Body Len", "Lệch so với gốc", "Thời gian (ms)", "Đánh giá"]
+EXPORT_ROLE_WIDTHS = [6, 7, 9, 44, 40, 22, 12, 8, 10, 14, 14, 40]
+
+
+def api_export_rows(groups):
+    """(api_rows, role_rows) for the Excel export, ordered by API number."""
+    api_rows = []
+    role_rows = []
+    for idx, g in enumerate(sorted(groups or [], key=lambda x: x.gid), 1):
+        _, g_sum = evaluate_group_audit(g)
+        done = len([r for r in g.results if r.state in (STATE_DONE, STATE_ERROR)])
+        api_rows.append([idx, g.method, strip_query(g.path), g.feature_name, g.host, g.url,
+                         g.orig_status, g_sum, "%d/%d" % (done, len(g.results)), g.source, g.created])
+        for r in g.results:
+            _, badge = evaluate_role_result(g, r)
+            delta = (r.length - g.orig_length) if (r.length is not None and g.orig_length is not None) else None
+            role_rows.append([len(role_rows) + 1, g.gid, g.method, strip_query(g.path), g.feature_name,
+                              r.role_name, r.state, r.status, r.length, delta, r.elapsed_ms, badge])
+    return api_rows, role_rows
+
+
+_XML_BAD = re.compile(u"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _xml_escape(value):
+    text = _XML_BAD.sub(u"", u_text(value))
+    return (text.replace(u"&", u"&amp;").replace(u"<", u"&lt;")
+            .replace(u">", u"&gt;").replace(u'"', u"&quot;"))
+
+
+def _xlsx_col(index):
+    name = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def _xlsx_sheet(header, rows, widths):
+    last_col = _xlsx_col(len(header) - 1)
+    out = [u'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+           u'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+           u'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+           u'<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+           u'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>',
+           u'<sheetFormatPr defaultRowHeight="15"/><cols>']
+    for i, w in enumerate(widths):
+        out.append(u'<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i + 1, i + 1, w))
+    out.append(u'</cols><sheetData>')
+    for r_idx, row in enumerate([header] + list(rows)):
+        style = u' s="1"' if r_idx == 0 else u''
+        cells = []
+        for c_idx, value in enumerate(row):
+            if value is None:
+                continue
+            ref = u"%s%d" % (_xlsx_col(c_idx), r_idx + 1)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and r_idx > 0:
+                cells.append(u'<c r="%s"%s><v>%s</v></c>' % (ref, style, value))
+            else:
+                cells.append(u'<c r="%s" t="inlineStr"%s><is><t xml:space="preserve">%s</t></is></c>'
+                             % (ref, style, _xml_escape(value)))
+        out.append(u'<row r="%d">%s</row>' % (r_idx + 1, u"".join(cells)))
+    out.append(u'</sheetData><autoFilter ref="A1:%s%d"/></worksheet>' % (last_col, len(rows) + 1))
+    return u"".join(out)
+
+
+def build_xlsx(sheets):
+    """
+    Minimal but valid .xlsx (Office Open XML) from [(name, header, rows, widths), ...].
+    Bold coloured header row, frozen + auto-filtered. Standard library only (zipfile).
+    """
+    import zipfile
+    from io import BytesIO
+    ns_main = u"http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ns_rel = u"http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    ns_pkg = u"http://schemas.openxmlformats.org/package/2006/relationships"
+    buf = BytesIO()
+    z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+
+    def put(name, text):
+        z.writestr(name, text.encode("utf-8"))
+
+    overrides = [u'<Override PartName="/xl/workbook.xml" ContentType="application/'
+                 u'vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+                 u'<Override PartName="/xl/styles.xml" ContentType="application/'
+                 u'vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>']
+    sheet_tags = []
+    rels = []
+    names = []
+    for i, (name, header, rows, widths) in enumerate(sheets, 1):
+        put(u"xl/worksheets/sheet%d.xml" % i, _xlsx_sheet(header, rows, widths))
+        overrides.append(u'<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/'
+                         u'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+        sheet_tags.append(u'<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (_xml_escape(name[:31]), i, i))
+        rels.append(u'<Relationship Id="rId%d" Type="%s/worksheet" Target="worksheets/sheet%d.xml"/>'
+                    % (i, ns_rel, i))
+        names.append(u'<definedName name="_xlnm._FilterDatabase" localSheetId="%d" hidden="1">'
+                     u"&apos;%s&apos;!$A$1:$%s$%d</definedName>"
+                     % (i - 1, _xml_escape(name[:31]), _xlsx_col(len(header) - 1), len(rows) + 1))
+    rels.append(u'<Relationship Id="rId%d" Type="%s/styles" Target="styles.xml"/>' % (len(sheets) + 1, ns_rel))
+    put(u"[Content_Types].xml",
+        u'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        u'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        u'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        u'<Default Extension="xml" ContentType="application/xml"/>' + u"".join(overrides) + u'</Types>')
+    put(u"_rels/.rels",
+        u'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="%s">'
+        u'<Relationship Id="rId1" Type="%s/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+        % (ns_pkg, ns_rel))
+    put(u"xl/workbook.xml",
+        u'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="%s" xmlns:r="%s">'
+        u'<sheets>%s</sheets><definedNames>%s</definedNames></workbook>'
+        % (ns_main, ns_rel, u"".join(sheet_tags), u"".join(names)))
+    put(u"xl/_rels/workbook.xml.rels",
+        u'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="%s">%s</Relationships>'
+        % (ns_pkg, u"".join(rels)))
+    put(u"xl/styles.xml",
+        u'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="%s">'
+        u'<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+        u'<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>'
+        u'<fills count="3"><fill><patternFill patternType="none"/></fill>'
+        u'<fill><patternFill patternType="gray125"/></fill>'
+        u'<fill><patternFill patternType="solid"><fgColor rgb="FF2563EB"/><bgColor indexed="64"/>'
+        u'</patternFill></fill></fills>'
+        u'<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        u'<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        u'<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        u'<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        u'</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        u'</styleSheet>' % ns_main)
+    z.close()
+    return buf.getvalue()
+
+
+def build_api_workbook(groups):
+    api_rows, role_rows = api_export_rows(groups)
+    return build_xlsx([
+        (u"API", EXPORT_API_HEADER, api_rows, EXPORT_API_WIDTHS),
+        (u"Kết quả Role", EXPORT_ROLE_HEADER, role_rows, EXPORT_ROLE_WIDTHS),
+    ])
+
+
 def build_history_summary_text(features, groups):
     """
     Build a structured audit report grouping sequential APIs (API 1, API 2, ...)
@@ -1192,7 +1371,15 @@ def merge_config(stored):
         else:
             cfg[k] = "" if cfg[k] is None else "%s" % cfg[k]
     cfg["threads"] = max(1, min(64, cfg["threads"]))
-    cfg["throttle_ms"] = max(0, min(60000, cfg["throttle_ms"]))
+    if cfg["send_profile"] not in [p[0] for p in SEND_PROFILES]:
+        cfg["send_profile"] = DEFAULT_CONFIG["send_profile"]
+    for key, label, delay, jitter, conc in SEND_PROFILES:
+        if key == cfg["send_profile"] and delay is not None:
+            cfg["send_delay_ms"], cfg["send_jitter_pct"], cfg["host_concurrency"] = delay, jitter, conc
+    cfg["send_delay_ms"] = max(0, min(60000, cfg["send_delay_ms"]))
+    cfg["send_jitter_pct"] = max(0, min(100, cfg["send_jitter_pct"]))
+    cfg["host_concurrency"] = max(1, min(16, cfg["host_concurrency"]))
+    cfg["max_retries"] = max(0, min(10, cfg["max_retries"]))
     cfg["short_path_len"] = max(8, min(200, cfg["short_path_len"]))
     return cfg
 
@@ -1234,6 +1421,190 @@ def ui_call(fn):
         fn()
     else:
         SwingUtilities.invokeLater(_Task(fn))
+
+
+def parse_retry_after(header_lines, now=None):
+    """Seconds to wait from a Retry-After header (delta-seconds or HTTP-date), capped at 300."""
+    for h in header_lines or []:
+        line = u_text(h)
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name.strip().lower() != "retry-after":
+            continue
+        v = value.strip()
+        if v.isdigit():
+            return float(min(int(v), 300))
+        try:
+            import email.utils
+            parsed = email.utils.parsedate_tz(v)
+            if parsed:
+                secs = email.utils.mktime_tz(parsed) - (now if now is not None else time.time())
+                return float(max(0, min(secs, 300)))
+        except Exception:
+            pass
+        return None
+    return None
+
+
+class _SendJob(object):
+    def __init__(self, group, res):
+        self.group = group
+        self.res = res
+        self.key = (group.protocol, group.host, group.port)
+        self.retries = 0
+
+
+class _HostState(object):
+    def __init__(self):
+        self.queue = deque()
+        self.inflight = 0
+        self.next_ok = 0.0
+        self.paused_until = 0.0
+        self.penalty = 1.0
+        self.ok_streak = 0
+
+
+class SendDispatcher(object):
+    """
+    Single gate for EVERY outgoing request (auto-send after capture, bulk send, single send).
+
+    Per target host:
+      * requests leave in FIFO order, at most `host_concurrency` at a time;
+      * consecutive requests are spaced by `send_delay_ms` +/- `send_jitter_pct`, measured
+        from when the previous answer arrived - the rhythm of a person clicking around;
+      * a 429 / 503 answer pauses that host (Retry-After is honoured, otherwise an
+        exponential back-off), halves its speed, forces one-at-a-time and puts the request
+        back at the head of the queue (up to `max_retries`). Successful streaks speed back up.
+    Workers never sleep: pacing is done by scheduling a wake-up for the next ready host.
+    """
+    MAX_PENALTY = 16.0
+    RECOVER_AFTER = 8
+
+    def __init__(self, run_fn, executor, scheduler, cfg_fn, log_fn=None, clock=None, rand=None):
+        self._run_fn = run_fn
+        self._executor = executor
+        self._scheduler = scheduler
+        self._cfg_fn = cfg_fn
+        self._log = log_fn
+        self._clock = clock or time.time
+        self._rand = rand or random.random
+        self._lock = threading.RLock()
+        self._hosts = {}
+        self._order = []
+        self._wake_at = None
+
+    def _host(self, key):
+        h = self._hosts.get(key)
+        if h is None:
+            h = _HostState()
+            self._hosts[key] = h
+            self._order.append(key)
+        return h
+
+    def _pacing(self):
+        cfg = self._cfg_fn()
+        return (cfg.get("send_delay_ms", 0) / 1000.0, cfg.get("send_jitter_pct", 0) / 100.0,
+                max(1, cfg.get("host_concurrency", 1)), cfg.get("max_retries", 0))
+
+    def _gap(self, h, delay, jitter):
+        gap = delay * h.penalty
+        if jitter > 0:
+            gap *= 1.0 + jitter * (2.0 * self._rand() - 1.0)
+        return max(0.0, gap)
+
+    def submit(self, jobs):
+        with self._lock:
+            for job in jobs:
+                self._host(job.key).queue.append(job)
+        self.pump()
+
+    def cancel_all(self):
+        """Drop every queued (not yet sent) job and return them."""
+        dropped = []
+        with self._lock:
+            for h in self._hosts.values():
+                dropped.extend(h.queue)
+                h.queue.clear()
+        return dropped
+
+    def snapshot(self):
+        """(queued, in_flight, slowest_penalty, seconds_until_resume)"""
+        with self._lock:
+            now = self._clock()
+            queued = sum([len(h.queue) for h in self._hosts.values()])
+            inflight = sum([h.inflight for h in self._hosts.values()])
+            penalty = max([h.penalty for h in self._hosts.values()] or [1.0])
+            wait = max([h.paused_until - now for h in self._hosts.values()] or [0.0])
+        return queued, inflight, penalty, max(0.0, wait)
+
+    def _wake(self):
+        with self._lock:
+            self._wake_at = None
+        self.pump()
+
+    def pump(self):
+        run = []
+        wake_delay = None
+        with self._lock:
+            now = self._clock()
+            delay, jitter, conc, _ = self._pacing()
+            earliest = None
+            for key in self._order:
+                h = self._hosts[key]
+                limit = 1 if h.penalty > 1.0 else conc
+                while h.queue and h.inflight < limit:
+                    ready = max(h.next_ok, h.paused_until)
+                    if ready > now:
+                        earliest = ready if earliest is None else min(earliest, ready)
+                        break
+                    job = h.queue.popleft()
+                    h.inflight += 1
+                    h.next_ok = now + self._gap(h, delay, jitter)
+                    run.append(job)
+            if earliest is not None and (self._wake_at is None or earliest < self._wake_at - 0.005):
+                self._wake_at = earliest
+                wake_delay = earliest - now
+        if wake_delay is not None:
+            self._scheduler.schedule(_Task(self._wake, self._log),
+                                     int(wake_delay * 1000) + 1, TimeUnit.MILLISECONDS)
+        for job in run:
+            self._executor.execute(_Task((lambda j=job: self._run_fn(j)), self._log))
+
+    def will_retry(self, job, status):
+        return status in RETRYABLE_STATUS and job.retries < self._pacing()[3]
+
+    def done(self, job, status, retry_after=None):
+        """Report a finished request. Returns False when it was queued again for a retry."""
+        requeued = False
+        notice = None
+        with self._lock:
+            now = self._clock()
+            h = self._host(job.key)
+            h.inflight = max(0, h.inflight - 1)
+            delay, jitter, conc, max_retries = self._pacing()
+            if status in RETRYABLE_STATUS:
+                h.ok_streak = 0
+                h.penalty = min(self.MAX_PENALTY, h.penalty * 2.0)
+                wait = retry_after if retry_after is not None else min(60.0, max(2.0, delay * h.penalty * 2.0))
+                if now + wait > h.paused_until + 0.5:
+                    notice = (job.key, status, wait, h.penalty)
+                h.paused_until = max(h.paused_until, now + wait)
+                if job.retries < max_retries:
+                    job.retries += 1
+                    h.queue.appendleft(job)
+                    requeued = True
+            else:
+                h.ok_streak += 1
+                if h.penalty > 1.0 and h.ok_streak >= self.RECOVER_AFTER:
+                    h.penalty = max(1.0, h.penalty / 2.0)
+                    h.ok_streak = 0
+                h.next_ok = max(h.next_ok, now + self._gap(h, delay, jitter))
+        if notice is not None and self._log is not None:
+            self._log("Host %s trả HTTP %d -> tạm dừng %.1fs, giảm tốc x%d, gửi từng request một."
+                      % (notice[0][1], notice[1], notice[2], int(notice[3])))
+        self.pump()
+        return not requeued
 
 
 # =============================================================================
@@ -2020,6 +2391,16 @@ class RowPalette(object):
     ACCENTS = [(66, 133, 244), (234, 88, 12), (22, 163, 74), (168, 85, 247),
                (219, 39, 119), (13, 148, 136), (202, 138, 4), (100, 116, 139)]
     ORIG_ACCENT = (37, 99, 235)
+    # Folder level 1, 2, 3 ... (cycles): same level -> same colour in every tree.
+    LEVEL_HUES = [(37, 99, 235), (13, 148, 136), (147, 51, 234), (217, 119, 6),
+                  (219, 39, 119), (22, 163, 74), (71, 85, 105)]
+    MODE_HUES = {
+        "REPLACE": (37, 99, 235),
+        "ADD": (22, 163, 74),
+        "REMOVE": (220, 38, 38),
+        "COOKIE_SET": (147, 51, 234),
+        "COOKIE_REMOVE": (234, 88, 12),
+    }
 
     _cache = {}
 
@@ -2056,6 +2437,31 @@ class RowPalette(object):
         self.orig_fg = _mix(self.orig_accent, white, 0.45) if self.dark else self.orig_accent
         self._stripe_borders = {}
         self.pad_border = BorderFactory.createEmptyBorder(0, 6, 0, 6)
+        self.muted = _mix(fg, bg, 0.42)
+        self.dots = {}
+        for lvl, rgb in self.HUES.items():
+            self.dots[lvl] = Color(rgb[0], rgb[1], rgb[2])
+        self.dot_none = _mix(bg, fg, 0.35)
+        self.levels = []
+        for rgb in self.LEVEL_HUES:
+            hue = Color(rgb[0], rgb[1], rgb[2])
+            fill = _mix(bg, hue, 0.20 if self.dark else 0.10)
+            edge = _mix(bg, hue, 0.75)
+            text = _mix(hue, white, 0.55) if self.dark else _mix(hue, black, 0.30)
+            self.levels.append((fill, edge, text, hue))
+        self.modes = {}
+        for name, rgb in self.MODE_HUES.items():
+            hue = Color(rgb[0], rgb[1], rgb[2])
+            self.modes[name] = (_mix(bg, hue, 0.22 if self.dark else 0.12),
+                                _mix(hue, white, 0.45) if self.dark else _mix(hue, black, 0.15),
+                                _mix(bg, hue, 0.6))
+
+    def level(self, depth):
+        """(fill, edge, text, hue) of a folder at 1-based depth."""
+        return self.levels[(max(depth, 1) - 1) % len(self.levels)]
+
+    def dot(self, lvl):
+        return self.dots.get(lvl, self.dot_none)
 
     def background(self, lvl, view_row):
         pair = self.row_bg.get(lvl, self.zebra)
@@ -2299,6 +2705,33 @@ class _Action(ActionListener):
             self._fn(event)
 
 
+class _ViewportWidthPanel(JPanel, Scrollable):
+    """Panel that always takes the scroll pane's width (so wrapped text wraps), scrolling vertically."""
+
+    def getPreferredScrollableViewportSize(self):
+        return self.getPreferredSize()
+
+    def getScrollableUnitIncrement(self, rect, orientation, direction):
+        return 16
+
+    def getScrollableBlockIncrement(self, rect, orientation, direction):
+        return 96
+
+    def getScrollableTracksViewportWidth(self):
+        return True
+
+    def getScrollableTracksViewportHeight(self):
+        return False
+
+
+class _FocusLost(FocusAdapter):
+    def __init__(self, fn):
+        self._fn = fn
+
+    def focusLost(self, event):
+        self._fn()
+
+
 class _Change(ChangeListener):
     """Explicit ChangeListener implementation for JSpinner."""
 
@@ -2328,7 +2761,7 @@ class HierarchyTreeNode(DefaultMutableTreeNode):
     while storing .kind, .payload, .label, and .audit_level directly on the node.
     """
 
-    def __init__(self, kind, payload, label, audit_level=AUDIT_NONE, key=None):
+    def __init__(self, kind, payload, label, audit_level=AUDIT_NONE, key=None, depth=0):
         clean_label = u_text(label)
         DefaultMutableTreeNode.__init__(self, clean_label)
         self.kind = kind
@@ -2336,7 +2769,10 @@ class HierarchyTreeNode(DefaultMutableTreeNode):
         self.label = clean_label
         self.audit_level = audit_level
         self.key = key          # stable identity across rebuilds (selection / expansion restore)
-        self.loaded = True      # False while a GROUP node only holds its placeholder child
+        # folder level (1 = top), drives the level colour; not "depth"/"level": those are
+        # read-only bean properties of DefaultMutableTreeNode under Jython
+        self.folder_level = depth
+        self.loaded = True      # False while a lazy node only holds its placeholder child
 
     def toString(self):
         return getattr(self, "label", "")
@@ -2373,78 +2809,156 @@ class _TreeNodeItem(object):
         return self.label
 
 
-class HierarchyTreeRenderer(DefaultTreeCellRenderer):
+class _DotIcon(Icon):
+    """Small filled circle / rounded square used as the tree-row marker."""
+    _cache = {}
+
+    @classmethod
+    def of(cls, color, square=False):
+        key = (color.getRGB(), square)
+        icon = cls._cache.get(key)
+        if icon is None:
+            icon = cls(color, square)
+            cls._cache[key] = icon
+        return icon
+
+    def __init__(self, color, square=False):
+        self._color = color
+        self._square = square
+
+    def getIconWidth(self):
+        return 12
+
+    def getIconHeight(self):
+        return 10
+
+    def paintIcon(self, c, g, x, y):
+        g2 = g.create()
+        try:
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            g2.setColor(self._color)
+            if self._square:
+                g2.fillRoundRect(x + 1, y, 10, 10, 4, 4)
+            else:
+                g2.fillOval(x + 1, y, 10, 10)
+        finally:
+            g2.dispose()
+
+
+class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
     """
-    Custom JTree renderer that guarantees human-readable Vietnamese labels and
-    applies color-coding (Yellow INFO, Orange WARN, Green OK, Red ERR) to Folder/API/Role nodes.
+    Tree rows drawn as rounded "chips":
+      * folders: border + light fill in the colour of their LEVEL (level 1 blue, level 2 teal,
+        level 3 purple, ...), so siblings share a colour and parent/child never do; a dot at
+        the right end shows the branch's audit verdict;
+      * API / role rows: audit tint (yellow INFO, green OK, orange WARN, red ERROR) and an
+        audit-coloured marker; the original request is drawn in blue.
+    Colours come from RowPalette, i.e. from the tree's own colours (light and dark themes).
     """
-    FONT_FOLDER = Font("Dialog", getattr(Font, "BOLD", 1), 12)
-    FONT_API = Font("Dialog", getattr(Font, "BOLD", 1), 11)
-    FONT_NORMAL = Font("Dialog", getattr(Font, "PLAIN", 0), 11)
+    ARC = 10
+    STRONG = ("ROOT", "FOLDER", "GROUP", "LOGBRANCH", "LOGAPI", "LOGSYS")
 
     def __init__(self):
-        DefaultTreeCellRenderer.__init__(self)
+        JLabel.__init__(self)
+        self.setOpaque(False)
+        self.setIconTextGap(5)
+        self._fill = None
+        self._edge = None
+        self._dot = None
+        self._fonts = (None, None)
+        self._pad = BorderFactory.createEmptyBorder(2, 6, 2, 9)
+        self._pad_dot = BorderFactory.createEmptyBorder(2, 6, 2, 22)
+        self.setBorder(self._pad)
 
     def getTreeCellRendererComponent(self, tree, value, selected, expanded, leaf, row, hasFocus):
-        comp = DefaultTreeCellRenderer.getTreeCellRendererComponent(
-            self, tree, value, selected, expanded, leaf, row, hasFocus)
         try:
-            kind = getattr(value, "kind", None)
-            label = getattr(value, "label", None)
-            audit_level = getattr(value, "audit_level", AUDIT_NONE)
-            if kind is None and isinstance(value, DefaultMutableTreeNode):
-                uobj = value.getUserObject()
-                if hasattr(uobj, "label"):
-                    kind = getattr(uobj, "kind", None)
-                    label = getattr(uobj, "label", None)
-                    audit_level = getattr(uobj, "audit_level", AUDIT_NONE)
-                elif uobj is not None:
-                    label = u_text(uobj)
-            if label:
-                comp.setText(u_text(label))
-
-            if kind in ("ROOT", "FOLDER"):
-                comp.setFont(self.FONT_FOLDER)
-            elif kind in ("GROUP", "ORIG"):
-                comp.setFont(self.FONT_API)
-            else:
-                comp.setFont(self.FONT_NORMAL)
-
-            if not selected:
-                tree_bg = tree.getBackground() if (tree is not None and hasattr(tree, "getBackground")) else None
-                tree_fg = tree.getForeground() if (tree_bg is not None and hasattr(tree, "getForeground")) else None
-                if tree_bg is not None and tree_fg is not None:
-                    pal = RowPalette.of(tree_bg, tree_fg)
-                    if audit_level in pal.row_bg:
-                        bg, fg = pal.row_bg[audit_level][0], pal.audit_fg[audit_level]
-                    elif kind == "ORIG":
-                        bg, fg = _mix(tree_bg, pal.orig_accent, 0.14), pal.orig_fg
-                    else:
-                        bg, fg = None, tree_fg
-                elif audit_level == AUDIT_WARN:
-                    bg, fg = AuditTableRenderer.BG_WARN, AuditTableRenderer.FG_WARN
-                elif audit_level == AUDIT_INFO:
-                    bg, fg = AuditTableRenderer.BG_INFO, AuditTableRenderer.FG_INFO
-                elif audit_level == AUDIT_ERROR:
-                    bg, fg = AuditTableRenderer.BG_ERR, AuditTableRenderer.FG_ERR
-                elif audit_level == AUDIT_OK:
-                    bg, fg = AuditTableRenderer.BG_OK, AuditTableRenderer.FG_OK
-                elif kind == "ORIG":
-                    bg, fg = Color(232, 240, 254), Color(20, 65, 150)
-                else:
-                    bg, fg = None, AuditTableRenderer.FG_DEFAULT
-                eff_bg = bg if bg is not None else tree_bg
-                if hasattr(self, "setBackgroundNonSelectionColor") and eff_bg is not None:
-                    self.setBackgroundNonSelectionColor(eff_bg)
-                if hasattr(self, "setTextNonSelectionColor") and fg is not None:
-                    self.setTextNonSelectionColor(fg)
-                if eff_bg is not None:
-                    comp.setBackground(eff_bg)
-                if fg is not None:
-                    comp.setForeground(fg)
+            self._configure(tree, value, selected)
         except (Exception, Throwable):
-            pass
-        return comp
+            self._fill = self._edge = self._dot = None
+            try:
+                self.setText(u_text(getattr(value, "label", None) or value))
+            except (Exception, Throwable):
+                pass
+        return self
+
+    def _configure(self, tree, value, selected):
+        kind = getattr(value, "kind", None)
+        label = getattr(value, "label", None)
+        lvl = getattr(value, "audit_level", AUDIT_NONE)
+        depth = getattr(value, "folder_level", 0)
+        if label is None and isinstance(value, DefaultMutableTreeNode):
+            uobj = value.getUserObject()
+            label = u_text(uobj) if uobj is not None else ""
+        self.setText(u_text(label or ""))
+        self._fill = self._edge = self._dot = None
+        bg = tree.getBackground() if tree is not None else None
+        fg = tree.getForeground() if bg is not None else None
+        if bg is None or fg is None:
+            return
+        pal = RowPalette.of(bg, fg)
+        font = tree.getFont()
+        if self._fonts[0] != font:
+            self._fonts = (font, font.deriveFont(Font.BOLD))
+        self.setFont(self._fonts[1] if kind in self.STRONG else font)
+
+        fill = edge = dot = icon = None
+        text = fg
+        if kind in ("FOLDER", "LOGBRANCH"):
+            fill, edge, text, hue = pal.level(depth)
+            icon = _DotIcon.of(hue, square=True)
+            if lvl in pal.dots:
+                dot = pal.dot(lvl)
+        elif kind in ("ROOT", "LOGSYS"):
+            fill, edge = pal.zebra[1], pal.grid
+            icon = _DotIcon.of(pal.dot_none, square=True)
+        elif kind in ("GROUP", "LOGAPI"):
+            fill = pal.row_bg.get(lvl, pal.zebra)[0] if lvl in pal.row_bg else pal.zebra[1]
+            icon = _DotIcon.of(pal.dot(lvl))
+        elif kind in ("ORIG", "ROLE", "LOGRES"):
+            if lvl in pal.row_bg:
+                fill = pal.row_bg[lvl][0]
+            if kind == "ORIG":
+                text = pal.orig_fg
+            icon = _DotIcon.of(pal.orig_accent if kind == "ORIG" else pal.dot(lvl))
+        else:
+            text = pal.muted
+        if selected:
+            sel_bg = UIManager.getColor("Tree.selectionBackground") or Color(51, 120, 220)
+            sel_fg = UIManager.getColor("Tree.selectionForeground") or Color(255, 255, 255)
+            fill, edge, text = sel_bg, _mix(sel_bg, fg, 0.3), sel_fg
+        self._fill, self._edge, self._dot = fill, edge, dot
+        self.setForeground(text)
+        self.setIcon(icon)
+        self.setBorder(self._pad_dot if dot is not None else self._pad)
+
+    def paintComponent(self, g):
+        if self._fill is not None or self._edge is not None or self._dot is not None:
+            g2 = g.create()
+            try:
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                w = self.getWidth()
+                h = self.getHeight()
+                if self._fill is not None:
+                    g2.setColor(self._fill)
+                    g2.fillRoundRect(0, 1, w - 1, h - 2, self.ARC, self.ARC)
+                if self._edge is not None:
+                    g2.setColor(self._edge)
+                    g2.drawRoundRect(0, 1, w - 1, h - 3, self.ARC, self.ARC)
+                if self._dot is not None:
+                    g2.setColor(self._dot)
+                    g2.fillOval(w - 16, (h - 9) // 2, 9, 9)
+            finally:
+                g2.dispose()
+        self.super__paintComponent(g)
+
+    def getPreferredSize(self):
+        # Text is measured at 1x with integer metrics but drawn scaled (HiDPI 125-200 %) or with
+        # fractional metrics, which can be a few % wider: reserve that slack so labels never clip.
+        size = JLabel.getPreferredSize(self)
+        text = self.getText()
+        if text:
+            size.width += 4 + self.getFontMetrics(self.getFont()).stringWidth(text) // 20
+        return size
 
 
 class _DoubleClick(MouseAdapter):
@@ -2706,6 +3220,79 @@ class _EditorController(IMessageEditorController):
 # =============================================================================
 
 
+MODE_HINTS = [
+    (MODE_REPLACE, "ghi đè hoặc thêm header"),
+    (MODE_ADD, "thêm 1 dòng header mới"),
+    (MODE_REMOVE, "xóa header"),
+    (MODE_COOKIE_SET, "đặt / sửa 1 biến trong Cookie"),
+    (MODE_COOKIE_REMOVE, "xóa 1 biến khỏi Cookie"),
+    (REMOVE_TOKEN, "ghi vào ô Value = xóa"),
+]
+
+
+def _font_resized(font, style, delta):
+    """font with `style`, `delta` points bigger/smaller (relative, so Burp's font size setting is kept)."""
+    try:
+        return font.deriveFont(style, float(font.getSize2D()) + delta)
+    except (Exception, Throwable):
+        return font.deriveFont(style)
+
+
+def _ui_colors():
+    bg = UIManager.getColor("Panel.background") or Color(242, 242, 242)
+    fg = UIManager.getColor("Label.foreground") or Color(30, 30, 30)
+    return bg, fg
+
+
+def make_chip(text, fill, fg, edge):
+    """Small opaque pill-shaped label (plain text: Burp disables HTML in extension labels)."""
+    chip = JLabel(" %s " % text)
+    chip.setOpaque(True)
+    chip.setBackground(fill)
+    chip.setForeground(fg)
+    chip.setFont(chip.getFont().deriveFont(Font.BOLD))
+    chip.setBorder(BorderFactory.createCompoundBorder(
+        BorderFactory.createLineBorder(edge), BorderFactory.createEmptyBorder(1, 4, 1, 4)))
+    return chip
+
+
+def build_mode_legend():
+    """Legend of the rule modes, laid out as 3 x 2 chips + descriptions."""
+    bg, fg = _ui_colors()
+    pal = RowPalette.of(bg, fg)
+    panel = JPanel(BorderLayout(4, 4))
+    panel.setBorder(BorderFactory.createEmptyBorder(6, 2, 4, 2))
+    title = JLabel("Các chế độ (cột Mode):")
+    title.setFont(title.getFont().deriveFont(Font.BOLD))
+    panel.add(title, BorderLayout.NORTH)
+    grid = JPanel(GridLayout(0, 3, 12, 4))
+    for mode, hint in MODE_HINTS:
+        fill, text, edge = pal.modes.get(mode, (pal.zebra[1], fg, pal.grid))
+        cell = JPanel(FlowLayout(FlowLayout.LEFT, 5, 0))
+        cell.add(make_chip(mode, fill, text, edge))
+        desc = JLabel(hint)
+        desc.setForeground(pal.muted)
+        cell.add(desc)
+        grid.add(cell)
+    panel.add(grid, BorderLayout.CENTER)
+    return panel
+
+
+class ModeCellRenderer(DefaultTableCellRenderer):
+    """Mode column of the rule table: bold text in the mode's colour."""
+
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+        comp = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, table, value, isSelected, hasFocus, row, column)
+        comp.setFont(table.getFont().deriveFont(Font.BOLD))
+        if not isSelected:
+            pal = RowPalette.of(table.getBackground(), table.getForeground())
+            colours = pal.modes.get(u_text(value).upper())
+            comp.setBackground(colours[0] if colours else table.getBackground())
+            comp.setForeground(colours[1] if colours else table.getForeground())
+        return comp
+
+
 class RoleEditorPanel(JPanel):
     """
     Reusable editor panel for a single role profile. Used both inline on the
@@ -2749,9 +3336,10 @@ class RoleEditorPanel(JPanel):
         self.model = HeaderRuleTableModel(role.get("headers", []), on_change=self._refresh_jwt_preview)
         self.table = JTable(self.model)
         self.table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE)
-        self.table.setRowHeight(22)
         cm = self.table.getColumnModel()
         cm.getColumn(2).setCellEditor(DefaultCellEditor(JComboBox(HEADER_MODES)))
+        cm.getColumn(2).setCellRenderer(ModeCellRenderer())
+        self.table.setRowHeight(24)
         cm.getColumn(0).setPreferredWidth(180)
         cm.getColumn(1).setPreferredWidth(420)
         cm.getColumn(2).setPreferredWidth(130)
@@ -2769,12 +3357,7 @@ class RoleEditorPanel(JPanel):
 
         center = JPanel(BorderLayout(4, 4))
         center.add(split, BorderLayout.CENTER)
-        center.add(JLabel(
-            "<html><b>Modes:</b> REPLACE = ghi đè/thêm Header &nbsp;|&nbsp; "
-            "ADD = nối thêm dòng Header &nbsp;|&nbsp; "
-            "REMOVE (hoặc <b>[REMOVE]</b>) = xóa Header &nbsp;|&nbsp; "
-            "<b>COOKIE_SET</b> = thêm/sửa 1 biến trong Cookie &nbsp;|&nbsp; "
-            "<b>COOKIE_REMOVE</b> = xóa 1 biến khỏi Cookie</html>"), BorderLayout.SOUTH)
+        center.add(build_mode_legend(), BorderLayout.SOUTH)
         self.add(center, BorderLayout.CENTER)
 
         toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
@@ -3066,7 +3649,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._stale_stats = True
         self._stale_left = True
         self._stale_history = True
-        self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state()}
+        self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state(),
+                             "log": self._new_tree_state()}
+        self._stale_log = True
+        self._log_lock = threading.Lock()
+        self._log_system = deque(maxlen=LOG_SYSTEM_MAX)
+        self._log_by_gid = {}
+        self._send_ui_state = None
         self._restoring_tree = False
         self._restoring_feature_sel = False
         self._chips_path = None
@@ -3086,6 +3675,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         self.capture_executor = Executors.newSingleThreadExecutor()
         self.send_executor = Executors.newFixedThreadPool(self.config["threads"])
+        self.send_scheduler = Executors.newSingleThreadScheduledExecutor()
+        self.dispatcher = SendDispatcher(self._run_job, self.send_executor, self.send_scheduler,
+                                         self.get_config, self.log)
 
         callbacks.registerExtensionStateListener(self)
         # The UI is built and the tab registered before this method returns, so
@@ -3175,6 +3767,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         try:
             self.capture_executor.shutdownNow()
             self.send_executor.shutdownNow()
+            self.send_scheduler.shutdownNow()
             self.capture_executor.awaitTermination(2, TimeUnit.SECONDS)
             self.send_executor.awaitTermination(2, TimeUnit.SECONDS)
         except Throwable:
@@ -3189,33 +3782,36 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         return self.main_panel
 
     # --------------------------------------------------------------- logging
-    def log(self, msg):
-        """Thread-safe: lines are buffered and written (extension Output + Log tab) by the UI tick."""
-        line = "[%s] %s" % (time.strftime("%H:%M:%S"), u_text(msg))
+    def log(self, msg, gid=None):
+        """
+        Thread-safe. `gid` files the line under that API in the Log tab (otherwise under
+        'Hệ thống'). Lines are buffered and written (extension Output + Log tab) by the UI tick.
+        """
+        ts = time.strftime("%H:%M:%S")
+        text = u_text(msg)
+        entry = (ts, text, gid)
         if self._ui_timer is None:
-            try:
-                self.callbacks.printOutput(line)
-            except (Throwable, Exception):
-                pass
+            self._flush_log([entry])
             return
         with self._ui_lock:
             if len(self._p_log) < 5000:
-                self._p_log.append(line)
+                self._p_log.append(entry)
 
-    def _flush_log(self, lines):
-        text = "\n".join(lines)
+    def _flush_log(self, entries):
         try:
-            self.callbacks.printOutput(text)
+            self.callbacks.printOutput("\n".join(["[%s] %s" % (ts, text) for ts, text, _ in entries]))
         except (Throwable, Exception):
             pass
-        area = self.log_area
-        if area is None:
-            return
-        area.append(text + "\n")
-        doc = area.getDocument()
-        if doc.getLength() > 300000:
-            doc.remove(0, doc.getLength() - 200000)
-        area.setCaretPosition(doc.getLength())
+        with self._log_lock:
+            for ts, text, gid in entries:
+                if gid is None:
+                    self._log_system.append((ts, text))
+                else:
+                    lines = self._log_by_gid.setdefault(gid, [])
+                    lines.append((ts, text))
+                    if len(lines) > LOG_PER_API_MAX:
+                        del lines[:len(lines) - LOG_PER_API_MAX]
+        self._stale_log = True
 
     # ------------------------------------------------------------ UI refresh
     def _mark(self, structure=False, status=False):
@@ -3271,6 +3867,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._stale_stats = True
             self._stale_left = True
             self._stale_history = True
+            self._stale_log = True
+        self._refresh_send_controls()
         self._refresh_stale_views(force)
         if status or structure:
             self._do_update_status()
@@ -3308,6 +3906,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             if self._rebuild_tree("history", tree, self.history_tree_model, label, stats, force):
                 self._stale_history = False
                 self._refresh_history_summary_only()
+        tree = getattr(self, "log_tree", None)
+        if self._stale_log and tree is not None and tree.isShowing():
+            if self._rebuild_tree("log", tree, self.log_tree_model, "Nhật ký", stats, force,
+                                  builder=self._build_log_nodes):
+                self._stale_log = False
 
     def _reload_feature_table(self, stats):
         if self.feature_model is None or self.feature_table is None:
@@ -3590,7 +4193,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         err = self._recompile_filters(new_cfg)
         with self._cfg_lock:
             old_threads = self.config["threads"]
+            was_sending = self.config.get("auto_send", False)
             self.config = new_cfg
+        if was_sending and not new_cfg.get("auto_send", False):
+            self.cancel_pending_sends("Đã DỪNG gửi")
         n = new_cfg["threads"]
         if n != old_threads:
             pool = self.send_executor
@@ -3779,10 +4385,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         with self._ui_lock:
             self._p_new.append(group)
-        self.log("%s (%s) [%s]: %s %s -> 1 API gốc + %d role clone(s) [%s]" %
-                 (format_api_label(gid), format_group_id(gid),
-                  format_feature_label(feat.fid, feat.name),
-                  method, url, len(group.results), source))
+        self.log("Bắt từ %s: %s %s -> 1 API gốc + %d role" %
+                 (source, method, url, len(group.results)), gid=gid)
         if cfg["auto_repeater"]:
             self._dispatch_repeater(group, group.results)
         if cfg["auto_send"]:
@@ -3854,8 +4458,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     self._refresh_grouped_repeater_bar()
                 self._refresh_feature_views()
             ui_call(apply)
-            self.log("%s (%s) rebuilt with 1 API gốc + %d current role(s)." %
-                     (format_api_label(group.gid), format_group_id(group.gid), len(new_results)))
+            self.log("Dựng lại với 1 API gốc + %d role hiện tại." % len(new_results), gid=group.gid)
         self.capture_executor.execute(_Task(work, self.log))
 
     # -------------------------------------------------------------- Repeater
@@ -3891,21 +4494,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 self.callbacks.sendToRepeater(group.host, group.port, group.use_https(),
                                               res.request, tname)
             except Throwable as t:
-                self.log("Repeater dispatch failed for %s: %s" % (res.tab_name, t))
+                self.log("Đẩy Repeater lỗi (%s): %s" % (res.tab_name, t), gid=group.gid)
         if copy_group_name:
             grp_title = "%s %s %s" % (format_group_id(group.gid), group.method,
                                       short_path(group.path, 28))
             self._copy_to_clipboard(grp_title)
-            self.log("%s (%s): %d tab gọn đã gửi sang Burp Repeater (Đã copy tên Group '%s' vào Clipboard)." %
-                     (format_api_label(group.gid), format_group_id(group.gid), len(results), grp_title))
+            self.log("Đã đẩy %d tab gọn sang Burp Repeater (copy tên Group '%s')." % (len(results), grp_title),
+                     gid=group.gid)
         else:
-            self.log("%s (%s): %d request(s) sent to Repeater." %
-                     (format_api_label(group.gid), format_group_id(group.gid), len(results)))
+            self.log("Đã đẩy %d request sang Burp Repeater." % len(results), gid=group.gid)
 
     # ------------------------------------------------------ background replay
     def replay(self, group, results):
-        """Queue each result for background sending; never blocks the caller."""
-        results = list(results)
+        """Queue requests on the SendDispatcher (paced per host); never blocks the caller."""
+        busy = (STATE_QUEUED, STATE_SENDING, STATE_RETRY)
+        results = [r for r in results if r.state not in busy]
         if not results:
             return
         with self._state_lock:
@@ -3916,19 +4519,37 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             evaluate_role_result(group, res)
         group.recalc_audit()
         self._notify_results(group, None, finished_send=False)
-        for res in results:
-            self.send_executor.execute(_Task(
-                (lambda r=res: self._send_one(group, r)), self.log))
+        self.dispatcher.submit([_SendJob(group, res) for res in results])
 
-    def _send_one(self, group, res):
+    def cancel_pending_sends(self, reason="Đã hủy"):
+        """Take every not-yet-sent request off the queue; already-sent results are kept."""
+        dropped = self.dispatcher.cancel_all()
+        if not dropped:
+            return 0
+        groups = {}
+        for job in dropped:
+            res = job.res
+            res.state = STATE_DONE if res.status is not None else STATE_NOT_SENT
+            res.error = ""
+            groups[id(job.group)] = job.group
+        with self._state_lock:
+            self._active_sends = max(0, self._active_sends - len(dropped))
+            all_settled = (self._active_sends == 0)
+        for g in groups.values():
+            g.recalc_audit()
+            self._notify_results(g, None, finished_send=all_settled)
+        self.log("%s: %d request trong hàng đợi không được gửi." % (reason, len(dropped)))
+        return len(dropped)
+
+    def _run_job(self, job):
+        group, res = job.group, job.res
         if self._unloaded:
             return
-        throttle = self.config.get("throttle_ms", 0)
-        if throttle > 0:
-            time.sleep(throttle / 1000.0)
         res.state = STATE_SENDING
         evaluate_role_result(group, res)
+        self._notify_results(group, None)
         started = time.time()
+        retry_after = None
         try:
             request = res.request  # a virtual role request is built here, used once, then dropped
             if request is None:
@@ -3955,6 +4576,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 res.length = len(resp) - rinfo.getBodyOffset()
                 res.state = STATE_DONE
                 res.error = ""
+                if res.status in RETRYABLE_STATUS:
+                    try:
+                        retry_after = parse_retry_after(rinfo.getHeaders())
+                    except (Throwable, Exception):
+                        retry_after = None  # fall back to exponential back-off
                 if getattr(res, "is_original", False):
                     group.has_orig_response = True
                     group.orig_status = res.status
@@ -3967,12 +4593,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             res.elapsed_ms = int((time.time() - started) * 1000)
             res.state = STATE_ERROR
             res.error = "%s" % e
+        status = res.status if res.state == STATE_DONE else None
+        if self.dispatcher.will_retry(job, status):
+            res.state = STATE_RETRY
+            res.error = "HTTP %d - server giới hạn tốc độ, sẽ tự gửi lại (lần %d/%d)" % (
+                status, job.retries + 1, self.get_config().get("max_retries", 0))
+        finished = self.dispatcher.done(job, status, retry_after)
         # Pre-calculate audit on the worker thread so the Swing EDT does 0 heavy work
         group.recalc_audit()
-        with self._state_lock:
-            self._active_sends = max(0, self._active_sends - 1)
-            all_settled = (self._active_sends == 0)
-        self._notify_results(group, res, finished_send=all_settled)
+        all_settled = False
+        if finished:
+            with self._state_lock:
+                self._active_sends = max(0, self._active_sends - 1)
+                all_settled = (self._active_sends == 0)
+        self._notify_results(group, res if finished else None, finished_send=all_settled)
 
     def _notify_results(self, group, res, finished_send=False):
         """Record that a group changed; the UI tick repaints it (any thread, never blocks)."""
@@ -4039,6 +4673,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
         self.lbl_feature_counter = JLabel("(0 API)")
         left_header.add(self.cb_capture)
+        self.btn_send_mode = JButton(" ", actionPerformed=self._on_toggle_send_mode)
+        self.btn_send_mode.setFont(Font("Dialog", Font.BOLD, 12))
+        self.btn_send_mode.setMargin(Insets(2, 8, 2, 8))
+        self.btn_queue = JButton("Hàng đợi: 0", actionPerformed=self._on_cancel_queue)
+        self.btn_queue.setMargin(Insets(2, 6, 2, 6))
+        left_header.add(self.btn_send_mode)
+        left_header.add(self.btn_queue)
         left_header.add(self.btn_capture_opts)
         left_header.add(JLabel(" | "))
         left_header.add(self.lbl_active_feature)
@@ -4068,9 +4709,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.tabs.addTab("Lịch sử & Báo cáo", self._build_history_tab())
         self.tabs.addTab("Roles (Profiles)", self._build_roles_tab())
         self.tabs.addTab("Cấu hình & Bộ lọc", self._build_settings_tab(cfg))
-        self.log_area = JTextArea()
-        self.log_area.setEditable(False)
-        self.tabs.addTab("Log", JScrollPane(self.log_area))
+        self.tabs.addTab("Log", self._build_log_tab())
         # A tree that was hidden while APIs arrived is rebuilt the moment its tab is opened.
         self.tabs.addChangeListener(_Change(lambda e: self._ui_tick(None)))
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
@@ -4145,7 +4784,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         left_root = HierarchyTreeNode("ROOT", "", "Tất cả Group & API")
         self.left_hierarchy_tree_model = DefaultTreeModel(left_root)
         self.left_hierarchy_tree = JTree(self.left_hierarchy_tree_model)
-        self.left_hierarchy_tree.setRowHeight(22)
+        self.left_hierarchy_tree.setRowHeight(26)
         self.left_hierarchy_tree.setLargeModel(True)
         self.left_hierarchy_tree.setCellRenderer(HierarchyTreeRenderer())
         self.left_hierarchy_tree.addTreeWillExpandListener(_LazyTreeLoader(
@@ -4314,6 +4953,106 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         panel.add(master_split, BorderLayout.CENTER)
         return panel
 
+    # ---- Log tab: grouped, collapsed, loaded on expand
+    def _build_log_tab(self):
+        panel = JPanel(BorderLayout(4, 4))
+        bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        btn_xlsx = JButton("Xuất Excel (.xlsx)...", actionPerformed=self._on_export_excel)
+        btn_xlsx.setFont(btn_xlsx.getFont().deriveFont(Font.BOLD))
+        btn_xlsx.setBackground(Color(22, 163, 74))
+        btn_xlsx.setForeground(Color(255, 255, 255))
+        bar.add(btn_xlsx)
+        bar.add(JButton("Mở các nhánh", actionPerformed=self._on_log_expand_branches))
+        bar.add(JButton("Thu gọn tất cả", actionPerformed=self._on_log_collapse_all))
+        bar.add(JButton("Xóa nhật ký hệ thống", actionPerformed=self._on_log_clear_system))
+        hint = JLabel("   Mỗi nhánh > API > chi tiết chỉ được tải khi bạn bấm mở. Click đúp 1 API để xem ở tab API Groups.")
+        bg, fg = _ui_colors()
+        hint.setForeground(_mix(fg, bg, 0.42))
+        bar.add(hint)
+        panel.add(bar, BorderLayout.NORTH)
+
+        self.log_tree_model = DefaultTreeModel(HierarchyTreeNode("ROOT", "", "Nhật ký", key=("ROOT",)))
+        self.log_tree = JTree(self.log_tree_model)
+        self.log_tree.setRootVisible(False)
+        self.log_tree.setShowsRootHandles(True)
+        self.log_tree.setRowHeight(26)
+        self.log_tree.setLargeModel(True)
+        self.log_tree.setCellRenderer(HierarchyTreeRenderer())
+        self.log_tree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION)
+        self.log_tree.addTreeWillExpandListener(_LazyTreeLoader(
+            lambda node: self._lazy_load_tree_node("log", self.log_tree_model, node)))
+        self.log_tree.addMouseListener(_DoubleClick(self._on_log_jump_to_group))
+        panel.add(JScrollPane(self.log_tree), BorderLayout.CENTER)
+        return panel
+
+    def _on_log_expand_branches(self, event):
+        tree = self.log_tree
+        for i in range(tree.getRowCount() - 1, -1, -1):
+            node = tree.getPathForRow(i).getLastPathComponent()
+            if getattr(node, "kind", None) == "LOGBRANCH":
+                tree.expandRow(i)
+
+    def _on_log_collapse_all(self, event):
+        tree = self.log_tree
+        for i in range(tree.getRowCount() - 1, -1, -1):
+            tree.collapseRow(i)
+        self._tree_states["log"]["expanded"] = set()
+
+    def _on_log_clear_system(self, event):
+        with self._log_lock:
+            self._log_system.clear()
+        self._stale_log = True
+        self._ui_tick(None)
+
+    def _on_log_jump_to_group(self):
+        path = self.log_tree.getSelectionPath()
+        if path is None:
+            return
+        node = path.getLastPathComponent()
+        kind = getattr(node, "kind", None)
+        if kind == "LOGAPI":
+            group, res = node.payload, None
+        elif kind == "LOGRES":
+            group, res = node.payload
+        else:
+            return
+        self.group_model.set_feature_filter(None)
+        self.group_model.set_hierarchy_filter(None)
+        self.tabs.setSelectedIndex(0)
+        self._select_group_in_table(group, target_result=res)
+
+    def _on_export_excel(self, event):
+        groups = self.group_model.all_groups() if self.group_model is not None else []
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, "Chưa có API nào để xuất.", EXT_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
+        chooser = JFileChooser()
+        chooser.setSelectedFile(File("theMythOfCrawl_API_%s.xlsx" % time.strftime("%Y%m%d_%H%M")))
+        chooser.setFileFilter(FileNameExtensionFilter("Excel (.xlsx)", "xlsx"))
+        if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
+            return
+        f = chooser.getSelectedFile()
+        if not f.getName().lower().endswith(".xlsx"):
+            f = File(f.getAbsolutePath() + ".xlsx")
+        if f.exists() and JOptionPane.showConfirmDialog(
+                self.main_panel, "Ghi đè %s?" % f.getName(), EXT_NAME,
+                JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+            return
+        try:
+            data = build_api_workbook(groups)
+            out = open(f.getAbsolutePath(), "wb")
+            try:
+                out.write(data)
+            finally:
+                out.close()
+            self.log("Đã xuất %d API ra Excel: %s" % (len(groups), f.getAbsolutePath()))
+            JOptionPane.showMessageDialog(self.main_panel, "Đã xuất %d API ra:\n%s" % (len(groups), f.getAbsolutePath()),
+                                          EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
+        except (Throwable, Exception) as e:
+            JOptionPane.showMessageDialog(self.main_panel, "Xuất Excel thất bại: %s" % u_text(e), EXT_NAME,
+                                          JOptionPane.ERROR_MESSAGE)
+
     # ---- History & Features tab (Minimalist top bar + Right-click tree menu + Audit summary)
     def _build_history_tab(self):
         panel = JPanel(BorderLayout(4, 4))
@@ -4324,6 +5063,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         top_bar.add(JButton("+ Nhánh mới...", actionPerformed=self._on_next_feature))
         top_bar.add(JButton("✏ Đổi tên...", actionPerformed=self._on_rename_tree_feature))
         top_bar.add(JButton("🔍 Xem ở tab API Groups", actionPerformed=self._on_jump_to_group_from_tree))
+        top_bar.add(JButton("📊 Xuất Excel (.xlsx)...", actionPerformed=self._on_export_excel))
         top_bar.add(JButton("📄 Export Báo cáo (.txt/.md)...", actionPerformed=self._on_export_history_report))
         top_bar.add(JButton("↻ Refresh", actionPerformed=lambda e: self._refresh_feature_views()))
         panel.add(top_bar, BorderLayout.NORTH)
@@ -4331,7 +5071,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         root = HierarchyTreeNode("ROOT", "", "Lịch sử Chức năng & API")
         self.history_tree_model = DefaultTreeModel(root)
         self.history_tree = JTree(self.history_tree_model)
-        self.history_tree.setRowHeight(22)
+        self.history_tree.setRowHeight(26)
         self.history_tree.setLargeModel(True)
         self.history_tree.setCellRenderer(HierarchyTreeRenderer())
         self.history_tree.addTreeWillExpandListener(_LazyTreeLoader(
@@ -4406,89 +5146,235 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     # ---- Settings tab
     def _build_settings_tab(self, cfg):
-        panel = JPanel(GridBagLayout())
-        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
-        gc = GridBagConstraints()
-        gc.insets = Insets(4, 4, 4, 4)
-        gc.anchor = GridBagConstraints.WEST
-        gc.fill = GridBagConstraints.HORIZONTAL
-        row = [0]
+        """Four colour-coded sections; plain Swing text only (Burp disables HTML in labels)."""
+        self._syncing_settings = False
+        on_change = self._on_settings_changed
 
-        def add_row(left, right=None):
-            gc.gridy = row[0]
+        def check(text, value):
+            cb = JCheckBox(text, value, actionPerformed=on_change)
+            cb.setOpaque(False)
+            return cb
+
+        self.cb_scope = check("Chỉ bắt API nằm trong Target Scope của Burp", cfg["in_scope_only"])
+        self.cb_static = check("Bỏ qua file tĩnh có đuôi:", cfg["ignore_static"])
+        self.tf_static = JTextField(cfg["static_ext"], 50)
+        self.tf_static.addActionListener(_Action(on_change))
+        self.cb_regex = check("Chỉ bắt path khớp Regex:", cfg["api_regex_enabled"])
+        self.tf_regex = JTextField(cfg["api_regex"], 50)
+        self.tf_regex.addActionListener(_Action(on_change))
+        self.cb_options = check("Bỏ qua OPTIONS / HEAD (CORS preflight)", cfg["ignore_options_head"])
+        self.regex_error = JLabel("")  # empty -> takes no height until there is an error
+        self.regex_error.setForeground(Color(220, 38, 38))
+
+        self.cb_dedup = check("Chỉ nhân bản mỗi endpoint 1 lần (Method + Host + Path)", cfg["dedup"])
+        self.cb_dedup_ids = check("Coi số / UUID / chuỗi hex dài trong path là {id} khi so trùng",
+                                  cfg["dedup_normalize_ids"])
+        self.cb_dedup_feature = check("Chống trùng riêng theo từng Nhánh (được bắt lại API cũ khi sang nhánh mới)",
+                                      cfg.get("dedup_per_feature", False))
+
+        self.cb_send_profile = JComboBox([label for _, label, _, _, _ in SEND_PROFILES])
+        self.cb_send_profile.setSelectedIndex(self._profile_index(cfg["send_profile"]))
+        self.cb_send_profile.addActionListener(_Action(self._on_send_profile_changed))
+        self.tf_delay = self._num_field(cfg["send_delay_ms"])
+        self.tf_jitter = self._num_field(cfg["send_jitter_pct"])
+        self.tf_conc = self._num_field(cfg["host_concurrency"])
+        self.tf_retries = self._num_field(cfg["max_retries"])
+        self.tf_threads = self._num_field(cfg["threads"])
+        self.lbl_pacing = JLabel(" ")
+        self.cb_store_disk = check("Lưu request / response vào file tạm của Burp thay vì RAM (khuyên dùng khi bắt nhiều API)",
+                                   cfg.get("store_on_disk", True))
+
+        self.cb_number = check("Thêm số thứ tự role vào tên tab (01_, 02_ ...) nếu tên chưa có",
+                               cfg["number_roles_in_tab"])
+        self.cb_feat_tab = check("Gắn mã Nhánh vào tên tab: [F01-G01:POST /v1/...] thay vì [G01:POST /v1/...]",
+                                 cfg.get("include_feature_in_tab", False))
+        self.tf_pathlen = self._num_field(cfg["short_path_len"])
+
+        content = JPanel()
+        content.setLayout(BoxLayout(content, BoxLayout.Y_AXIS))
+        content.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12))
+        sections = [
+            ("1.  Bắt API từ Proxy", (37, 99, 235),
+             "Request nào đi qua Proxy được bắt và nhân bản theo Role. Bắt thủ công (chuột phải > theMythOfCrawl) "
+             "luôn bỏ qua bộ lọc này, trừ mục 'apply capture filters'.",
+             [("check", self.cb_scope),
+              ("pair", self.cb_static, self.tf_static),
+              ("pair", self.cb_regex, self.tf_regex),
+              ("pair", None, self.regex_error),
+              ("check", self.cb_options)]),
+            ("2.  Chống trùng lặp", (147, 51, 234),
+             "Tránh nhân bản lại cùng một endpoint nhiều lần.",
+             [("check", self.cb_dedup), ("check", self.cb_dedup_ids), ("check", self.cb_dedup_feature)]),
+            ("3.  Gửi request & chống lỗi 429", (22, 163, 74),
+             "Mọi request (tự gửi sau khi crawl, gửi hàng loạt, gửi lẻ) đi qua 1 hàng đợi theo từng host, "
+             "giãn cách ngẫu nhiên như người dùng thật. Gặp 429/503: tự dừng theo Retry-After, giảm tốc x2, "
+             "gửi từng request một rồi gửi lại; tự nhanh dần lại sau 8 lần thành công.",
+             [("field", "Chế độ gửi:", self.cb_send_profile, None),
+              ("field", "Khoảng nghỉ giữa 2 request (ms):", self.tf_delay, self.lbl_pacing),
+              ("field", "Dao động ngẫu nhiên (%):", self.tf_jitter, "nghỉ = khoảng nghỉ ± % này"),
+              ("field", "Số request song song mỗi host:", self.tf_conc, "1 = lần lượt như người thật"),
+              ("field", "Tự gửi lại khi gặp 429 / 503 (lần):", self.tf_retries, None),
+              ("field", "Tổng số luồng gửi (mọi host):", self.tf_threads, None),
+              ("check", self.cb_store_disk)]),
+            ("4.  Burp Repeater & tên tab", (234, 88, 12),
+             "Cách đặt tên tab khi đẩy sang Burp Repeater.",
+             [("check", self.cb_number), ("check", self.cb_feat_tab),
+              ("field", "Độ dài tối đa của path trong tên tab:", self.tf_pathlen, None)]),
+        ]
+        for title, rgb, desc, rows in sections:
+            content.add(self._settings_section(title, Color(rgb[0], rgb[1], rgb[2]), desc, rows))
+            content.add(Box.createVerticalStrut(10))
+
+        btns = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        btns.setAlignmentX(0.0)
+        apply_btn = JButton("Áp dụng", actionPerformed=on_change)
+        apply_btn.setFont(apply_btn.getFont().deriveFont(Font.BOLD))
+        btns.add(apply_btn)
+        btns.add(JButton("Khôi phục mặc định", actionPerformed=self._on_restore_defaults))
+        self.lbl_settings_saved = JLabel(" ")
+        btns.add(self.lbl_settings_saved)
+        content.add(btns)
+        self._sync_settings_fields(cfg)
+        # Width-tracking holder: sections keep their natural height and the notes wrap.
+        holder = _ViewportWidthPanel(BorderLayout())
+        holder.add(content, BorderLayout.NORTH)
+        scroll = JScrollPane(holder)
+        scroll.getVerticalScrollBar().setUnitIncrement(16)
+        return scroll
+
+    def _settings_section(self, title, accent, desc, rows):
+        bg, fg = _ui_colors()
+        muted = _mix(fg, bg, 0.42)
+        tint = _mix(bg, accent, 0.06)
+        section = JPanel(BorderLayout(0, 6))
+        section.setAlignmentX(0.0)
+        section.setBackground(tint)
+        section.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createMatteBorder(0, 4, 0, 0, accent),
+            BorderFactory.createEmptyBorder(8, 12, 10, 12)))
+        head = JPanel(BorderLayout(0, 2))
+        head.setOpaque(False)
+        lbl = JLabel(title)
+        lbl.setFont(_font_resized(lbl.getFont(), Font.BOLD, 2))
+        lbl.setForeground(accent)
+        head.add(lbl, BorderLayout.NORTH)
+        note = JTextArea(desc)
+        note.setEditable(False)
+        note.setFocusable(False)
+        note.setLineWrap(True)
+        note.setWrapStyleWord(True)
+        note.setOpaque(False)
+        note.setBackground(tint)  # some look-and-feels paint text areas even when not opaque
+        note.setBorder(None)
+        note.setFont(_font_resized(lbl.getFont(), Font.PLAIN, -2))
+        note.setForeground(muted)
+        head.add(note, BorderLayout.CENTER)
+        section.add(head, BorderLayout.NORTH)
+
+        form = JPanel(GridBagLayout())
+        form.setOpaque(False)
+        gc = GridBagConstraints()
+        gc.insets = Insets(3, 2, 3, 8)
+        gc.anchor = GridBagConstraints.WEST
+        for r, row in enumerate(rows):
+            gc.gridy = r
             gc.gridx = 0
             gc.weightx = 0.0
-            gc.gridwidth = 1 if right is not None else 2
-            panel.add(left, gc)
-            if right is not None:
+            gc.fill = GridBagConstraints.NONE
+            kind = row[0]
+            if kind == "check":
+                gc.gridwidth = 3
+                form.add(row[1], gc)
+                gc.gridwidth = 1
+                continue
+            if kind == "pair":
+                if row[1] is not None:
+                    form.add(row[1], gc)
                 gc.gridx = 1
+                gc.gridwidth = 2
                 gc.weightx = 1.0
-                panel.add(right, gc)
-            row[0] += 1
+                gc.fill = GridBagConstraints.HORIZONTAL
+                form.add(row[2], gc)
+                gc.gridwidth = 1
+                continue
+            label = JLabel(row[1])
+            form.add(label, gc)
+            gc.gridx = 1
+            form.add(row[2], gc)
+            hint = row[3]
+            if hint is not None:
+                gc.gridx = 2
+                gc.weightx = 1.0
+                if not isinstance(hint, JLabel):
+                    hint = JLabel(hint)
+                hint.setForeground(muted)
+                form.add(hint, gc)
+        gc.gridy = 0
+        gc.gridx = 3
+        gc.weightx = 1.0
+        gc.insets = Insets(0, 0, 0, 0)
+        form.add(Box.createHorizontalGlue(), gc)
+        section.add(form, BorderLayout.CENTER)
+        return section
 
-        on_change = self._on_settings_changed
-        self.cb_scope = JCheckBox("In-Scope Only (Target > Scope)", cfg["in_scope_only"], actionPerformed=on_change)
-        self.cb_static = JCheckBox("Ignore Static Extensions:", cfg["ignore_static"], actionPerformed=on_change)
-        self.tf_static = JTextField(cfg["static_ext"], 60)
-        self.tf_static.addActionListener(_Action(on_change))
-        self.cb_regex = JCheckBox("API Path Regex (matched against path, no query):", cfg["api_regex_enabled"],
-                                  actionPerformed=on_change)
-        self.tf_regex = JTextField(cfg["api_regex"], 60)
-        self.tf_regex.addActionListener(_Action(on_change))
-        self.cb_options = JCheckBox("Ignore OPTIONS / HEAD (CORS preflight)", cfg["ignore_options_head"],
-                                    actionPerformed=on_change)
-        self.cb_dedup = JCheckBox("Deduplicate (Method + Host + Path) - clone each endpoint only once",
-                                  cfg["dedup"], actionPerformed=on_change)
-        self.cb_dedup_ids = JCheckBox("Dedup: treat numeric / UUID / long-hex path segments as {id}",
-                                      cfg["dedup_normalize_ids"], actionPerformed=on_change)
-        self.cb_dedup_feature = JCheckBox(
-            "Dedup riêng theo từng Chức năng (cho phép bắt lại cùng API khi chuyển sang Tên chức năng mới)",
-            cfg.get("dedup_per_feature", False), actionPerformed=on_change)
-        self.cb_number = JCheckBox("Prefix role index in tab names (01_, 02_ ...) unless the name already has one",
-                                   cfg["number_roles_in_tab"], actionPerformed=on_change)
-        self.cb_feat_tab = JCheckBox(
-            "Gắn mã Chức năng vào tên tab Repeater ([F01-G01:POST /v1/...] thay vì [G01:POST /v1/...])",
-            cfg.get("include_feature_in_tab", False), actionPerformed=on_change)
-        self.cb_store_disk = JCheckBox(
-            "Lưu request/response vào file tạm của Burp thay vì RAM (khuyên dùng khi bắt nhiều API)",
-            cfg.get("store_on_disk", True), actionPerformed=on_change)
-        self.sp_threads = JSpinner(SpinnerNumberModel(cfg["threads"], 1, 64, 1))
-        self.sp_throttle = JSpinner(SpinnerNumberModel(cfg["throttle_ms"], 0, 60000, 50))
-        self.sp_pathlen = JSpinner(SpinnerNumberModel(cfg["short_path_len"], 8, 200, 1))
-        for sp in (self.sp_threads, self.sp_throttle, self.sp_pathlen):
-            sp.addChangeListener(_Change(lambda e: self._on_settings_changed(None)))
-        self.regex_error = JLabel(" ")
-        self.regex_error.setForeground(Color(200, 0, 0))
+    def _num_field(self, value):
+        field = JTextField(u_text(value), 7)
+        field.setHorizontalAlignment(JTextField.RIGHT)
+        field.addActionListener(_Action(self._on_settings_changed))
+        field.addFocusListener(_FocusLost(lambda: self._on_settings_changed(None)))
+        return field
 
-        add_row(JLabel("<html><b>Proxy capture filters</b> (manual context-menu cloning bypasses them unless "
-                       "you pick the 'apply capture filters' item)</html>"))
-        add_row(self.cb_scope)
-        add_row(self.cb_static, self.tf_static)
-        add_row(self.cb_regex, self.tf_regex)
-        add_row(JLabel(""), self.regex_error)
-        add_row(self.cb_options)
-        add_row(self.cb_dedup)
-        add_row(self.cb_dedup_ids)
-        add_row(self.cb_dedup_feature)
-        add_row(JLabel("<html><br><b>Cloning, Repeater and replay</b></html>"))
-        add_row(self.cb_number)
-        add_row(self.cb_feat_tab)
-        add_row(JLabel("Short path max length in tab names:"), self.sp_pathlen)
-        add_row(JLabel("Replay worker threads:"), self.sp_threads)
-        add_row(JLabel("Throttle per request (ms):"), self.sp_throttle)
-        add_row(self.cb_store_disk)
-        apply_btn = JButton("Apply Text Fields", actionPerformed=on_change)
-        reset_btn = JButton("Restore Defaults", actionPerformed=self._on_restore_defaults)
-        btns = JPanel(FlowLayout(FlowLayout.LEFT))
-        btns.add(apply_btn)
-        btns.add(reset_btn)
-        add_row(btns)
-        gc.gridy = row[0]
-        gc.weighty = 1.0
-        panel.add(JPanel(), gc)
-        return JScrollPane(panel)
+    @staticmethod
+    def _profile_index(key):
+        for i, p in enumerate(SEND_PROFILES):
+            if p[0] == key:
+                return i
+        return 0
+
+    def _read_int(self, field, key):
+        try:
+            return int(u_text(field.getText()).strip())
+        except (ValueError, Exception):
+            return self.config.get(key, DEFAULT_CONFIG[key])
+
+    def _sync_settings_fields(self, cfg):
+        """Show the normalised config values (presets, clamping) in the form."""
+        self._syncing_settings = True
+        try:
+            for field, key in ((self.tf_delay, "send_delay_ms"), (self.tf_jitter, "send_jitter_pct"),
+                               (self.tf_conc, "host_concurrency"), (self.tf_retries, "max_retries"),
+                               (self.tf_threads, "threads"), (self.tf_pathlen, "short_path_len")):
+                if u_text(field.getText()).strip() != u_text(cfg[key]):
+                    field.setText(u_text(cfg[key]))
+            idx = self._profile_index(cfg["send_profile"])
+            if self.cb_send_profile.getSelectedIndex() != idx:
+                self.cb_send_profile.setSelectedIndex(idx)
+            delay = cfg["send_delay_ms"]
+            if delay > 0:
+                per_min = int(60000.0 / delay * cfg["host_concurrency"])
+                self.lbl_pacing.setText("tối đa ~%d request / phút cho mỗi host" % per_min)
+            else:
+                self.lbl_pacing.setText("không giãn cách - rất dễ bị 429")
+        finally:
+            self._syncing_settings = False
+
+    def _on_send_profile_changed(self, event):
+        if getattr(self, "_syncing_settings", False):
+            return
+        key = SEND_PROFILES[max(0, self.cb_send_profile.getSelectedIndex())][0]
+        cfg = self.get_config()
+        cfg["send_profile"] = key
+        self.apply_config(cfg)
+        self._sync_settings_fields(self.get_config())
 
     def _collect_settings(self):
+        profile = SEND_PROFILES[max(0, self.cb_send_profile.getSelectedIndex())]
+        delay = self._read_int(self.tf_delay, "send_delay_ms")
+        jitter = self._read_int(self.tf_jitter, "send_jitter_pct")
+        conc = self._read_int(self.tf_conc, "host_concurrency")
+        key = profile[0]
+        if key != "CUSTOM" and (delay, jitter, conc) != (profile[2], profile[3], profile[4]):
+            key = "CUSTOM"  # the user typed their own numbers
         return {
             "capture_enabled": self.cb_capture.isSelected(),
             "auto_repeater": self.cb_auto_repeater.isSelected(),
@@ -4504,10 +5390,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             "dedup_per_feature": self.cb_dedup_feature.isSelected(),
             "number_roles_in_tab": self.cb_number.isSelected(),
             "include_feature_in_tab": self.cb_feat_tab.isSelected(),
-            "threads": int(self.sp_threads.getValue()),
-            "throttle_ms": int(self.sp_throttle.getValue()),
-            "short_path_len": int(self.sp_pathlen.getValue()),
+            "threads": self._read_int(self.tf_threads, "threads"),
+            "short_path_len": self._read_int(self.tf_pathlen, "short_path_len"),
             "store_on_disk": self.cb_store_disk.isSelected(),
+            "send_profile": key,
+            "send_delay_ms": delay,
+            "send_jitter_pct": jitter,
+            "host_concurrency": conc,
+            "max_retries": self._read_int(self.tf_retries, "max_retries"),
         }
 
     def _on_top_filter_toggled(self, event):
@@ -4518,36 +5408,125 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._on_settings_changed(event)
 
     def _on_settings_changed(self, event):
-        if getattr(self, "cb_top_scope", None) is not None and getattr(self, "cb_scope", None) is not None:
+        if getattr(self, "_syncing_settings", False) or getattr(self, "cb_send_profile", None) is None:
+            return
+        if getattr(self, "cb_top_scope", None) is not None:
             self.cb_top_scope.setSelected(self.cb_scope.isSelected())
-        if getattr(self, "cb_top_regex", None) is not None and getattr(self, "cb_regex", None) is not None:
+        if getattr(self, "cb_top_regex", None) is not None:
             self.cb_top_regex.setSelected(self.cb_regex.isSelected())
         err = self.apply_config(self._collect_settings())
         if err and self.cb_regex.isSelected():
-            self.regex_error.setText("Invalid regex - API filter inactive: %s" % err)
+            self.regex_error.setText("Regex không hợp lệ - bộ lọc path đang tắt: %s" % err)
         else:
-            self.regex_error.setText(" ")
+            self.regex_error.setText("")
+        self._sync_settings_fields(self.get_config())
+        self.lbl_settings_saved.setText("Đã lưu lúc %s" % time.strftime("%H:%M:%S"))
+        self._refresh_send_controls()
 
     def _on_restore_defaults(self, event):
         d = merge_config({})
-        self.cb_scope.setSelected(d["in_scope_only"])
-        self.cb_static.setSelected(d["ignore_static"])
-        self.tf_static.setText(d["static_ext"])
-        self.cb_regex.setSelected(d["api_regex_enabled"])
-        self.tf_regex.setText(d["api_regex"])
-        self.cb_options.setSelected(d["ignore_options_head"])
-        self.cb_dedup.setSelected(d["dedup"])
-        self.cb_dedup_ids.setSelected(d["dedup_normalize_ids"])
-        self.cb_dedup_feature.setSelected(d["dedup_per_feature"])
-        self.cb_number.setSelected(d["number_roles_in_tab"])
-        self.cb_feat_tab.setSelected(d["include_feature_in_tab"])
-        self.cb_auto_send.setSelected(d["auto_send"])
-        self.cb_auto_repeater.setSelected(d["auto_repeater"])
-        self.sp_threads.setValue(Integer(d["threads"]))
-        self.sp_throttle.setValue(Integer(d["throttle_ms"]))
-        self.sp_pathlen.setValue(Integer(d["short_path_len"]))
-        self.cb_store_disk.setSelected(d["store_on_disk"])
+        self._syncing_settings = True
+        try:
+            self.cb_scope.setSelected(d["in_scope_only"])
+            self.cb_static.setSelected(d["ignore_static"])
+            self.tf_static.setText(d["static_ext"])
+            self.cb_regex.setSelected(d["api_regex_enabled"])
+            self.tf_regex.setText(d["api_regex"])
+            self.cb_options.setSelected(d["ignore_options_head"])
+            self.cb_dedup.setSelected(d["dedup"])
+            self.cb_dedup_ids.setSelected(d["dedup_normalize_ids"])
+            self.cb_dedup_feature.setSelected(d["dedup_per_feature"])
+            self.cb_number.setSelected(d["number_roles_in_tab"])
+            self.cb_feat_tab.setSelected(d["include_feature_in_tab"])
+            self.cb_auto_send.setSelected(d["auto_send"])
+            self.cb_auto_repeater.setSelected(d["auto_repeater"])
+            self.cb_store_disk.setSelected(d["store_on_disk"])
+            self.cb_send_profile.setSelectedIndex(self._profile_index(d["send_profile"]))
+        finally:
+            self._syncing_settings = False
+        self._sync_settings_fields(d)
         self._on_settings_changed(None)
+
+    # ---- Send mode (crawl + send  /  crawl only) and the request queue
+    def _refresh_send_controls(self):
+        btn = getattr(self, "btn_send_mode", None)
+        if btn is None:
+            return
+        sending = bool(self.config.get("auto_send", False))
+        queued, inflight, penalty, wait = self.dispatcher.snapshot()
+        state = (sending, queued, inflight, int(penalty), int(wait + 0.99))
+        if state == self._send_ui_state:
+            return
+        self._send_ui_state = state
+        if sending:
+            btn.setText("⏸  ĐANG GỬI  (bấm để dừng)")
+            btn.setBackground(Color(22, 163, 74))
+            btn.setToolTipText("Crawl xong gửi luôn. Bấm để chuyển sang CHỈ CRAWL: hủy mọi request đang chờ.")
+        else:
+            btn.setText("▶  CHỈ CRAWL  (bấm để gửi)")
+            btn.setBackground(Color(100, 116, 139))
+            btn.setToolTipText("API vẫn được bắt nhưng không gửi. Bấm để bật gửi: API bắt từ giờ sẽ gửi ngay.")
+        btn.setForeground(Color(255, 255, 255))
+        total = queued + inflight
+        q = self.btn_queue
+        if total:
+            text = "✖ Hủy hàng đợi (%d)" % total
+        else:
+            text = "Hàng đợi: 0"
+        if penalty > 1.0:
+            text += "  ·  chậm x%d" % int(penalty)
+        if wait > 0.5:
+            text += "  ·  chờ %ds (429)" % int(wait + 0.99)
+        q.setText(text)
+        q.setEnabled(total > 0)
+        q.setForeground(Color(220, 38, 38) if (penalty > 1.0 or wait > 0.5) else UIManager.getColor("Button.foreground"))
+
+    def set_sending(self, enabled):
+        cfg = self.get_config()
+        cfg["auto_send"] = bool(enabled)
+        if getattr(self, "cb_auto_send", None) is not None:
+            self.cb_auto_send.setSelected(bool(enabled))
+        self.apply_config(cfg)
+        self.log("Chế độ gửi: %s" % ("ĐANG GỬI - crawl xong gửi luôn" if enabled
+                                      else "CHỈ CRAWL - bắt API nhưng không gửi"))
+        self._refresh_send_controls()
+        self.update_status()
+
+    def _unsent_results(self):
+        out = []
+        for g in self.group_model.all_groups():
+            pending = [r for r in g.results if r.state == STATE_NOT_SENT]
+            if pending:
+                out.append((g, pending))
+        return out
+
+    def _on_toggle_send_mode(self, event):
+        if self.get_config().get("auto_send", False):
+            self.set_sending(False)
+            return
+        self.set_sending(True)
+        unsent = self._unsent_results()
+        if not unsent:
+            return
+        n_req = sum([len(p) for _, p in unsent])
+        choice = JOptionPane.showConfirmDialog(
+            self.main_panel,
+            "Đã BẬT gửi: API bắt từ giờ sẽ được gửi ngay.\n\n"
+            "Có %d API (%d request) đã crawl trong lúc dừng nhưng chưa gửi.\nGửi luôn bây giờ?" % (len(unsent), n_req),
+            EXT_NAME, JOptionPane.YES_NO_OPTION)
+        if choice == JOptionPane.YES_OPTION:
+            for g, pending in unsent:
+                self.replay(g, pending)
+
+    def _on_send_all_unsent(self, event):
+        unsent = self._unsent_results()
+        for g, pending in unsent:
+            self.replay(g, pending)
+        self.log("Xếp hàng gửi %d API chưa gửi." % len(unsent))
+
+    def _on_cancel_queue(self, event):
+        self.cancel_pending_sends("Đã hủy hàng đợi")
+        self._ui_tick(None)
 
     # ---- Dynamic N-Level Sub-Folder Chips & Dropdown Menus
     def _rebuild_subfolder_chips(self, path_text):
@@ -4637,6 +5616,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         menu.add(JMenuItem("▶▶ Gửi toàn bộ Nhánh đang chọn (Đệ quy tất cả cấp con)",
                            actionPerformed=self._on_replay_selected_hierarchy_or_feature))
         menu.addSeparator()
+        menu.add(JMenuItem("▶ Gửi tất cả request CHƯA GỬI (crawl lúc đang dừng)", actionPerformed=self._on_send_all_unsent))
+        menu.add(JMenuItem("✖ Hủy hàng đợi gửi", actionPerformed=self._on_cancel_queue))
         menu.add(JMenuItem("▶▶ Gửi tất cả API đã bắt (%d API)" % len(self.group_model.all_groups()),
                            actionPerformed=lambda e: [self.replay(g, g.results) for g in self.group_model.all_groups()]))
         menu.show(btn, 0, btn.getHeight())
@@ -4668,6 +5649,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                            actionPerformed=self._on_rebuild))
         menu.add(JMenuItem("📌 Xem Request/Response của API Gốc (Acc Crawl)", actionPerformed=self._on_show_original))
         menu.addSeparator()
+        menu.add(JMenuItem("📊 Xuất Excel (.xlsx): STT / Method / Path / Vị trí...", actionPerformed=self._on_export_excel))
         menu.add(JMenuItem("💾 Export Matrix JSON...", actionPerformed=self._on_export_matrix))
         menu.add(JMenuItem("📄 Export Báo cáo Lịch sử (.txt/.md)...", actionPerformed=self._on_export_history_report))
         menu.addSeparator()
@@ -4999,7 +5981,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if stats is None:
             stats = HierarchyStats(self.features_list(), [])
         act = self.active_feature()
-        mode_str = "Auto" if cfg.get("auto_send") else "Manual"
+        mode_str = "Gửi: BẬT" if cfg.get("auto_send") else "Chỉ crawl"
         self.status_label.setText(
             "%s | Roles: %d/%d | Nhánh: %d | API: %d (Vàng: %d)"
             % (mode_str, self.roles.enabled_count(), self.roles.count(),
@@ -5053,8 +6035,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                     lvl, summary = audit_from_counts(total, flagged, ok)
                     node = HierarchyTreeNode(
                         "FOLDER", " > ".join(parts[:idx + 1]),
-                        "[Cấp %d] %s   (%d API | %s)" % (idx + 1, parts[idx], total, summary),
-                        audit_level=lvl, key=key)
+                        "%s   ·   %d API   ·   %s" % (parts[idx], total, summary),
+                        audit_level=lvl, key=key, depth=idx + 1)
                     nodes[key] = node
                     parent.add(node)
                     if id(parent) in open_ids and key not in collapsed:
@@ -5072,11 +6054,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             key = ("G", g.gid)
             g_audit = getattr(g, "_audit_summary", None) or evaluate_group_audit(g)[1]
             node = HierarchyTreeNode(
-                "GROUP", g,
-                "%s [%s]: %s %s  (1 Gốc + %d Roles)  --> [%s]"
-                % (format_api_label(g.gid), format_group_id(g.gid), g.method, short_path(g.path, 45),
-                   len(g.results), g_audit),
-                audit_level=_group_level(g), key=key)
+                "GROUP", g, group_tree_label(g, g_audit), audit_level=_group_level(g), key=key)
             nodes[key] = node
             if id(leaf) in open_ids and key in expanded:
                 self._load_group_children(node, nodes)
@@ -5100,25 +6078,29 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         for kind, key, r in entries:
             lvl = getattr(r, "_audit_level", None) or evaluate_role_result(g, r)[0]
             badge = getattr(r, "_audit_badge", None) or evaluate_role_result(g, r)[1]
-            status = r.status if r.status is not None else ("-" if kind == "ORIG" else r.state)
-            child = HierarchyTreeNode(
-                kind, (g, r),
-                "%s  --> [%s] | Status: %s | Len: %s"
-                % (r.role_name, badge, status, r.length if r.length is not None else "-"),
-                audit_level=lvl, key=key)
+            child = HierarchyTreeNode(kind, (g, r), result_tree_label(r, badge),
+                                      audit_level=lvl, key=key)
             g_node.add(child)
             if nodes is not None:
                 nodes[key] = child
         g_node.loaded = True
 
     def _lazy_load_tree_node(self, name, model, node):
-        if getattr(node, "kind", None) == "GROUP" and not getattr(node, "loaded", True):
-            self._load_group_children(node, self._tree_states[name]["nodes"])
+        if getattr(node, "loaded", True):
+            return
+        loader = {
+            "GROUP": self._load_group_children,
+            "LOGBRANCH": self._load_log_branch,
+            "LOGAPI": self._load_log_api,
+            "LOGSYS": self._load_log_system,
+        }.get(getattr(node, "kind", None))
+        if loader is not None:
+            loader(node, self._tree_states[name]["nodes"])
             model.nodeStructureChanged(node)
 
     @staticmethod
     def _remember_tree_state(tree, state):
-        """Record which folders the user collapsed and which API nodes they opened."""
+        """Folders are open unless the user collapsed them; every other node is closed unless opened."""
         collapsed = state["collapsed"]
         expanded = state["expanded"]
         for i in range(tree.getRowCount()):
@@ -5127,21 +6109,113 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                 continue
             node = path.getLastPathComponent()
             key = getattr(node, "key", None)
-            kind = getattr(node, "kind", None)
             if key is None or node.getChildCount() == 0:
                 continue
-            if kind == "FOLDER":
+            if getattr(node, "kind", None) == "FOLDER":
                 if tree.isExpanded(i):
                     collapsed.discard(key)
                 else:
                     collapsed.add(key)
-            elif kind == "GROUP":
-                if tree.isExpanded(i):
-                    expanded.add(key)
-                else:
-                    expanded.discard(key)
+            elif tree.isExpanded(i):
+                expanded.add(key)
+            else:
+                expanded.discard(key)
 
-    def _rebuild_tree(self, name, tree, model, root_label, stats, force):
+    # ---- Log tree: branch > API > (log lines + role results), every level loaded on expand
+    @staticmethod
+    def _placeholder(node):
+        node.loaded = False
+        node.add(HierarchyTreeNode("LOADING", None, "..."))
+
+    def _build_log_nodes(self, stats, root_label, state):
+        root = HierarchyTreeNode("ROOT", "", root_label, key=("ROOT",))
+        nodes = {root.key: root}
+        expand = [root]
+        expanded = state["expanded"]
+        by_path = {}
+        for g in stats.groups:
+            by_path.setdefault(normalize_hierarchy_path(getattr(g, "feature_name", "") or DEFAULT_HIERARCHY_PATH),
+                               []).append(g)
+        for path in stats.paths:
+            groups = by_path.get(path)
+            if not groups:
+                continue
+            lvl, summary = evaluate_feature_audit(groups)
+            node = HierarchyTreeNode(
+                "LOGBRANCH", groups, "%s   ·   %d API   ·   %s" % (path, len(groups), summary),
+                audit_level=lvl, key=("LB", path.lower()), depth=len(split_hierarchy_path(path)))
+            self._placeholder(node)
+            nodes[node.key] = node
+            root.add(node)
+        with self._log_lock:
+            n_sys = len(self._log_system)
+        sys_node = HierarchyTreeNode("LOGSYS", None, "Hệ thống & thao tác   ·   %d dòng" % n_sys, key=("LS",))
+        self._placeholder(sys_node)
+        nodes[sys_node.key] = sys_node
+        root.add(sys_node)
+        # Re-open what the user had open (loading those levels now, parents first).
+        for i in range(root.getChildCount()):
+            branch = root.getChildAt(i)
+            if branch.key not in expanded:
+                continue
+            self._lazy_load_any(branch, nodes)
+            expand.append(branch)
+            for j in range(branch.getChildCount()):
+                api = branch.getChildAt(j)
+                if getattr(api, "key", None) in expanded:
+                    self._lazy_load_any(api, nodes)
+                    expand.append(api)
+        return root, nodes, expand
+
+    def _lazy_load_any(self, node, nodes):
+        kind = node.kind
+        if kind == "LOGBRANCH":
+            self._load_log_branch(node, nodes)
+        elif kind == "LOGAPI":
+            self._load_log_api(node, nodes)
+        elif kind == "LOGSYS":
+            self._load_log_system(node, nodes)
+
+    def _load_log_branch(self, node, nodes=None):
+        node.removeAllChildren()
+        for g in node.payload:
+            g_audit = getattr(g, "_audit_summary", None) or evaluate_group_audit(g)[1]
+            child = HierarchyTreeNode(
+                "LOGAPI", g, "%s   ·   %s   ·   %s   ·   %s" % (
+                    format_api_label(g.gid), "%s %s" % (g.method, short_path(g.path, 60)),
+                    g.created, g_audit),
+                audit_level=_group_level(g), key=("LA", g.gid))
+            self._placeholder(child)
+            node.add(child)
+            if nodes is not None:
+                nodes[child.key] = child
+        node.loaded = True
+
+    def _load_log_api(self, node, nodes=None):
+        g = node.payload
+        node.removeAllChildren()
+        with self._log_lock:
+            lines = list(self._log_by_gid.get(g.gid, ()))
+        for idx, (ts, text) in enumerate(lines):
+            node.add(HierarchyTreeNode("LOGLINE", None, "%s   %s" % (ts, text), key=("LL", g.gid, idx)))
+        for r in g.all_entries():
+            lvl, badge = evaluate_role_result(g, r)
+            child = HierarchyTreeNode("LOGRES", (g, r), result_tree_label(r, badge), audit_level=lvl,
+                                      key=("LR", g.gid, r.role_index))
+            node.add(child)
+            if nodes is not None:
+                nodes[child.key] = child
+        node.loaded = True
+
+    def _load_log_system(self, node, nodes=None):
+        node.removeAllChildren()
+        with self._log_lock:
+            lines = list(self._log_system)
+        for idx, (ts, text) in enumerate(lines):
+            node.add(HierarchyTreeNode("LOGLINE", None, "%s   %s" % (ts, text), key=("LSL", idx)))
+        node.loaded = True
+
+    def _rebuild_tree(self, name, tree, model, root_label, stats, force, builder=None):
         """
         Rebuild one tree, keeping the user's selection and expand/collapse choices.
         Unless forced by a user action, rebuilds are spaced out in proportion to their
@@ -5154,7 +6228,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._remember_tree_state(tree, state)
         sel_path = tree.getSelectionPath()
         sel_key = getattr(sel_path.getLastPathComponent(), "key", None) if sel_path is not None else None
-        root, nodes, expand = self._build_hierarchy_nodes(stats, root_label, state)
+        root, nodes, expand = (builder or self._build_hierarchy_nodes)(stats, root_label, state)
         state["nodes"] = nodes
         state["collapsed"] = set([k for k in state["collapsed"] if k in nodes])
         state["expanded"] = set([k for k in state["expanded"] if k in nodes])
@@ -5842,8 +6916,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             return
         for g in groups:
             self.replay(g, g.results)
-            self.log("%s (%s): replaying %d role(s) to server." %
-                     (format_api_label(g.gid), format_group_id(g.gid), len(g.results)))
+            self.log("Xếp hàng gửi %d role." % len(g.results), gid=g.gid)
 
     def _on_replay_selected(self, event):
         g = self._require_group()
@@ -5860,8 +6933,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                           JOptionPane.INFORMATION_MESSAGE)
             return
         self.replay(g, results)
-        self.log("%s (%s): replaying %d selected role(s)." %
-                 (format_api_label(g.gid), format_group_id(g.gid), len(results)))
+        self.log("Xếp hàng gửi %d role đang chọn." % len(results), gid=g.gid)
 
     def _on_rebuild(self, event):
         for g in self._selected_groups():
@@ -5932,7 +7004,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             self._p_new = []
             self._p_dirty = {}
             self._p_done_res = set()
-        self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state()}
+        self._tree_states = {"left": self._new_tree_state(), "history": self._new_tree_state(),
+                             "log": self._new_tree_state()}
+        with self._log_lock:
+            self._log_by_gid = {}
         self.group_model.set_feature_filter(None)
         self.group_model.set_hierarchy_filter(None)
         self._refresh_feature_views()
