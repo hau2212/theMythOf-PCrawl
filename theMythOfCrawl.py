@@ -59,7 +59,8 @@ from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable,
                          JSplitPane, JTabbedPane, JTextArea, JMenuItem, JPopupMenu, JOptionPane,
                          JFileChooser, JDialog, JComboBox, JSpinner, SpinnerNumberModel,
                          ListSelectionModel, SwingUtilities, BorderFactory, DefaultCellEditor,
-                         BoxLayout, Box, JTree, JRadioButton, ButtonGroup, JFrame, JList, DefaultListModel)
+                         BoxLayout, Box, JTree, JRadioButton, ButtonGroup, JFrame, JList, DefaultListModel,
+                         JMenu, JCheckBoxMenuItem)
 from javax.swing import Timer, UIManager, Icon, Scrollable, JComponent, KeyStroke, AbstractAction
 from javax.swing.event import (ListSelectionListener, TreeSelectionListener, ChangeListener,
                                TreeWillExpandListener, DocumentListener)
@@ -108,32 +109,25 @@ class _PlacementMixin(object):
     """Capture destination, pending confirmation, moves / revert, 'giữ chỗ' book and its tab.
     Kept out of BurpExtender: Jython limits the size of one class body."""
 
-    def _build_destination_bar(self, cfg):
-        bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 1))
-        lbl = JLabel("➜ Request mới sẽ vào:")
-        lbl.setFont(lbl.getFont().deriveFont(Font.BOLD))
-        bar.add(lbl)
-        self.btn_dest = JButton(" ", actionPerformed=lambda e: self._on_pick_destination())
+    def _build_header_bar(self, cfg):
+        """'➜ [đích ▾] ⓘ  [Cần xử lý ▾] ⓘ' - the destination and the decisions waiting for you."""
+        bar = JPanel(FlowLayout(FlowLayout.LEFT, 3, 0))
+        arrow = JLabel(u"➜ Đích:")
+        arrow.setFont(arrow.getFont().deriveFont(Font.BOLD))
+        bar.add(arrow)
+        self.btn_dest = JButton(" ", actionPerformed=lambda e: self._show_destination_menu())
         self.btn_dest.setFont(self.btn_dest.getFont().deriveFont(Font.BOLD))
         self.btn_dest.setBackground(Color(234, 88, 12))
         self.btn_dest.setForeground(Color(255, 255, 255))
-        self.btn_dest.setToolTipText("Đích cố định cho mọi request mới. Chỉ đổi khi bạn chọn lại ở đây "
-                                     "(bấm chọn chỗ khác trong cây / bảng KHÔNG đổi đích).")
+        self.btn_dest.setMargin(Insets(2, 8, 2, 8))
         bar.add(self.btn_dest)
-        bar.add(JButton("🌳 Lấy nhánh đang chọn trong cây", actionPerformed=lambda e: self._on_dest_from_tree()))
-        bar.add(JButton("＋ Nhánh mới...", actionPerformed=lambda e: self._on_new_destination()))
-        bar.add(JLabel(" | "))
-        self.btn_pending = JButton("⏳ Chờ xác nhận: 0", actionPerformed=lambda e: self._show_pending_menu())
-        self.btn_pending.setFont(self.btn_pending.getFont().deriveFont(Font.BOLD))
-        bar.add(self.btn_pending)
-        self.cb_confirm_new = JCheckBox("Hỏi xác nhận vị trí API mới", cfg.get("confirm_new_apis", True))
-        self.cb_confirm_new.addActionListener(_Action(lambda e: self._set_place_option(
-            "confirm_new_apis", self.cb_confirm_new.isSelected())))
-        self.cb_restore_place = JCheckBox("API đã xóa quay về chỗ cũ (giữ chỗ)", cfg.get("restore_known_place", True))
-        self.cb_restore_place.addActionListener(_Action(lambda e: self._set_place_option(
-            "restore_known_place", self.cb_restore_place.isSelected())))
-        bar.add(self.cb_confirm_new)
-        bar.add(self.cb_restore_place)
+        bar.add(info_icon(HELP["dest"], u"Đích của request mới"))
+        self.btn_todo = JButton(u"Cần xử lý: 0", actionPerformed=lambda e: self._show_todo_menu())
+        self.btn_todo.setFont(self.btn_todo.getFont().deriveFont(Font.BOLD))
+        self.btn_todo.setMargin(Insets(2, 8, 2, 8))
+        bar.add(self.btn_todo)
+        bar.add(info_icon(HELP["todo"], u"Cần xử lý"))
+        self._recent_dest = []
         self._refresh_destination_bar()
         return bar
 
@@ -147,11 +141,77 @@ class _PlacementMixin(object):
         if btn is None:
             return
         name = self.active_feature().name
-        if btn.getText() != u" %s ▾ " % name:
-            btn.setText(u" %s ▾ " % name)
-        n = len(self.pending_groups())
-        self.btn_pending.setText(u"⏳ Chờ xác nhận: %d" % n)
-        self.btn_pending.setEnabled(n > 0)
+        shown = name if len(name) <= 60 else u"…" + name[-58:]
+        if btn.getText() != u"%s ▾" % shown:
+            btn.setText(u"%s ▾" % shown)
+            btn.setToolTipText(u"Request mới sẽ vào: %s  (bấm để đổi)" % name)
+        pending = self.pending_groups()
+        dups = len([g for g in pending if getattr(g, "dup_pending", False)])
+        n = len(pending)
+        self.btn_todo.setText((u"Cần xử lý: %d" % n) + ((u" (⧉%d)" % dups) if dups else u""))
+        self.btn_todo.setBackground(Color(128, 128, 140) if n else None)
+        self.btn_todo.setForeground(Color(255, 255, 255) if n else None)
+
+    def _show_destination_menu(self):
+        menu = JPopupMenu()
+        menu.add(JMenuItem(u"📂 Chọn đích từ danh sách...", actionPerformed=lambda e: self._on_pick_destination()))
+        menu.add(JMenuItem(u"🌳 Lấy nhánh đang chọn trong cây", actionPerformed=lambda e: self._on_dest_from_tree()))
+        menu.add(JMenuItem(u"＋ Nhánh con mới của đích...", actionPerformed=lambda e: self._on_new_destination()))
+        menu.add(JMenuItem(u"＋ Nhánh mới cùng cấp (nút / action tiếp theo)...", actionPerformed=self._on_next_feature))
+        menu.add(JMenuItem(u"⬆ Lên 1 cấp", actionPerformed=self._on_pop_subfolder))
+        menu.add(JMenuItem(u"✏ Đổi tên / sửa đường dẫn đích...", actionPerformed=lambda e: self._on_rename_destination()))
+        more = JMenu(u"Khác")
+        more.add(JMenuItem(u"⚙ Quản lý các cấp của đích (thêm / xóa / đổi thứ tự)...",
+                           actionPerformed=self._on_open_subfolder_manager))
+        more.add(JMenuItem(u"🗑 Xóa nhánh đích...", actionPerformed=self._on_delete_active_branch))
+        menu.add(more)
+        recent = [p for p in self._recent_dest if p != self.active_feature().name][:8]
+        if recent:
+            menu.addSeparator()
+            title = JMenuItem(u"Gần đây:")
+            title.setEnabled(False)
+            menu.add(title)
+            for path in recent:
+                menu.add(JMenuItem(u"   " + path, actionPerformed=lambda e, p=path: self.set_destination(p)))
+        menu.show(self.btn_dest, 0, self.btn_dest.getHeight())
+
+    def _on_rename_destination(self):
+        act = self.active_feature()
+        name = JOptionPane.showInputDialog(self.main_panel, u"Sửa đường dẫn của đích (các API trong nhánh này đổi theo):",
+                                           act.name)
+        if name is not None and u_text(name).strip():
+            self._apply_or_switch_path(normalize_hierarchy_path(name), rename_current=True)
+            self._refresh_destination_bar()
+
+    def _show_todo_menu(self):
+        groups = self.pending_groups()
+        dups = [g for g in groups if getattr(g, "dup_pending", False)]
+        menu = JPopupMenu()
+        menu.add(JMenuItem(u"🧭 Mở danh sách Cần xử lý (giải thích + nút cho từng API)...",
+                           actionPerformed=lambda e: self.show_audit("decide")))
+        menu.addSeparator()
+        n = len(groups)
+        items = [
+            (JMenuItem(u"✔ Giữ chỗ hiện tại cho cả %d API" % n,
+                       actionPerformed=lambda e: self.confirm_groups(self.pending_groups(), u"xác nhận tất cả")), n),
+            (JMenuItem(u"↪ Chuyển cả %d API sang path khác..." % n,
+                       actionPerformed=lambda e: self.open_move_dialog(self.pending_groups())), n),
+            (JMenuItem(u"🙈 Không giữ %d API trùng (ẩn, vẫn lưu ở Audit)" % len(dups),
+                       actionPerformed=lambda e: self.hide_groups(
+                           [g for g in self.pending_groups() if getattr(g, "dup_pending", False)])), len(dups)),
+            (JMenuItem(u"🔎 Lọc bảng API: chỉ API đang chờ", actionPerformed=lambda e: self._filter_pending()), n),
+            (None, 1),
+            (JMenuItem(u"🙈 Xem API trùng & đang ẩn (%d ẩn)" % len(self._hidden),
+                       actionPerformed=lambda e: self.show_audit("dups")), 1),
+            (JMenuItem(u"🗑 Xóa %d API đang chờ..." % n, actionPerformed=lambda e: self._drop_pending()), n),
+        ]
+        for item, enabled in items:
+            if item is None:
+                menu.addSeparator()
+                continue
+            item.setEnabled(bool(enabled))
+            menu.add(item)
+        menu.show(self.btn_todo, 0, self.btn_todo.getHeight())
 
     def known_paths(self):
         paths = [f.name for f in self.features_list()]
@@ -169,6 +229,8 @@ class _PlacementMixin(object):
         if not path:
             return
         self._apply_or_switch_path(path, rename_current=False)
+        name = self.active_feature().name
+        self._recent_dest = [name] + [p for p in getattr(self, "_recent_dest", []) if p != name][:11]
         self.log(u"➜ Đích cho request mới: %s" % self.active_feature().name)
         self._refresh_destination_bar()
         self._flash_status(u"➜ Request mới sẽ vào: %s" % self.active_feature().name)
@@ -193,18 +255,6 @@ class _PlacementMixin(object):
             self.active_feature().name + " > ")
         if name is not None and u_text(name).strip().strip(">").strip():
             self.set_destination(normalize_hierarchy_path(name))
-
-    def _show_pending_menu(self):
-        groups = self.pending_groups()
-        menu = JPopupMenu()
-        menu.add(JMenuItem(u"✔ Xác nhận vị trí tất cả %d API đang chờ" % len(groups),
-                           actionPerformed=lambda e: self.confirm_groups(self.pending_groups(), u"xác nhận tất cả")))
-        menu.add(JMenuItem(u"↪ Chuyển tất cả %d API đang chờ sang..." % len(groups),
-                           actionPerformed=lambda e: self.open_move_dialog(self.pending_groups())))
-        menu.add(JMenuItem(u"🔎 Chỉ hiện API đang chờ trong bảng API", actionPerformed=lambda e: self._filter_pending()))
-        menu.addSeparator()
-        menu.add(JMenuItem(u"🗑 Bỏ (xóa) %d API đang chờ..." % len(groups), actionPerformed=lambda e: self._drop_pending()))
-        menu.show(self.btn_pending, 0, self.btn_pending.getHeight())
 
     def _filter_pending(self):
         combo = getattr(self, "cb_audit_filter", None)
@@ -266,74 +316,283 @@ class _PlacementMixin(object):
         n = self.revert_groups(list(groups or []))
         self._flash_status(u"↶ %d API đã về vị trí trước" % n if n else u"Không có vị trí trước để quay về")
 
-    def _build_places_tab(self):
-        panel = JPanel(BorderLayout(4, 4))
+    # ---- "Audit" tab: Cần xử lý | Giữ chỗ | API trùng & ẩn | Nhật ký
+    def _audit_bar(self, help_key, title, *controls):
         bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-        bar.add(JLabel("Lọc:"))
-        self.tf_place_filter = JTextField(18)
+        bar.add(info_icon(HELP[help_key], title))
+        for c in controls:
+            bar.add(c)
+        return bar
+
+    def _audit_table(self, model, widths, audit_col, method_col=None, bold=()):
+        table = JTable(model)
+        style_data_table(table)
+        table.setAutoCreateRowSorter(True)
+        renderer = AuditTableRenderer(model, audit_col=audit_col, method_col=method_col, bold_cols=bold)
+        for col, width in enumerate(widths):
+            column = table.getColumnModel().getColumn(col)
+            column.setPreferredWidth(width)
+            column.setCellRenderer(renderer)
+        return table
+
+    def _build_places_tab(self):
+        self.audit_tabs = JTabbedPane()
+        self.audit_tabs.addTab(u"Cần xử lý", self._build_decide_panel())
+        self.audit_tabs.addTab(u"Giữ chỗ", self._build_book_panel())
+        self.audit_tabs.addTab(u"API trùng & ẩn", self._build_dups_panel())
+        self.audit_tabs.addTab(u"Nhật ký", self._build_log_panel())
+        self.audit_tabs.addChangeListener(_Change(lambda e: self._reload_places()))
+        self.places_panel = JPanel(BorderLayout())
+        self.places_panel.add(self.audit_tabs, BorderLayout.CENTER)
+        return self.places_panel
+
+    def show_audit(self, section="decide"):
+        if getattr(self, "places_panel", None) is None:
+            return
+        self.tabs.setSelectedComponent(self.places_panel)
+        self.audit_tabs.setSelectedIndex(["decide", "places", "dups", "log"].index(section))
+        self._reload_places()
+
+    # Cần xử lý
+    def _build_decide_panel(self):
+        buttons = [JButton(u"✔ Giữ chỗ hiện tại", actionPerformed=lambda e: self._decide("keep")),
+                   JButton(u"↪ Về nơi vừa gặp", actionPerformed=lambda e: self._decide("found")),
+                   JButton(u"📁 Path khác...", actionPerformed=lambda e: self._decide("other")),
+                   JButton(u"🙈 Không giữ", actionPerformed=lambda e: self._decide("hide")),
+                   JButton(u"🗑 Xóa", actionPerformed=lambda e: self._decide("delete")),
+                   JButton(u"Chọn hết", actionPerformed=lambda e: self.decide_table.selectAll())]
+        buttons[0].setFont(buttons[0].getFont().deriveFont(Font.BOLD))
+        self.decide_model = _RowsModel(DECIDE_COLS)
+        self.decide_table = self._audit_table(self.decide_model, (150, 80, 300, 300, 300), 0, None, (1,))
+        self.decide_table.getSelectionModel().addListSelectionListener(_SelectionListener(self._on_decide_selected))
+        self.decide_text = JTextArea(4, 60)
+        self.decide_text.setEditable(False)
+        self.decide_text.setLineWrap(True)
+        self.decide_text.setWrapStyleWord(True)
+        self.decide_text.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
+        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.decide_table), JScrollPane(self.decide_text))
+        split.setResizeWeight(0.65)
+        panel = JPanel(BorderLayout())
+        panel.add(self._audit_bar("decide", u"Cần xử lý", *buttons), BorderLayout.NORTH)
+        panel.add(split, BorderLayout.CENTER)
+        return panel
+
+    def _selected_rows_payload(self, table, model):
+        return [model.payload_at(table.convertRowIndexToModel(vr)) for vr in table.getSelectedRows()]
+
+    def _on_decide_selected(self):
+        rows = self._selected_rows_payload(self.decide_table, self.decide_model)
+        if not rows:
+            self.decide_text.setText(u"Chọn 1 dòng để xem giải thích và lựa chọn.")
+        elif len(rows) == 1:
+            self.decide_text.setText(decision_text(rows[0], self._copies_of(rows[0].book_key)))
+        else:
+            self.decide_text.setText(u"%d API đang chọn. Các nút phía trên áp dụng cho tất cả." % len(rows))
+        self.decide_text.setCaretPosition(0)
+
+    def _decide(self, action):
+        groups = self._selected_rows_payload(self.decide_table, self.decide_model)
+        if not groups:
+            JOptionPane.showMessageDialog(self.main_panel, u"Chọn ít nhất 1 dòng.", EXT_NAME,
+                                          JOptionPane.INFORMATION_MESSAGE)
+            return
+        if action == "keep":
+            n = self.confirm_groups(groups, u"giữ chỗ hiện tại")
+            msg = u"✔ Đã giữ chỗ hiện tại cho %d API" % n
+        elif action == "found":
+            n = 0
+            for g in groups:
+                hint = getattr(g, "place_hint", None)
+                if hint and hint.get("found"):
+                    n += 1 if self.move_groups_to_path([g], hint["found"], note=u"về nơi vừa gặp") else 0
+                else:
+                    n += self.confirm_groups([g], u"đã ở nơi vừa gặp")
+            msg = u"↪ %d API đã ở nơi vừa gặp" % n
+        elif action == "other":
+            n = self.open_move_dialog(groups)
+            msg = u"📁 Đã chuyển %d API" % (n or 0)
+        elif action == "hide":
+            n = self.hide_groups(groups, u"không giữ")
+            msg = u"🙈 Đã ẩn %d API (xem lại ở tab API trùng & ẩn)" % n
+        else:
+            if JOptionPane.showConfirmDialog(self.main_panel, u"Xóa %d API?" % len(groups), EXT_NAME,
+                                             JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+                return
+            self.group_model.remove_groups(groups)
+            self.on_groups_removed(groups, u"xóa từ Cần xử lý")
+            self._refresh_feature_views()
+            msg = u"🗑 Đã xóa %d API" % len(groups)
+        self._flash_status(msg)
+        self._ui_tick(None)
+
+    # Giữ chỗ
+    def _build_book_panel(self):
+        self.tf_place_filter = JTextField(16)
+        self.tf_place_filter.setToolTipText(u"Lọc theo method, path, vị trí...")
         self.tf_place_filter.getDocument().addDocumentListener(_DocChange(lambda: self._reload_places()))
-        bar.add(self.tf_place_filter)
-        self.cb_place_view = JComboBox(["Tất cả endpoint", "Đang có API", "👻 Đã xóa (giữ chỗ)", "⏳ Chờ xác nhận"])
+        self.cb_place_view = JComboBox([u"Tất cả", u"Đang có API", u"👻 Đã xóa (giữ chỗ)", u"⏳ Chờ xác nhận"])
         self.cb_place_view.addActionListener(_Action(lambda e: self._reload_places()))
-        bar.add(self.cb_place_view)
-        for label, fn in ((u"✏ Sửa vị trí giữ chỗ...", lambda e: self._on_edit_place()),
-                          (u"➕ Thêm giữ chỗ...", lambda e: self._on_add_place()),
-                          (u"✖ Quên giữ chỗ", lambda e: self._on_forget_place()),
-                          (u"♻ Cho phép bắt lại", lambda e: self._on_recapture_place()),
-                          (u"🔎 Mở API", lambda e: self._on_open_place_api())):
-            bar.add(JButton(label, actionPerformed=fn))
-        self.lbl_places = JLabel(" ")
-        self.lbl_places.setFont(self.lbl_places.getFont().deriveFont(Font.BOLD))
-        self.lbl_places.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 8))
+        more = JButton(u"Thêm ▾")
+        more.addActionListener(_Action(lambda e: self._show_book_more(more)))
+        bar = self._audit_bar("places", u"Giữ chỗ", JLabel(u"Lọc:"), self.tf_place_filter, self.cb_place_view,
+                              JButton(u"✏ Sửa chỗ...", actionPerformed=lambda e: self._on_edit_place()),
+                              JButton(u"➕ Thêm...", actionPerformed=lambda e: self._on_add_place()), more)
+        self.lbl_places = JLabel(u" ")
+        self.lbl_places.setBorder(BorderFactory.createEmptyBorder(0, 8, 2, 8))
+        self.place_model = _RowsModel(PLACE_COLS)
+        self.place_table = self._audit_table(self.place_model, (65, 280, 150, 280, 80, 140, 70, 60, 90, 110, 240, 80),
+                                             5, 0, (3,))
+        self.place_table.addMouseListener(_DoubleClick(lambda: self._on_edit_place()))
         top = JPanel(BorderLayout())
         top.add(bar, BorderLayout.NORTH)
         top.add(self.lbl_places, BorderLayout.SOUTH)
+        panel = JPanel(BorderLayout())
         panel.add(top, BorderLayout.NORTH)
-
-        self.place_model = _RowsModel(PLACE_COLS)
-        self.place_table = JTable(self.place_model)
-        style_data_table(self.place_table)
-        self.place_table.setAutoCreateRowSorter(True)
-        self.place_table.getSelectionModel().addListSelectionListener(_SelectionListener(self._reload_place_log))
-        self.place_table.addMouseListener(_DoubleClick(lambda: self._on_edit_place()))
-        r1 = AuditTableRenderer(self.place_model, audit_col=5, method_col=0, bold_cols=(3,))
-        for col, width in ((0, 65), (1, 300), (2, 160), (3, 300), (4, 80), (5, 140), (6, 80), (7, 70), (8, 100),
-                           (9, 110), (10, 260), (11, 90)):
-            column = self.place_table.getColumnModel().getColumn(col)
-            column.setPreferredWidth(width)
-            column.setCellRenderer(r1)
-
-        log_bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-        log_title = JLabel("Nhật ký vị trí")
-        log_title.setFont(log_title.getFont().deriveFont(Font.BOLD))
-        log_bar.add(log_title)
-        self.cb_log_selected_only = JCheckBox("Chỉ của endpoint đang chọn", True)
-        self.cb_log_selected_only.addActionListener(_Action(lambda e: self._reload_place_log()))
-        log_bar.add(self.cb_log_selected_only)
-        log_bar.add(JLabel("Lọc:"))
-        self.tf_log_filter = JTextField(16)
-        self.tf_log_filter.getDocument().addDocumentListener(_DocChange(lambda: self._reload_place_log()))
-        log_bar.add(self.tf_log_filter)
-        log_bar.add(JButton(u"↶ Hoàn tác dòng đang chọn", actionPerformed=lambda e: self._on_revert_log()))
-        log_bar.add(JButton(u"Xóa nhật ký...", actionPerformed=lambda e: self._on_clear_place_log()))
-        self.place_log_model = _RowsModel(PLACE_LOG_COLS)
-        self.place_log_table = JTable(self.place_log_model)
-        style_data_table(self.place_log_table)
-        self.place_log_table.addMouseListener(_DoubleClick(lambda: self._on_revert_log()))
-        r2 = AuditTableRenderer(self.place_log_model, audit_col=2, method_col=4, bold_cols=(0,))
-        for col, width in ((0, 45), (1, 110), (2, 210), (3, 70), (4, 65), (5, 260), (6, 240), (7, 240), (8, 300)):
-            column = self.place_log_table.getColumnModel().getColumn(col)
-            column.setPreferredWidth(width)
-            column.setCellRenderer(r2)
-        bottom = JPanel(BorderLayout())
-        bottom.add(log_bar, BorderLayout.NORTH)
-        bottom.add(JScrollPane(self.place_log_table), BorderLayout.CENTER)
-        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.place_table), bottom)
-        split.setResizeWeight(0.55)
-        split.setOneTouchExpandable(True)
-        panel.add(split, BorderLayout.CENTER)
-        self.places_panel = panel
+        panel.add(JScrollPane(self.place_table), BorderLayout.CENTER)
         return panel
+
+    def _show_book_more(self, btn):
+        menu = JPopupMenu()
+        menu.add(JMenuItem(u"✖ Quên giữ chỗ (lần sau vào đích hiện tại)", actionPerformed=lambda e: self._on_forget_place()))
+        menu.add(JMenuItem(u"♻ Cho phép bắt lại ngay (xóa bộ nhớ chống trùng)",
+                           actionPerformed=lambda e: self._on_recapture_place()))
+        menu.add(JMenuItem(u"🔎 Mở API đang có", actionPerformed=lambda e: self._on_open_place_api()))
+        menu.add(JMenuItem(u"🕘 Xem nhật ký của endpoint này", actionPerformed=lambda e: self._show_log_of_selected()))
+        menu.show(btn, 0, btn.getHeight())
+
+    def _show_log_of_selected(self):
+        rec = self._selected_place()
+        if rec is not None:
+            self._log_key = rec.get("key")
+            self.audit_tabs.setSelectedIndex(3)
+            self._reload_places()
+
+    # API trùng & ẩn
+    def _build_dups_panel(self):
+        self.cb_dup_view = JComboBox([u"Tất cả API trùng & ẩn", u"Chỉ đang ẩn"])
+        self.cb_dup_view.addActionListener(_Action(lambda e: self._reload_places()))
+        bar = self._audit_bar("dups", u"API trùng & ẩn", self.cb_dup_view,
+                              JButton(u"👁 Hiện", actionPerformed=lambda e: self._dup_action("show")),
+                              JButton(u"🙈 Ẩn", actionPerformed=lambda e: self._dup_action("hide")),
+                              JButton(u"✔ Giữ (bản chờ)", actionPerformed=lambda e: self._dup_action("keep")),
+                              JButton(u"🔎 Mở", actionPerformed=lambda e: self._dup_action("open")),
+                              JButton(u"🗑 Xóa", actionPerformed=lambda e: self._dup_action("delete")))
+        self.dup_model = _RowsModel(DUP_COLS)
+        self.dup_table = self._audit_table(self.dup_model, (320, 70, 80, 320, 140, 70, 80), 4, None, (1,))
+        self.dup_table.addMouseListener(_DoubleClick(lambda: self._dup_action("open")))
+        panel = JPanel(BorderLayout())
+        panel.add(bar, BorderLayout.NORTH)
+        panel.add(JScrollPane(self.dup_table), BorderLayout.CENTER)
+        return panel
+
+    def _dup_action(self, action, groups=None):
+        if groups is None:
+            groups = self._selected_rows_payload(self.dup_table, self.dup_model)
+        if not groups:
+            return 0
+        if action == "show":
+            n = self.show_groups(groups)
+        elif action == "hide":
+            n = self.hide_groups(groups)
+        elif action == "keep":
+            n = self.keep_duplicates(groups)
+        elif action == "open":
+            g = groups[0]
+            if getattr(g, "hidden", False):
+                self.show_groups([g])
+                self._ui_tick(None)
+            self.group_model.set_feature_filter(None)
+            self.group_model.set_hierarchy_filter(None)
+            self.tabs.setSelectedIndex(0)
+            self._select_group_in_table(g)
+            return 1
+        else:
+            if JOptionPane.showConfirmDialog(self.main_panel, u"Xóa %d bản?" % len(groups), EXT_NAME,
+                                             JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+                return 0
+            shown = [g for g in groups if not getattr(g, "hidden", False)]
+            if shown:
+                self.group_model.remove_groups(shown)
+            self.on_groups_removed(groups, u"xóa bản trùng")
+            self._refresh_feature_views()
+            n = len(groups)
+        self._ui_tick(None)
+        return n
+
+    def show_dup_popup(self, g):
+        """Quick look at every copy of a duplicated API (#1 ... #n) with the common actions."""
+        copies = sorted(self._copies_of(g.book_key), key=lambda c: c.dup_no)
+        model = _RowsModel([u"Bản", u"API", u"Đang ở", u"Trạng thái", u"Excel"])
+        rows = []
+        for c in copies:
+            hidden = getattr(c, "hidden", False)
+            state = u"🙈 ẩn" if hidden else (u"⏳ chờ quyết định" if getattr(c, "dup_pending", False) else u"đang hiện")
+            e = getattr(c, "target", None)
+            rows.append((c, AUDIT_PENDING if hidden else AUDIT_NONE,
+                         [u"#%d" % c.dup_no, format_api_label(c.gid), c.feature_name, state,
+                          (u"#%s" % e.stt) if e is not None else u""]))
+        model.set_rows(rows)
+        table = JTable(model)
+        style_data_table(table)
+        for col, width in enumerate((45, 70, 300, 120, 60)):
+            table.getColumnModel().getColumn(col).setPreferredWidth(width)
+        mine = [i for i, c in enumerate(copies) if c is g]
+        if mine:
+            table.setRowSelectionInterval(mine[0], mine[0])
+        scroll = JScrollPane(table)
+        scroll.setPreferredSize(Dimension(620, min(60 + 24 * len(rows), 260)))
+        popup = JPopupMenu()
+
+        def act(kind):
+            vr = table.getSelectedRow()
+            if vr < 0:
+                return
+            target = model.payload_at(vr)
+            popup.setVisible(False)
+            if kind == "audit":
+                self.show_audit("dups")
+            else:
+                self._dup_action(kind, [target])
+
+        head = JLabel(u"  ⧉ %s %s  ·  %d bản (số #1, #2 ... theo thứ tự gặp)" % (g.method, strip_query(g.path),
+                                                                              len(copies)))
+        head.setFont(head.getFont().deriveFont(Font.BOLD))
+        head.setForeground(DUP_PURPLE)
+        btns = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        for label, kind in ((u"🔎 Mở", "open"), (u"✔ Giữ", "keep"), (u"🙈 Ẩn", "hide"), (u"👁 Hiện", "show"),
+                            (u"🗑 Xóa", "delete"), (u"Chi tiết ở Audit", "audit")):
+            btns.add(JButton(label, actionPerformed=lambda e, k=kind: act(k)))
+        panel = JPanel(BorderLayout(2, 2))
+        panel.add(head, BorderLayout.NORTH)
+        panel.add(scroll, BorderLayout.CENTER)
+        panel.add(btns, BorderLayout.SOUTH)
+        popup.add(panel)
+        anchor = getattr(self, "_chip_anchor", None) or (self.main_panel, 40, 40)
+        popup.show(anchor[0], anchor[1], anchor[2])
+        return popup
+
+    # Nhật ký
+    def _build_log_panel(self):
+        self._log_key = None
+        self.tf_log_filter = JTextField(16)
+        self.tf_log_filter.getDocument().addDocumentListener(_DocChange(lambda: self._reload_places()))
+        self.btn_log_scope = JButton(u"Tất cả endpoint", actionPerformed=lambda e: self._clear_log_scope())
+        self.btn_log_scope.setToolTipText(u"Đang xem nhật ký của 1 endpoint - bấm để xem tất cả")
+        bar = self._audit_bar("log", u"Nhật ký vị trí", JLabel(u"Lọc:"), self.tf_log_filter, self.btn_log_scope,
+                              JButton(u"↶ Hoàn tác dòng chọn", actionPerformed=lambda e: self._on_revert_log()),
+                              JButton(u"Xóa nhật ký...", actionPerformed=lambda e: self._on_clear_place_log()))
+        self.place_log_model = _RowsModel(PLACE_LOG_COLS)
+        self.place_log_table = self._audit_table(self.place_log_model, (45, 110, 230, 70, 65, 260, 240, 240, 300),
+                                                 2, 4, (0,))
+        self.place_log_table.addMouseListener(_DoubleClick(lambda: self._on_revert_log()))
+        panel = JPanel(BorderLayout())
+        panel.add(bar, BorderLayout.NORTH)
+        panel.add(JScrollPane(self.place_log_table), BorderLayout.CENTER)
+        return panel
+
+    def _clear_log_scope(self):
+        self._log_key = None
+        self._reload_places()
 
     def _selected_place(self):
         table = getattr(self, "place_table", None)
@@ -343,23 +602,50 @@ class _PlacementMixin(object):
         return self.place_model.payload_at(table.convertRowIndexToModel(vr)) if vr >= 0 else None
 
     def _reload_places(self):
-        if getattr(self, "place_model", None) is None:
+        if getattr(self, "audit_tabs", None) is None:
             return
-        keep = self._selected_place()
+        pending = self.pending_groups()
+        keep = self._selected_rows_payload(self.decide_table, self.decide_model)
+        self.decide_model.set_rows([
+            (g, AUDIT_PENDING if decision_kind(g) == "new" else AUDIT_INFO,
+             [DECISION_LABELS[decision_kind(g)], format_api_label(g.gid), u"%s %s" % (g.method, strip_query(g.path)),
+              g.feature_name, (getattr(g, "place_hint", None) or {}).get("found")
+              or (g.feature_name if getattr(g, "dup_pending", False) else u"")])
+            for g in sorted(pending, key=lambda x: x.gid)])
+        for g in keep:
+            for r in range(self.decide_model.getRowCount()):
+                if self.decide_model.payload_at(r) is g:
+                    vr = self.decide_table.convertRowIndexToView(r)
+                    self.decide_table.addRowSelectionInterval(vr, vr)
+        self._on_decide_selected()
+        keep_rec = self._selected_place()
         rows = place_rows(self.places, self.cb_place_view.getSelectedIndex(), self.tf_place_filter.getText())
         self.place_model.set_rows([(rec, PLACE_STATE_LEVEL[st], cells) for rec, st, cells in rows])
-        if keep is not None:
-            self._select_place_key(keep.get("key"), scroll=False)
-        self._reload_place_log()
-        entries = list(self.places.entries.values())
+        if keep_rec is not None:
+            self._select_place_key(keep_rec.get("key"), scroll=False)
+        dup_rows_ = dup_rows(dict(self._copies), self.cb_dup_view.getSelectedIndex() == 1)
+        self.dup_model.set_rows(dup_rows_)
+        key = self._log_key
+        log_rows = place_log_rows(self.places, key, self.tf_log_filter.getText())
+        self.place_log_model.set_rows([(ev, PLACE_ACTION_LEVEL.get(ev.get("action"), AUDIT_NONE), cells)
+                                       for ev, cells in log_rows])
+        rec = self.places.get(key) if key else None
+        self.btn_log_scope.setText((u"Chỉ: %s %s ✖" % (rec.get("method"), short_path(rec.get("path") or u"", 30)))
+                                   if rec else u"Tất cả endpoint")
+        self.btn_log_scope.setEnabled(rec is not None)
         counts = {}
-        for rec in entries:
-            st = place_state(rec)
+        for r in self.places.entries.values():
+            st = place_state(r)
             counts[st] = counts.get(st, 0) + 1
-        self.lbl_places.setText(u"%d endpoint được nhớ  ·  %d đang có API  ·  ⏳ %d chờ xác nhận  ·  👻 %d đã xóa "
-                                u"(giữ chỗ)  ·  %d dòng nhật ký   —  click đúp 1 dòng để sửa vị trí giữ chỗ"
-                                % (len(entries), counts.get("live", 0), counts.get("pending", 0),
-                                   counts.get("deleted", 0), len(self.places.log)))
+        self.lbl_places.setText(u"%d endpoint · %d đang có API · 👻 %d đã xóa (giữ chỗ) · click đúp để sửa chỗ"
+                                % (len(self.places.entries), counts.get("live", 0) + counts.get("pending", 0),
+                                   counts.get("deleted", 0)))
+        dup_count = len([1 for k, v in self._copies.items() if len(v) > 1])
+        titles = [u"Cần xử lý (%d)" % len(pending), u"Giữ chỗ (%d)" % len(self.places.entries),
+                  u"API trùng & ẩn (%d ⧉ · %d 🙈)" % (dup_count, len(self._hidden)), u"Nhật ký (%d)" % len(self.places.log)]
+        for i, t in enumerate(titles):
+            if self.audit_tabs.getTitleAt(i) != t:
+                self.audit_tabs.setTitleAt(i, t)
 
     def _select_place_key(self, key, scroll=True):
         for r in range(self.place_model.getRowCount()):
@@ -373,21 +659,14 @@ class _PlacementMixin(object):
                 return True
         return False
 
-    def _reload_place_log(self):
-        if getattr(self, "place_log_model", None) is None:
-            return
-        rec = self._selected_place()
-        key = rec.get("key") if (rec is not None and self.cb_log_selected_only.isSelected()) else None
-        rows = place_log_rows(self.places, key, self.tf_log_filter.getText())
-        self.place_log_model.set_rows([(ev, PLACE_ACTION_LEVEL.get(ev.get("action"), AUDIT_NONE), cells)
-                                       for ev, cells in rows])
-
     def show_place_of(self, key, view=0):
         if getattr(self, "places_panel", None) is None:
             return
         self.tabs.setSelectedComponent(self.places_panel)
+        self.audit_tabs.setSelectedIndex(1)
         self.cb_place_view.setSelectedIndex(view)
         self.tf_place_filter.setText(u"")
+        self._log_key = key
         self._reload_places()
         if key is not None:
             self._select_place_key(key)
@@ -472,7 +751,7 @@ class _PlacementMixin(object):
                 if getattr(g, "pending", False)]
 
     def confirm_groups(self, groups, note=u""):
-        n = 0
+        n = self.keep_duplicates([g for g in groups if getattr(g, "dup_pending", False)])
         for g in groups:
             if not getattr(g, "pending", False):
                 continue
@@ -539,13 +818,94 @@ class _PlacementMixin(object):
         self._mark(structure=True, status=True)
 
     def on_groups_removed(self, groups, note=u""):
-        """Deleted APIs keep their place ('giữ chỗ') and can be captured again."""
+        """
+        Deleted APIs keep their place ('giữ chỗ': the confirmed one, else where they were) and can
+        be captured again; the copies left of the same endpoint keep its dedup memory.
+        """
+        for g in groups:
+            self._drop_copy(g)
+            self._hidden.pop(g.gid, None)
         self.forget_dedup(groups)
         for g in groups:
-            if g.book_key and self.places.deleted(g.book_key, g.gid) is not None:
+            if not g.book_key:
+                continue
+            left = self._copies_of(g.book_key)
+            if self.places.deleted(g.book_key, g.gid, g.feature_name, left[0].gid if left else None) is not None:
                 self.places.event("delete", g.book_key, g.gid, g.method, g.path, g.feature_name, None,
                                   note or (u"giữ chỗ: %s" % (self.places.get(g.book_key) or {}).get("place")))
+        self._refresh_dup_totals()
         self._after_place_change()
+
+    # ---- copies of one endpoint (duplicates)
+    def _copies_of(self, key):
+        return list(self._copies.get(key, [])) if key else []
+
+    def _add_copy(self, g):
+        with self._state_lock:
+            self._copies.setdefault(g.book_key, []).append(g)
+        self._refresh_dup_totals(g.book_key)
+
+    def _drop_copy(self, g):
+        with self._state_lock:
+            lst = self._copies.get(g.book_key)
+            if lst is not None:
+                self._copies[g.book_key] = [c for c in lst if c is not g]
+                if not self._copies[g.book_key]:
+                    del self._copies[g.book_key]
+
+    def _refresh_dup_totals(self, key=None):
+        keys = [key] if key else list(self._copies.keys())
+        for k in keys:
+            copies = self._copies_of(k)
+            for c in copies:
+                c.dup_total = len(copies)
+
+    def hidden_groups(self):
+        return sorted(self._hidden.values(), key=lambda g: g.gid)
+
+    def keep_duplicates(self, groups):
+        """'Có': keep the duplicate at its new place (it stays numbered #2, #3 ... in the duplicate list)."""
+        n = 0
+        for g in groups:
+            if getattr(g, "dup_pending", False):
+                g.dup_pending = False
+                g.pending = False
+                self.places.event("dup_keep", g.book_key, g.gid, g.method, g.path, None, g.feature_name,
+                                  u"bản trùng #%d" % g.dup_no)
+                self._notify_results(g, None)
+                n += 1
+        if n:
+            self._after_place_change()
+        return n
+
+    def hide_groups(self, groups, note=u""):
+        """'Không': the API leaves the crawl screens but stays in the audit (can be shown again)."""
+        groups = [g for g in groups if g.gid not in self._hidden]
+        if not groups:
+            return 0
+        if self.group_model is not None:
+            self.group_model.remove_groups(groups)
+        for g in groups:
+            g.hidden = True
+            g.dup_pending = False
+            g.pending = False
+            self._hidden[g.gid] = g
+            self.places.event("hide", g.book_key, g.gid, g.method, g.path, g.feature_name, None,
+                              note or u"vẫn lưu trong Audit, bấm Hiện để đưa lại")
+        self._refresh_feature_views()
+        self._after_place_change()
+        return len(groups)
+
+    def show_groups(self, groups):
+        groups = [g for g in groups if self._hidden.pop(g.gid, None) is not None]
+        for g in groups:
+            g.hidden = False
+            self.places.event("show", g.book_key, g.gid, g.method, g.path, None, g.feature_name)
+        if groups and self.group_model is not None:
+            self.group_model.add_many(groups)
+        self._refresh_feature_views()
+        self._after_place_change()
+        return len(groups)
 
     def edit_place(self, key, new_place):
         rec = self.places.get(key)
@@ -643,10 +1003,15 @@ class _PlacementMixin(object):
         with self._state_lock:
             for g in groups:
                 key = getattr(g, "dedup_key", None)
-                if key is not None and self._seen_gid.get(key) == g.gid:
-                    self._seen_keys.discard(key)
-                    del self._seen_gid[key]
-                    n += 1
+                if key is None or self._seen_gid.get(key) != g.gid:
+                    continue
+                left = [c for c in self._copies.get(g.book_key, []) if c is not g]
+                if left:
+                    self._seen_gid[key] = left[0].gid      # another copy still stands for this endpoint
+                    continue
+                self._seen_keys.discard(key)
+                del self._seen_gid[key]
+                n += 1
         if n:
             self.log("Đã xóa %d API: lần sau đi qua chúng sẽ được bắt lại." % n)
         return n
@@ -762,12 +1127,20 @@ class _WorkbenchMixin(object):
         g = self.group_model.group_at(model_row)
         if g is None:
             return
-        self.on_chip("copy" if model_col == GroupTableModel.COPY_COL else "excel", g)
+        ev = getattr(self._group_cell_click, "last_event", None)
+        if ev is not None:
+            self._chip_anchor = (self.group_table, ev.getX(), ev.getY())
+        kind = {GroupTableModel.COPY_COL: "copy", GroupTableModel.EXCEL_COL: "excel",
+                GroupTableModel.DUP_COL: "dup"}.get(model_col)
+        self.on_chip(kind, g)
 
     def on_chip(self, kind, g):
         if kind == "copy":
             line = self.copy_groups([g])
             self._flash_status(u"📋 Đã copy: %s" % line)
+        elif kind == "dup":
+            if getattr(g, "dup_total", 1) > 1:
+                self.show_dup_popup(g)
         elif getattr(g, "target", None) is not None:
             self.jump_to_target(g.target)
 
@@ -797,6 +1170,13 @@ class _WorkbenchMixin(object):
                 fm.stringWidth(text[:text.index(badge)])
             if start - 2 <= rel <= start + fm.stringWidth(badge) + 2:
                 return "excel", g
+        dup = dup_badge(g)
+        if dup and dup in text:
+            fm = comp.getFontMetrics(comp.getFont())
+            start = (icon.getIconWidth() if icon is not None else 0) + comp.getIconTextGap() + \
+                fm.stringWidth(text[:text.index(dup)])
+            if start - 2 <= rel <= start + fm.stringWidth(dup) + 2:
+                return "dup", g
         return None
 
     def copy_label_for(self, group, assign=True):
@@ -937,7 +1317,7 @@ class _WorkbenchMixin(object):
         frame.setSize(Dimension(max(1100, size.width), max(760, size.height)))
         frame.setLocationRelativeTo(None)
         self._main_window = frame
-        self.btn_detach.setText("🗗 Gắn lại vào tab Burp")
+        self.btn_detach.setText(u"🗗 Gắn lại")
         frame.setVisible(True)
         self._ensure_tree_renderers()
 
@@ -953,7 +1333,7 @@ class _WorkbenchMixin(object):
         root.add(self.main_panel, BorderLayout.CENTER)
         root.revalidate()
         root.repaint()
-        self.btn_detach.setText("🗗 Tách ra cửa sổ riêng")
+        self.btn_detach.setText(u"🗗")
         self._ensure_tree_renderers()
 
     def _on_full_tree_selected(self):
@@ -1091,6 +1471,8 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
         self._stale_coverage = True
         self.target_hits = TargetHitLog()
         self.places = PlacementBook()
+        self._copies = {}
+        self._hidden = {}
         self._stale_places = True
         self._places_saved_at = 0.0
         try:
@@ -1402,7 +1784,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
             if self._rebuild_tree("full", tree, self.full_tree_model, label, stats, force):
                 self._stale_full = False
                 self._update_full_tree_header()
-        table = getattr(self, "place_table", None)
+        table = getattr(self, "places_panel", None)
         if self._stale_places and table is not None and table.isShowing():
             self._stale_places = False
             self._reload_places()
@@ -2036,27 +2418,33 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                         self._seen_keys.add(key)
                     earlier = self._seen_gid.get(key)
                 if seen:
-                    hit(HIT_DUP, earlier)
+                    # Same endpoint met again: skipped, unless it shows up at a NEW place (another
+                    # branch than every copy so far) - then it becomes a duplicate copy to decide on.
                     pkey = self._place_key(method, service, path, cfg)
-                    self.places.ensure(pkey, method, service.getHost(), path)
-                    self.places.seen(pkey, standing, skipped=True)
-                    if source == "Manual":
-                        self.log("Skipped %s %s (duplicate endpoint)" % (method, url))
-                    self.update_status()
-                    return
-
-        # Roles are optional: with none enabled the API is still captured, stored and shown
-        # ("1 API gốc + 0 role") and every send / Repeater action falls back to the original.
-        roles = effective_roles(self.roles.all(), feat.name, self.role_branch_rules)
+                    copies = self._copies_of(pkey)
+                    places = set([c.feature_name.lower() for c in copies])
+                    if not (cfg.get("dup_new_place", True) and copies and feat.name.lower() not in places):
+                        hit(HIT_DUP, earlier)
+                        self.places.ensure(pkey, method, service.getHost(), path)
+                        self.places.seen(pkey, standing, skipped=True)
+                        if source == "Manual":
+                            self.log("Skipped %s %s (duplicate endpoint)" % (method, url))
+                        self.update_status()
+                        return
 
         # Placement: a deleted API that comes back returns to its remembered place ('giữ chỗ');
-        # new APIs wait (grey) for a confirmation of their place when that option is on.
+        # a duplicate met at a new place asks whether to keep it there; new APIs wait (grey) for a
+        # confirmation of their place when that option is on.
         pkey = self._place_key(method, service, path, cfg)
         rec = self.places.get(pkey)
+        copies = self._copies_of(pkey)
         pending = bool(cfg.get("confirm_new_apis", True))
         action = "pending" if pending else "capture"
         hint = None
-        if (rec is not None and rec.get("place") and rec.get("gid") is None and cfg.get("restore_known_place", True)
+        if copies:
+            pending = True
+            action = "dup"
+        elif (rec is not None and rec.get("place") and cfg.get("restore_known_place", True)
                 and rec["place"].lower() != feat.name.lower()):
             old_exists = self.feature_by_name(rec["place"]) is not None
             found_at = feat.name
@@ -2065,6 +2453,10 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                     "deleted": rec.get("deleted", 0)}
             pending = True
             action = "return"
+
+        # Roles are optional: with none enabled the API is still captured, stored and shown
+        # ("1 API gốc + 0 role") and every send / Repeater action falls back to the original.
+        roles = effective_roles(self.roles.all(), feat.name, self.role_branch_rules)
 
         with self._state_lock:
             gid = self._next_gid
@@ -2076,11 +2468,20 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
         group.pending = pending
         group.place_hint = hint
         rec = self.places.ensure(pkey, method, service.getHost(), path)
-        self.places.update(pkey, gid=gid, pending=pending)
+        group.dup_no = self.places.next_copy_no(pkey)
+        group.dup_pending = bool(copies)
+        self._add_copy(group)
+        if not copies:
+            self.places.update(pkey, gid=gid, pending=pending)
         self.places.seen(pkey, standing)
         if not pending:
             self.places.set_place(pkey, feat.name)
-        if hint is not None:
+        if copies:
+            first = sorted(copies, key=lambda c: c.dup_no)[0]
+            self.places.event("dup", pkey, gid, method, path, first.feature_name, feat.name,
+                              u"bản #%d; bản #%d (API #%d) đang ở %s" % (group.dup_no, first.dup_no, first.gid,
+                                                                       first.feature_name))
+        elif hint is not None:
             note = u"từng ở đây (đã xóa %d lần); vừa gặp tại %s%s" % (
                 hint["deleted"], hint["found"], u"; nhánh cũ đã bị xóa nên được tạo lại" if hint["old_missing"] else u"")
             self.places.event("return", pkey, gid, method, path, hint["found"], feat.name, note)
@@ -2095,6 +2496,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
             with self._state_lock:
                 self._seen_gid[key] = gid
         hit(HIT_NEW, gid)
+        self._stale_places = True
         if resp is not None:
             try:
                 rinfo = self.helpers.analyzeResponse(resp)
@@ -2428,54 +2830,52 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
         self.btn_path_menu.setFont(Font("Dialog", Font.BOLD, 11))
 
         self.lbl_feature_counter = JLabel("(0 API)")
-        left_header.add(self.cb_capture)
         self.btn_send_mode = JButton(" ", actionPerformed=self._on_toggle_send_mode)
         self.btn_send_mode.setFont(Font("Dialog", Font.BOLD, 12))
         self.btn_send_mode.setMargin(Insets(2, 8, 2, 8))
         self.btn_queue = JButton("Hàng đợi: 0", actionPerformed=self._on_cancel_queue)
         self.btn_queue.setMargin(Insets(2, 6, 2, 6))
+        self.btn_capture_opts.setText(u"⚙ ▾")
+        self.btn_capture_opts.setToolTipText(u"Tùy chọn: phạm vi bắt, regex, tự gửi, xác nhận vị trí, giữ chỗ, API trùng...")
+        # The path chips / text field stay alive (off-screen) for the existing path actions; the
+        # destination button and its menu replace them in the header.
+        left_header.add(self.cb_capture)
         left_header.add(self.btn_send_mode)
         left_header.add(self.btn_queue)
+        left_header.add(info_icon(HELP["capture"], u"Bắt & gửi"))
+        left_header.add(JLabel(u" │ "))
+        left_header.add(self._build_header_bar(cfg))
+        left_header.add(JLabel(u" │ "))
         left_header.add(self.btn_capture_opts)
-        left_header.add(JLabel(" | "))
-        left_header.add(self.lbl_active_feature)
-        left_header.add(self.subfolder_chips_panel)
-        left_header.add(self.tf_feature_name)
-        left_header.add(self.btn_path_menu)
-        left_header.add(self.lbl_feature_counter)
+        self.btn_detach = JButton(u"🗗", actionPerformed=self._on_toggle_detach)
+        self.btn_detach.setMargin(Insets(1, 6, 1, 6))
+        self.btn_detach.setToolTipText(u"Tách cả extension ra cửa sổ riêng (bấm lại / đóng cửa sổ để gắn vào tab Burp)")
+        left_header.add(self.btn_detach)
 
-        # Second header row: never competes for width with the controls above (no overlap).
         right_header = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
         self.status_label = JLabel("")
         self.status_label.setFont(Font("Dialog", Font.PLAIN, 11))
+        bg, fg = _ui_colors()
+        self.status_label.setForeground(_mix(fg, bg, 0.30))
+        right_header.add(info_icon(HELP["colors"], u"Màu & nhãn"))
         right_header.add(self.status_label)
-        right_header.add(self._make_color_badge("Vàng: Lỗi/Lệch",
-                                                AuditTableRenderer.BG_INFO, AuditTableRenderer.FG_INFO))
-        right_header.add(self._make_color_badge("Cam: Bypass",
-                                                AuditTableRenderer.BG_WARN, AuditTableRenderer.FG_WARN))
-        right_header.add(self._make_color_badge("Xanh: 2xx",
-                                                AuditTableRenderer.BG_OK, AuditTableRenderer.FG_OK))
 
         self._rebuild_subfolder_chips(self.active_feature().name)
         top_container.add(left_header, BorderLayout.NORTH)
-        top_container.add(self._build_destination_bar(cfg), BorderLayout.CENTER)
         top_container.add(right_header, BorderLayout.SOUTH)
         self.main_panel.add(top_container, BorderLayout.NORTH)
-        self.btn_detach = JButton("🗗 Tách ra cửa sổ riêng", actionPerformed=self._on_toggle_detach)
-        self.btn_detach.setMargin(Insets(1, 6, 1, 6))
-        self.btn_detach.setToolTipText("Mở cả extension trong một cửa sổ riêng (vd: màn hình thứ 2); "
-                                       "đóng cửa sổ để gắn lại vào tab của Burp")
-        right_header.add(self.btn_detach)
 
         self.tabs = JTabbedPane()
-        self.tabs.addTab("API Groups & Repeater", self._build_groups_tab())
-        self.tabs.addTab("Lịch sử & Báo cáo", self._build_history_tab())
-        self.tabs.addTab("Roles (Profiles)", self._build_roles_tab())
-        self.tabs.addTab("Cấu hình & Bộ lọc", self._build_settings_tab(cfg))
-        self.tabs.addTab("Log", self._build_log_tab())
-        self.tabs.addTab("Độ phủ Excel", self._build_coverage_tab())
-        self.tabs.addTab("🌳 Cây Sub-folder", self._build_tree_tab())
-        self.tabs.addTab("🧭 Vị trí & Audit", self._build_places_tab())
+        for title, builder, tip in (
+                (u"API", self._build_groups_tab, u"Danh sách API đã bắt, kết quả từng role, Repeater gộp"),
+                (u"Lịch sử", self._build_history_tab, u"Cây lịch sử theo nhánh và báo cáo"),
+                (u"Roles", self._build_roles_tab, u"Các role / profile (header, cookie, JWT) và profile API gốc"),
+                (u"Cấu hình", lambda: self._build_settings_tab(cfg), u"Bộ lọc bắt, tốc độ gửi, Excel, copy"),
+                (u"Log", self._build_log_tab, u"Nhật ký theo nhánh / API, xuất Excel"),
+                (u"Excel", self._build_coverage_tab, u"Đối chiếu file Excel: dòng nào đã bắt, số lần gặp, ở đâu"),
+                (u"Cây", self._build_tree_tab, u"Cây nhánh cỡ lớn, mở được cửa sổ riêng, có Request / Response"),
+                (u"Audit", self._build_places_tab, u"Cần xử lý, giữ chỗ, API trùng & ẩn, nhật ký vị trí")):
+            self.tabs.addTab(title, None, builder(), tip)
         # A tree that was hidden while APIs arrived is rebuilt the moment its tab is opened.
         self.tabs.addChangeListener(_Change(lambda e: self._ui_tick(None)))
         self.main_panel.add(self.tabs, BorderLayout.CENTER)
@@ -2640,11 +3040,20 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
         excel_col.setPreferredWidth(100)
         excel_col.setCellRenderer(_ActionCellRenderer(
             self.group_model, "link", lambda r: self._excel_tooltip(self.group_model.group_at(r))))
-        # 'Copy' first, 'Excel' right after Method (the other columns keep their model index)
+        dup_col = cm.getColumn(GroupTableModel.DUP_COL)
+        dup_col.setPreferredWidth(56)
+        dup_col.setMinWidth(52)
+        excel_col.setMinWidth(70)
+        dup_col.setCellRenderer(_ActionCellRenderer(
+            self.group_model, "dup", lambda r: u"API trùng: bấm để xem nhanh các bản" if
+            getattr(self.group_model.group_at(r), "dup_total", 1) > 1 else None))
+        # 'Copy' first, 'Excel' and 'Trùng' right after Method (the other columns keep their model index)
         cm.moveColumn(GroupTableModel.COPY_COL, 0)
         cm.moveColumn(GroupTableModel.EXCEL_COL, 6)
-        cell_click = _TableCellClick(self.group_table, (GroupTableModel.COPY_COL, GroupTableModel.EXCEL_COL),
-                                     self._on_group_cell_click)
+        cm.moveColumn(GroupTableModel.DUP_COL, 7)
+        cell_click = _TableCellClick(self.group_table, (GroupTableModel.COPY_COL, GroupTableModel.EXCEL_COL,
+                                                        GroupTableModel.DUP_COL), self._on_group_cell_click)
+        self._group_cell_click = cell_click
         self.group_table.addMouseListener(cell_click)
         self.group_table.addMouseMotionListener(cell_click)
         self.group_path_editor_combo = JComboBox([DEFAULT_HIERARCHY_PATH])
@@ -3793,6 +4202,8 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
             "copy_counter": self.config.get("copy_counter", 1),
             "confirm_new_apis": self.config.get("confirm_new_apis", True),
             "restore_known_place": self.config.get("restore_known_place", True),
+            "dup_new_place": self.config.get("dup_new_place", True),
+            "show_ghosts": self.config.get("show_ghosts", True),
             "excel_position_copy_format": self.cb_excel_position_copy.isSelected(),
         }
 
@@ -3985,6 +4396,15 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
         menu.addSeparator()
         add_toggle("Cho phép Tự động Gửi ngầm (Auto-Send 1..N Roles)", self.cb_auto_send)
         add_toggle("Tự động đẩy sang Burp Repeater khi bắt", self.cb_auto_repeater)
+        menu.addSeparator()
+        cfg = self.get_config()
+        for label, key in ((u"Hỏi xác nhận vị trí API mới (màu xám)", "confirm_new_apis"),
+                           (u"API đã xóa quay về chỗ cũ (giữ chỗ)", "restore_known_place"),
+                           (u"Gặp API trùng ở chỗ mới: hỏi giữ thêm bản (màu tím)", "dup_new_place"),
+                           (u"Hiện API đã xóa (👻 giữ chỗ) trong cây", "show_ghosts")):
+            item = JCheckBoxMenuItem(label, bool(cfg.get(key, True)))
+            item.addActionListener(_Action(lambda e, k=key, it=item: self._set_place_option(k, it.isSelected())))
+            menu.add(item)
         menu.addSeparator()
         menu.add(JMenuItem("⚙ Mở tab Cấu hình & Bộ lọc chi tiết...",
                            actionPerformed=lambda e: self.tabs.setSelectedIndex(3)))
@@ -4885,6 +5305,10 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
         if self._restoring_tree:
             return
         self._menu_tree = tree
+        if tree.getSelectionCount() > 1:
+            n = len(self._selected_tree_groups(tree))
+            self._flash_status(u"Đang chọn %d mục trong cây = %d API (Ctrl / Shift + click để thêm bớt)"
+                               % (tree.getSelectionCount(), n))
         self._on_left_hierarchy_tree_selected()
         # set after: selecting the matching table row above fires the table listener too
         self._scope_source = "tree"
@@ -4942,6 +5366,12 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                     break
 
     def _on_replay_selected_hierarchy_or_feature(self, event):
+        many = self._many_selected_in_tree()
+        if many is not None:
+            for g in many:
+                self.replay(g, self.default_targets(g))
+            self._flash_status(u"▶ Xếp hàng gửi %d API đang chọn" % len(many))
+            return
         kind, payload = self._selected_left_tree_payload()
         if kind == "ROOT":
             all_g = self.group_model.all_groups()
@@ -5076,7 +5506,19 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
             # Classic full tab names
             self.send_to_repeater(group, self.default_targets(group), compact=False, copy_group_name=False)
 
+    def _many_selected_in_tree(self):
+        tree = getattr(self, "_menu_tree", None) or getattr(self, "left_hierarchy_tree", None)
+        if tree is not None and tree.getSelectionCount() > 1 and getattr(self, "_scope_source", "") == "tree":
+            return self._selected_tree_groups(tree)
+        return None
+
     def _on_send_selected_hierarchy_repeater(self, event):
+        many = self._many_selected_in_tree()
+        if many is not None:
+            for g in many:
+                self._dispatch_group_with_selected_mode(g)
+            self._flash_status(u"📤 Đã đẩy %d API đang chọn sang Repeater" % len(many))
+            return
         kind, payload = self._selected_left_tree_payload()
         if kind == "FOLDER" and payload:
             matched = self.groups_for_hierarchy_prefix(payload)
@@ -5619,7 +6061,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                 self.main_panel, "Xóa toàn bộ các API đã bắt, đặt lại danh sách Nhánh về mặc định và xóa Dedup cache?",
                 EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
             return
-        self.on_groups_removed(self.group_model.all_groups(), u"Xóa toàn bộ")
+        self.on_groups_removed(self.group_model.all_groups() + self.hidden_groups(), u"Xóa toàn bộ")
         self.group_model.clear()
         self.result_model.set_group(None)
         self._show_result(None)

@@ -187,6 +187,23 @@ How to read results: a low-privilege role that gets a `2xx` with a body length c
 - **Excel:** mỗi API có icon copy và cột `Excel #STT · gặp N` (bấm để mở dòng đó trong tab Độ phủ Excel). Tab Độ phủ
   có bộ đếm lượt gặp từng dòng và bảng chi tiết từng lần gặp (path thực tế, vị trí, kết quả).
 
+### 2.8 Giao diện gọn, API trùng, giữ chỗ cho cả API chưa xác nhận (v1.12)
+
+- **Header 1 hàng:** `Capture` · `CHỈ CRAWL / GỬI` · `Hàng đợi` · `➜ Đích [path ▾]` · `Cần xử lý: N` · `⚙ ▾` · `🗗`.
+  Đường dẫn và các thao tác nhánh nằm trong dropdown của nút Đích (chọn từ danh sách, lấy từ cây, nhánh con /
+  cùng cấp mới, lên 1 cấp, đổi tên, đích gần đây). Các tùy chọn (xác nhận vị trí, giữ chỗ, API trùng, hiện API
+  đã xóa) nằm trong `⚙ ▾`. Tên tab rút gọn: API · Lịch sử · Roles · Cấu hình · Log · Excel · Cây · Audit.
+- **Icon ⓘ:** rê chuột xem tóm tắt, bấm xem giải thích đầy đủ (header, các phần của tab Audit, màu sắc).
+- **Giữ chỗ cho cả API chưa xác nhận:** API bị xóa (hoặc Xóa toàn bộ, xóa path, reset chống trùng) nhớ vị trí
+  đã xác nhận, nếu chưa xác nhận thì nhớ nơi nó nằm lúc bị xóa. Bắt lại sẽ về đúng chỗ đó; path đã mất được tạo lại
+  và tab Audit > Cần xử lý giải thích, cho chọn: khôi phục path cũ / về nơi vừa gặp / path khác.
+- **API trùng:** cùng endpoint gặp ở chỗ MỚI → tạo bản #2, #3 ... (màu tím, nhãn `⧉2/3`) và hỏi có giữ ở chỗ mới
+  không. Giữ = hiện ở chỗ mới; Không = ẩn khỏi màn hình crawl, vẫn ở Audit > API trùng & ẩn (bấm Hiện để đưa lại).
+  Gặp lại ở chỗ đã có bản thì chỉ đếm. Bấm nhãn tím (bảng hoặc cây) để xem nhanh mọi bản và thao tác nhanh.
+- **Tab Audit:** Cần xử lý (giải thích từng API + nút) · Giữ chỗ · API trùng & ẩn · Nhật ký (hoàn tác từng dòng).
+- **Chọn nhiều:** Ctrl / Shift + click trong cây (vd cả nhánh A + vài API của nhánh B) hoặc trong bảng; mọi thao tác
+  áp dụng cho tất cả.
+
 ## 3. Threading & safety design
 
 | Concern | Implementation |

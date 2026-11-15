@@ -1822,5 +1822,122 @@ class PlacementTests(unittest.TestCase):
         self.capture()
         self.assertEqual(len(groups), 2)
 
+
+class PlaceholderScenarioTests(unittest.TestCase):
+    """The user's scenarios: unconfirmed APIs keep their place; duplicates met at a new place."""
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+    groups = PlacementTests.groups
+    go = PlacementTests.go
+    tick = PlacementTests.tick
+
+    def clear_everything(self):
+        ext = self.ext
+        ext.on_groups_removed(ext.group_model.all_groups() + ext.hidden_groups(), u"Xóa toàn bộ")
+        ext.group_model.clear()
+        with ext._state_lock:
+            ext._seen_keys.clear()
+            ext._seen_gid.clear()
+            ext._features = [tm.FeatureGroup(1, tm.DEFAULT_HIERARCHY_PATH)]
+            ext._active_fid = 1
+
+    def test_never_confirmed_api_returns_after_clear_all_and_paths_deleted(self):
+        groups = self.groups()
+        self.go("/ > a > b")
+        self.capture()
+        self.tick()
+        self.assertTrue(groups[0].pending)                  # never confirmed
+        self.clear_everything()                              # APIs, dedup cache and paths gone
+        self.assertIsNone(self.ext.feature_by_name("/ > a > b"))
+        self.go("/ > s > f")
+        self.capture()
+        self.tick()
+        g = groups[1]
+        self.assertEqual(g.feature_name, "/ > a > b")        # back where it was
+        self.assertTrue(g.place_hint["old_missing"])
+        self.assertEqual(g.place_hint["found"], "/ > s > f")
+        self.assertIsNotNone(self.ext.feature_by_name("/ > a > b"))
+
+    def test_duplicate_at_a_new_place_asks_and_is_numbered(self):
+        groups = self.groups()
+        self.go("/ > a")
+        self.capture()
+        self.tick()
+        self.ext.confirm_groups(groups)
+        self.capture()                                       # same place: plain dedup skip
+        self.assertEqual(len(groups), 1)
+        self.go("/ > b")
+        self.capture()                                       # new place: duplicate #2, waiting
+        self.tick()
+        self.assertEqual(len(groups), 2)
+        first, dup = groups
+        self.assertEqual((first.dup_no, dup.dup_no), (1, 2))
+        self.assertEqual((first.dup_total, dup.dup_total), (2, 2))
+        self.assertTrue(dup.dup_pending and dup.pending)
+        self.assertEqual(dup.feature_name, "/ > b")
+        self.assertEqual(tm.dup_badge(dup), u"[⧉2/2]")
+        self.assertIn(u"API trùng #2", tm.pending_label(dup))
+        self.assertEqual(self.ext.places.log[-1]["action"], "dup")
+        self.capture()                                       # met again at /b: now a plain skip
+        self.assertEqual(len(groups), 2)
+        # "Không": hidden from the crawl screens, kept in the audit, can be shown again
+        self.assertEqual(self.ext.hide_groups([dup]), 1)
+        self.tick()
+        self.assertNotIn(dup, self.ext.group_model.all_groups())
+        self.assertEqual(self.ext.hidden_groups(), [dup])
+        self.assertEqual(dup.dup_total, 2)
+        self.assertEqual(self.ext.show_groups([dup]), 1)
+        self.tick()
+        self.assertIn(dup, self.ext.group_model.all_groups())
+        # "Có": kept at the new place, still duplicate #2
+        self.assertEqual(self.ext.keep_duplicates([dup]), 0)  # no longer asking after hide / show
+        self.go("/ > c")
+        self.capture()
+        self.tick()
+        third = groups[2]
+        self.assertEqual(third.dup_no, 3)
+        self.assertEqual(self.ext.confirm_groups([third]), 1)
+        self.assertFalse(third.pending or third.dup_pending)
+        # deleting the first copy keeps the endpoint's dedup memory with the other copies
+        self.ext.group_model.remove_groups([first])
+        self.ext.on_groups_removed([first])
+        self.assertEqual(dup.dup_total, 2)
+        self.go("/ > b")
+        self.capture()
+        self.assertEqual(len(groups), 3)                     # /b already holds copy #2
+
+    def test_decisions_explain_each_case_and_duplicates_table(self):
+        groups = self.groups()
+        self.go("/ > a")
+        self.capture()
+        self.tick()
+        self.ext.confirm_groups(groups)
+        self.go("/ > b")
+        self.capture()
+        self.tick()
+        first, dup = groups
+        self.assertEqual(tm.decision_kind(dup), "dup")
+        text = tm.decision_text(dup, self.ext._copies_of(dup.book_key))
+        self.assertIn(u"bản trùng #2", text)
+        self.assertIn(u"/ > a", text)
+        rows = tm.dup_rows(dict(self.ext._copies))
+        self.assertEqual([r[2][1] for r in rows], [u"#1 / 2", u"#2 / 2"])
+        self.ext.hide_groups([dup])
+        self.assertEqual([r[0] for r in tm.dup_rows(dict(self.ext._copies), hidden_only=True)], [dup])
+        wrapped = tm.wrap_text(u"• " + u"chữ " * 40, 30)
+        self.assertTrue(all([len(l) <= 30 for l in wrapped.split(u"\n")]))
+        self.assertTrue(wrapped.split(u"\n")[1].startswith(u"   "))
+
+    def test_duplicates_can_be_switched_off(self):
+        cfg = self.ext.get_config()
+        cfg["dup_new_place"] = False
+        self.ext.apply_config(cfg)
+        groups = self.groups()
+        self.go("/ > a")
+        self.capture()
+        self.go("/ > b")
+        self.capture()
+        self.assertEqual(len(groups), 1)
+
 if __name__ == "__main__":
     unittest.main()

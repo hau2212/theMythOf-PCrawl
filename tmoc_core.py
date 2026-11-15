@@ -40,7 +40,8 @@ from javax.swing import (JPanel, JLabel, JButton, JCheckBox, JTextField, JTable,
                          JSplitPane, JTabbedPane, JTextArea, JMenuItem, JPopupMenu, JOptionPane,
                          JFileChooser, JDialog, JComboBox, JSpinner, SpinnerNumberModel,
                          ListSelectionModel, SwingUtilities, BorderFactory, DefaultCellEditor,
-                         BoxLayout, Box, JTree, JRadioButton, ButtonGroup, JFrame, JList, DefaultListModel)
+                         BoxLayout, Box, JTree, JRadioButton, ButtonGroup, JFrame, JList, DefaultListModel,
+                         JMenu, JCheckBoxMenuItem)
 from javax.swing import Timer, UIManager, Icon, Scrollable, JComponent, KeyStroke, AbstractAction
 from javax.swing.event import (ListSelectionListener, TreeSelectionListener, ChangeListener,
                                TreeWillExpandListener, DocumentListener)
@@ -94,7 +95,7 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.11.0"
+EXT_VERSION = "1.12.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_ORIGINAL = "tmoc.original_profile.v1"
 SETTINGS_KEY_ROLE_SCOPES = "tmoc.role_scopes.v1"
@@ -156,6 +157,8 @@ DEFAULT_CONFIG = {
     "dedup_per_feature": False,
     "confirm_new_apis": True,
     "restore_known_place": True,
+    "dup_new_place": True,
+    "show_ghosts": True,
     "auto_repeater": False,
     "auto_send": False,
     "number_roles_in_tab": True,
@@ -871,10 +874,20 @@ def display_level(g):
 def pending_label(g):
     if not getattr(g, "pending", False):
         return u""
+    if getattr(g, "dup_pending", False):
+        return u"⏳ API trùng #%d - giữ ở chỗ mới?" % getattr(g, "dup_no", 0)
     hint = getattr(g, "place_hint", None)
     if hint:
-        return u"⏳ Chờ xác nhận · ↩ quay về chỗ cũ"
+        return u"⏳ Quay về chỗ cũ - chờ xác nhận"
     return u"⏳ Chờ xác nhận vị trí"
+
+
+def dup_badge(g):
+    """'[⧉2/3]' on an API that has duplicates (copy number / copies), else ''."""
+    total = getattr(g, "dup_total", 1)
+    if total <= 1:
+        return u""
+    return u"[⧉%d/%d]" % (getattr(g, "dup_no", 1), total)
 
 
 def _group_level(g):
@@ -984,8 +997,9 @@ def roles_label(group):
 
 def group_tree_label(g, audit_summary):
     badge = excel_badge(g)
-    text = u"%s   ·   %s %s%s   ·   %s" % (format_api_label(g.gid), g.method, (badge + u" ") if badge else u"",
-                                         short_path(g.path, 48), roles_label(g))
+    dup = dup_badge(g)
+    text = u"%s%s   ·   %s %s%s   ·   %s" % (format_api_label(g.gid), (u" " + dup) if dup else u"", g.method,
+                                           (badge + u" ") if badge else u"", short_path(g.path, 48), roles_label(g))
     if getattr(g, "pending", False):
         text = u"⏳ " + text + u"   ·   " + pending_label(g)[2:]
     if audit_summary and not audit_summary.startswith(u"API gốc"):
@@ -1467,6 +1481,10 @@ PLACE_ACTIONS = {
     "forget": u"✖ Quên giữ chỗ",
     "manual": u"➕ Thêm giữ chỗ",
     "recapture": u"♻ Cho phép bắt lại",
+    "dup": u"⧉ Gặp API trùng ở chỗ mới · chờ quyết định",
+    "dup_keep": u"⧉ Giữ API trùng ở chỗ mới",
+    "hide": u"🙈 Ẩn khỏi màn hình crawl",
+    "show": u"👁 Hiện lại",
 }
 
 
@@ -1511,6 +1529,7 @@ class PlacementBook(object):
                 rec["history"].append({"time": time.strftime("%d/%m %H:%M:%S"), "place": place})
                 del rec["history"][:-self.MAX_HISTORY]
             rec["place"] = place
+            rec["place_confirmed"] = bool(place)
             self.dirty = True
 
     def update(self, key, **fields):
@@ -1534,17 +1553,36 @@ class PlacementBook(object):
             self.dirty = True
             return rec
 
-    def deleted(self, key, gid):
+    def deleted(self, key, gid, last_place=None, remaining_gid=None):
+        """
+        One copy of the endpoint was deleted. Its place is kept: the confirmed one, else the branch
+        it was in when deleted (so an API you never confirmed still comes back where it was).
+        """
         with self._lock:
             rec = self.entries.get(key)
-            if rec is None or (rec.get("gid") is not None and rec.get("gid") != gid):
+            if rec is None:
                 return None
-            rec["gid"] = None
-            rec["pending"] = False
+            rec["gid"] = remaining_gid
+            if remaining_gid is None:
+                rec["pending"] = False
             rec["deleted"] = rec.get("deleted", 0) + 1
             rec["deleted_at"] = time.strftime("%d/%m %H:%M:%S")
+            if not rec.get("place") and last_place:
+                rec["place"] = last_place
+                rec["place_confirmed"] = False
+                rec["history"].append({"time": rec["deleted_at"], "place": last_place})
             self.dirty = True
             return rec
+
+    def next_copy_no(self, key):
+        """1 for the first API of an endpoint, 2, 3 ... for later duplicates (never reused)."""
+        with self._lock:
+            rec = self.entries.get(key)
+            if rec is None:
+                return 1
+            rec["next_no"] = rec.get("next_no", 0) + 1
+            self.dirty = True
+            return rec["next_no"]
 
     def forget(self, key):
         with self._lock:
@@ -3088,9 +3126,10 @@ class FeatureTableModel(AbstractTableModel):
 
 class GroupTableModel(AbstractTableModel):
     COLS = ["API #", "Group", "Group Path (Click đúp để chọn/đổi)", "Đánh giá / Màu (Info)", "Method", "Host", "Path",
-            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time", "📋 Đã copy", "Copy", "Excel"]
+            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time", "📋 Đã copy", "Copy", "Excel", "Trùng"]
     COPY_COL = 14
     EXCEL_COL = 15
+    DUP_COL = 16
 
     def __init__(self, ext=None):
         self._ext = ext
@@ -3312,6 +3351,8 @@ class GroupTableModel(AbstractTableModel):
             hits = getattr(self._ext, "target_hits", None)
             n = hits.count(e) if hits is not None else 0
             return (u"#%s · gặp %d" % (u_text(e.stt), n)) if n else (u"#%s" % u_text(e.stt))
+        if c == 16:
+            return dup_badge(g)[1:-1]
         return ""
 
 
@@ -3747,7 +3788,7 @@ class _ActionCellRenderer(AuditTableRenderer):
             comp.setIcon(None)
             comp.setHorizontalAlignment(JLabel.LEFT)
             if value and not isSelected:
-                comp.setForeground(pal.orig_fg)
+                comp.setForeground(DUP_PURPLE if self._mode == "dup" else pal.orig_fg)
             comp.setFont(comp.getFont().deriveFont(Font.BOLD))
         tip = None
         if self._tooltip_fn is not None:
@@ -3783,6 +3824,7 @@ class _TableCellClick(MouseAdapter):
             return
         cell = self._cell(event)
         if cell is not None:
+            self.last_event = event
             self._fn(cell[0], cell[1])
 
     def mouseMoved(self, event):
@@ -3802,6 +3844,7 @@ class _TreeChipClick(MouseAdapter):
             return
         zone = self._ext.tree_chip_at(self._tree, event.getX(), event.getY())
         if zone is not None:
+            self._ext._chip_anchor = (self._tree, event.getX(), event.getY())
             self._ext.on_chip(zone[0], zone[1])
 
     def mouseMoved(self, event):
@@ -4301,6 +4344,195 @@ class _DotIcon(Icon):
             g2.dispose()
 
 
+DUP_PURPLE = Color(147, 51, 234)
+
+HELP = {
+    "capture": u"Bắt request từ Proxy.\n\n• Ô Capture: bật / tắt bắt.\n• CHỈ CRAWL / GỬI: chỉ ghi lại API, hoặc bắt "
+               u"xong gửi luôn theo hàng đợi chống 429. Bấm để đổi.\n• Hàng đợi: số request đang chờ gửi, bấm để hủy.",
+    "dest": u"Đích: mọi request MỚI sẽ vào đường dẫn này.\n\nChỉ đổi khi bạn chọn lại ở nút này (chọn từ danh "
+            u"sách, lấy nhánh đang chọn trong cây, tạo nhánh mới, đổi tên). Bấm chọn chỗ khác trong cây hay bảng "
+            u"KHÔNG làm đổi đích.\n\nAPI đã từng xóa sẽ quay về chỗ cũ thay vì vào đích (xem Audit).",
+    "todo": u"Việc cần bạn quyết định:\n\n• ⏳ API mới chờ xác nhận vị trí (màu xám).\n• ↩ API đã xóa quay lại "
+            u"chỗ cũ (kể cả khi path cũ đã bị xóa).\n• ⧉ API trùng gặp ở chỗ mới (màu tím): giữ thêm ở chỗ mới "
+            u"hay ẩn đi.\n\nChi tiết, giải thích và nút xử lý ở tab Audit > Cần xử lý.",
+    "colors": u"Màu của API:\n\n• Xám: chờ xác nhận vị trí\n• Vàng: có role lỗi / lệch quyền\n• Cam: nghi bypass "
+              u"(Guest được 2xx)\n• Xanh lá: mọi role 2xx\n• Đỏ: lỗi 5xx / mạng\n• Xanh dương: 3xx hoặc chưa gửi\n"
+              u"• Viền / nhãn tím ⧉2/3: API trùng (bản số 2 trong 3 bản) - bấm nhãn để xem nhanh các bản.",
+    "decide": u"Mỗi dòng là 1 API đang chờ bạn quyết định. Chọn 1 hoặc nhiều dòng rồi bấm nút:\n\n"
+              u"• ✔ Giữ chỗ hiện tại: xác nhận (với path cũ đã mất = khôi phục path cũ; với API trùng = giữ "
+              u"thêm bản ở chỗ mới).\n• ↪ Về nơi vừa gặp: chuyển API vào đích lúc nó được bắt.\n• 📁 Path khác: "
+              u"chọn / tạo path rồi chuyển vào đó (gộp vào path có sẵn).\n• 🙈 Không giữ: ẩn khỏi màn hình crawl, "
+              u"vẫn xem lại được ở tab API trùng & ẩn.\n• 🗑 Xóa.",
+    "places": u"Giữ chỗ: mỗi endpoint (method + host + path) nhớ vị trí cuối cùng của nó - vị trí đã xác nhận, "
+              u"hoặc nơi nó nằm lúc bị xóa. Nhớ cả khi xóa API, Xóa toàn bộ, xóa path, reset chống trùng, nạp lại "
+              u"extension. Lần sau bắt lại, API quay về đúng chỗ này.\n\n• Sửa: đổi chỗ sẽ quay về.\n• Thêm: giữ "
+              u"chỗ trước cho 1 endpoint chưa bắt.\n• Quên: lần sau vào đích hiện tại.\n• Cho phép bắt lại: xóa bộ "
+              u"nhớ chống trùng của endpoint.",
+    "dups": u"API trùng: cùng một endpoint gặp ở nhiều chỗ khác nhau. Bản đầu là #1, các lần gặp ở chỗ mới là "
+            u"#2, #3 ... (số không bao giờ dùng lại).\n\nGặp lại ở chỗ đã có bản thì chỉ đếm (bỏ qua do trùng). "
+            u"Bản bị ẩn không hiện ở màn hình crawl nhưng vẫn ở đây; bấm Hiện để đưa lại.",
+    "log": u"Nhật ký mọi thay đổi vị trí: bắt mới, quay về chỗ cũ, gặp trùng, xác nhận, chuyển, hoàn tác, ẩn / "
+           u"hiện, xóa, đổi tên nhánh, sửa giữ chỗ. Chọn 1 dòng rồi bấm Hoàn tác để quay lại trạng thái trước "
+           u"dòng đó.",
+    "copy": u"Bấm icon để copy 'STT. path' của API (STT lấy từ file Excel). Ctrl+Shift+C copy các API đang chọn.",
+    "excel": u"Dòng khớp trong file Excel: #STT · số lần đã gặp. Bấm để mở đúng dòng đó ở tab Excel.",
+    "select": u"Chọn nhiều: Ctrl + click (từng mục) hoặc Shift + click (một khoảng) trong cây hoặc bảng. Có thể "
+              u"chọn cả nhánh A và vài API của nhánh B cùng lúc; mọi thao tác (gửi, đẩy, copy, chuyển, xác nhận, "
+              u"bật/tắt role) áp dụng cho tất cả.",
+}
+
+
+class _InfoIcon(Icon):
+    """Small circled 'i' (drawn, no font needed)."""
+    _cache = {}
+
+    @classmethod
+    def of(cls, color):
+        icon = cls._cache.get(color.getRGB())
+        if icon is None:
+            icon = cls(color)
+            cls._cache[color.getRGB()] = icon
+        return icon
+
+    def __init__(self, color):
+        self._color = color
+
+    def getIconWidth(self):
+        return 14
+
+    def getIconHeight(self):
+        return 14
+
+    def paintIcon(self, c, g, x, y):
+        g2 = g.create()
+        try:
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            g2.setColor(self._color)
+            g2.drawOval(x + 1, y + 1, 11, 11)
+            g2.fillRect(x + 6, y + 6, 2, 4)
+            g2.fillRect(x + 6, y + 3, 2, 2)
+        finally:
+            g2.dispose()
+
+
+def wrap_text(text, width=64):
+    """Hard-wrap each paragraph (a wrapping JTextArea inside a popup breaks Swing's BoxLayout)."""
+    import textwrap
+    out = []
+    for line in u_text(text).split(u"\n"):
+        indent = u"   " if line.startswith(u"• ") or line.startswith(u"   ") else u""
+        out.append(textwrap.fill(line, width, subsequent_indent=indent) if line.strip() else u"")
+    return u"\n".join(out)
+
+
+def show_info_popup(comp, text, title=None):
+    area = JTextArea(wrap_text(text))
+    area.setEditable(False)
+    area.setBorder(BorderFactory.createEmptyBorder(6, 8, 8, 8))
+    panel = JPanel(BorderLayout())
+    if title:
+        head = JLabel(u" " + title)
+        head.setFont(head.getFont().deriveFont(Font.BOLD))
+        head.setBorder(BorderFactory.createEmptyBorder(6, 6, 0, 6))
+        panel.add(head, BorderLayout.NORTH)
+    panel.add(area, BorderLayout.CENTER)
+    popup = JPopupMenu()
+    popup.add(panel)
+    popup.show(comp, 0, comp.getHeight())
+    return popup
+
+
+class _InfoClick(MouseAdapter):
+    def __init__(self, comp, text, title):
+        self._comp = comp
+        self._text = text
+        self._title = title
+
+    def mouseClicked(self, event):
+        show_info_popup(self._comp, self._text, self._title)
+
+
+def info_icon(text, title=None):
+    """'ⓘ' next to a control: hover = short help, click = full explanation."""
+    _, fg = _ui_colors()
+    lbl = JLabel(_InfoIcon.of(_mix(fg, Color(37, 99, 235), 0.55)))
+    short = u_text(text).split(u"\n")[0]
+    lbl.setToolTipText(short + u"  (bấm để xem đầy đủ)")
+    lbl.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
+    lbl.setBorder(BorderFactory.createEmptyBorder(0, 1, 0, 3))
+    lbl.addMouseListener(_InfoClick(lbl, text, title))
+    return lbl
+
+
+DECISION_LABELS = {"dup": u"⧉ Trùng ở chỗ mới", "return_missing": u"↩ Path cũ đã bị xóa",
+                   "return": u"↩ Quay về chỗ cũ", "new": u"⏳ API mới"}
+
+
+def decision_kind(g):
+    if getattr(g, "dup_pending", False):
+        return "dup"
+    hint = getattr(g, "place_hint", None)
+    if hint:
+        return "return_missing" if hint.get("old_missing") else "return"
+    return "new"
+
+
+def decision_text(g, copies=()):
+    """Plain explanation of what happened to one waiting API and what each choice does."""
+    kind = decision_kind(g)
+    hint = getattr(g, "place_hint", None) or {}
+    api = u"%s %s %s" % (format_api_label(g.gid), g.method, strip_query(g.path))
+    if kind == "return_missing":
+        return (u"%s từng nằm ở '%s', nhưng path đó đã bị xóa. Extension đã tạo lại '%s' để API hiện đúng chỗ cũ.\n"
+                u"Lần này nó được bắt khi đích là '%s'.\n\nBạn chọn:\n• ✔ Giữ chỗ hiện tại = khôi phục path cũ.\n"
+                u"• ↪ Về nơi vừa gặp = chuyển vào '%s' (path cũ tạo lại sẽ trống, xóa được).\n• 📁 Path khác = gộp "
+                u"vào path có sẵn hoặc tạo path mới." % (api, hint.get("old"), hint.get("old"), hint.get("found"),
+                                                       hint.get("found")))
+    if kind == "return":
+        return (u"%s đã bị xóa trước đây khi đang ở '%s', nên được đưa về đúng chỗ đó.\nLần này nó được bắt khi "
+                u"đích là '%s'.\n\n• ✔ Giữ chỗ hiện tại = để ở '%s'.\n• ↪ Về nơi vừa gặp = chuyển vào '%s'.\n"
+                u"• 📁 Path khác = chọn chỗ khác." % (api, hint.get("old"), hint.get("found"), hint.get("old"),
+                                                    hint.get("found")))
+    if kind == "dup":
+        others = [c for c in copies if c is not g]
+        where = u"\n".join([u"   #%d · %s · %s%s" % (c.dup_no, format_api_label(c.gid), c.feature_name,
+                                                    u" (đang ẩn)" if getattr(c, "hidden", False) else u"")
+                            for c in sorted(others, key=lambda c: c.dup_no)])
+        return (u"%s là bản trùng #%d: endpoint này đã có ở\n%s\nLần này gặp lại ở chỗ mới '%s'.\n\n"
+                u"• ✔ Giữ = thêm bản trùng #%d ở '%s' (hiện tím ⧉ trên màn hình crawl).\n"
+                u"• 🙈 Không giữ = ẩn khỏi màn hình crawl; vẫn nằm trong tab API trùng & ẩn, bấm Hiện để đưa lại."
+                % (api, g.dup_no, where or u"   (bản trước đã bị xóa)", g.feature_name, g.dup_no, g.feature_name))
+    return (u"%s mới được bắt vào đích '%s'.\n\n• ✔ Giữ chỗ hiện tại = xác nhận.\n• 📁 Path khác = chuyển "
+            u"sang path khác." % (api, g.feature_name))
+
+
+def dup_rows(copies_by_key, hidden_only=False):
+    """Rows of the 'API trùng & ẩn' tab: every copy of endpoints that have several or a hidden one."""
+    rows = []
+    for key, copies in copies_by_key.items():
+        if not copies:
+            continue
+        if len(copies) < 2 and not any([getattr(c, "hidden", False) for c in copies]):
+            continue
+        for c in sorted(copies, key=lambda x: x.dup_no):
+            hidden = getattr(c, "hidden", False)
+            if hidden_only and not hidden:
+                continue
+            state = u"🙈 Đang ẩn" if hidden else (u"⏳ Chờ quyết định" if getattr(c, "dup_pending", False)
+                                                 else u"Đang hiện")
+            e = getattr(c, "target", None)
+            rows.append((c, AUDIT_PENDING if hidden else (AUDIT_INFO if getattr(c, "dup_pending", False) else AUDIT_OK),
+                         [u"%s %s" % (c.method, strip_query(c.path)), u"#%d / %d" % (c.dup_no, len(copies)),
+                          format_api_label(c.gid), c.feature_name, state, (u"#%s" % e.stt) if e is not None else u"",
+                          c.created]))
+    rows.sort(key=lambda r: (r[2][0], r[0].dup_no))
+    return rows
+
+
+DECIDE_COLS = ["Việc", "API", "Endpoint", "Đang ở", "Vừa gặp tại (đích lúc bắt)"]
+DUP_COLS = ["Endpoint", "Bản", "API", "Đang ở", "Trạng thái", "Excel", "Bắt lúc"]
+
+
 class _CopyIcon(Icon):
     """Small 'two sheets' copy glyph, drawn (no emoji font needed)."""
     _cache = {}
@@ -4453,6 +4685,8 @@ class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
             icon = _DotIcon.of(pal.dot(lvl))
             if kind == "GROUP":
                 icon = _GroupIcon.of(icon, _CopyIcon.of(pal.muted))
+                if getattr(getattr(value, "payload", None), "dup_total", 1) > 1:
+                    edge = DUP_PURPLE
         elif kind in ("ORIG", "ROLE", "LOGRES"):
             if lvl in pal.row_bg:
                 fill = pal.row_bg[lvl][0]
