@@ -31,6 +31,7 @@ import base64
 import json
 import random
 import re
+import sys
 import threading
 import time
 import traceback
@@ -111,7 +112,7 @@ def u_text(val):
 # =============================================================================
 
 EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.8.0"
+EXT_VERSION = "1.8.1"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
 SETTINGS_KEY_TARGETS = "tmoc.targets.v1"
@@ -1262,23 +1263,124 @@ class TargetList(object):
 
 
 _XLSX_MAX_PART = 40 * 1024 * 1024
+_ON_JYTHON = sys.platform.startswith("java")
 
 
 def _xml_local(tag):
     return tag.rsplit("}", 1)[-1]
 
 
-def _xlsx_part(z, name):
-    info = z.getinfo(name)
-    if info.file_size > _XLSX_MAX_PART:
-        raise ValueError("Excel part %s is too large" % name)
-    data = z.read(name)
+class _El(object):
+    """Tiny read-only element (tag / attrib / text / children) shared by both XML back-ends."""
+
+    def __init__(self, tag, attrib, text):
+        self.tag = tag
+        self.attrib = attrib
+        self.text = text
+        self.children = []
+
+    def get(self, key, default=None):
+        return self.attrib.get(key, default)
+
+    def __iter__(self):
+        return iter(self.children)
+
+    def iter(self):
+        stack = [self]
+        while stack:
+            el = stack.pop()
+            yield el
+            stack.extend(reversed(el.children))
+
+
+def _from_etree(node):
+    el = _El(node.tag, dict(node.attrib), node.text)
+    el.children = [_from_etree(c) for c in node]
+    return el
+
+
+def _from_dom(node):
+    from org.w3c.dom import Node
+    ns = node.getNamespaceURI()
+    local = node.getLocalName() or node.getNodeName()
+    attrib = {}
+    attrs = node.getAttributes()
+    for i in range(attrs.getLength()):
+        a = attrs.item(i)
+        a_ns = a.getNamespaceURI()
+        if a_ns == "http://www.w3.org/2000/xmlns/":
+            continue
+        a_local = a.getLocalName() or a.getNodeName()
+        attrib[(u"{%s}%s" % (a_ns, a_local)) if a_ns else a_local] = a.getValue()
+    texts = []
+    el = _El((u"{%s}%s" % (ns, local)) if ns else local, attrib, None)
+    child = node.getFirstChild()
+    while child is not None:
+        kind = child.getNodeType()
+        if kind == Node.ELEMENT_NODE:
+            el.children.append(_from_dom(child))
+        elif kind in (Node.TEXT_NODE, Node.CDATA_SECTION_NODE):
+            texts.append(child.getNodeValue())
+        child = child.getNextSibling()
+    el.text = u"".join(texts) if texts else None
+    return el
+
+
+def _jdk_dom_factory():
+    """The JDK's own DOM parser: Jython's bundled Xerces is not reachable from Burp's class loader."""
+    from javax.xml.parsers import DocumentBuilderFactory
+    try:
+        factory = DocumentBuilderFactory.newDefaultInstance()
+    except AttributeError:  # JDK < 13
+        factory = DocumentBuilderFactory.newInstance()
+    factory.setNamespaceAware(True)
     # Spreadsheet parts never declare a DTD; refusing them rules out entity-expansion tricks.
-    head = data[:4096].lower()
-    if b"<!doctype" in head or b"<!entity" in data.lower():
-        raise ValueError("Unsupported XML in %s" % name)
-    import xml.etree.ElementTree as ET
-    return ET.fromstring(data)
+    factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", True)
+    factory.setXIncludeAware(False)
+    factory.setExpandEntityReferences(False)
+    return factory
+
+
+class _XlsxArchive(object):
+    """Reads the parts of an .xlsx: JDK zip + DOM under Jython (Burp), stdlib under CPython (tests)."""
+
+    def __init__(self, path):
+        if _ON_JYTHON:
+            from java.util.zip import ZipFile as JavaZip
+            self._z = JavaZip(File(path))
+            self._names = set([e.getName() for e in list(self._z.entries())])
+            self._factory = _jdk_dom_factory()
+        else:
+            import zipfile
+            self._z = zipfile.ZipFile(path)
+            self._names = set(self._z.namelist())
+
+    def names(self):
+        return self._names
+
+    def root(self, name):
+        if name not in self._names:
+            raise ValueError("Missing part %s - is this really an .xlsx file?" % name)
+        if _ON_JYTHON:
+            entry = self._z.getEntry(name)
+            if entry.getSize() > _XLSX_MAX_PART:
+                raise ValueError("Excel part %s is too large" % name)
+            stream = self._z.getInputStream(entry)
+            try:
+                return _from_dom(self._factory.newDocumentBuilder().parse(stream).getDocumentElement())
+            finally:
+                stream.close()
+        info = self._z.getinfo(name)
+        if info.file_size > _XLSX_MAX_PART:
+            raise ValueError("Excel part %s is too large" % name)
+        data = self._z.read(name)
+        if b"<!doctype" in data[:4096].lower() or b"<!entity" in data.lower():
+            raise ValueError("Unsupported XML in %s" % name)
+        import xml.etree.ElementTree as ET
+        return _from_etree(ET.fromstring(data))
+
+    def close(self):
+        self._z.close()
 
 
 def _xlsx_col_index(ref):
@@ -1295,11 +1397,10 @@ def _xlsx_col_index(ref):
 
 def read_xlsx_rows(path, sheet_index=0):
     """(sheet_name, rows) of one worksheet; each row is a list of cell values (None for blanks)."""
-    import zipfile
-    z = zipfile.ZipFile(path)
+    z = _XlsxArchive(path)
     try:
-        names = set(z.namelist())
-        wb = _xlsx_part(z, "xl/workbook.xml")
+        names = z.names()
+        wb = z.root("xl/workbook.xml")
         sheets = [el for el in wb.iter() if _xml_local(el.tag) == "sheet"]
         if not sheets:
             raise ValueError("The workbook has no worksheet")
@@ -1311,17 +1412,17 @@ def read_xlsx_rows(path, sheet_index=0):
                 rel_id = v
         target = "worksheets/sheet%d.xml" % (sheet_index + 1)
         if rel_id and "xl/_rels/workbook.xml.rels" in names:
-            for rel in _xlsx_part(z, "xl/_rels/workbook.xml.rels").iter():
+            for rel in z.root("xl/_rels/workbook.xml.rels").iter():
                 if _xml_local(rel.tag) == "Relationship" and rel.get("Id") == rel_id:
                     target = rel.get("Target")
         part = target.lstrip("/") if target.startswith("/") else "xl/" + target
         shared = []
         if "xl/sharedStrings.xml" in names:
-            for si in _xlsx_part(z, "xl/sharedStrings.xml"):
+            for si in z.root("xl/sharedStrings.xml"):
                 if _xml_local(si.tag) == "si":
                     shared.append(u"".join([t.text or u"" for t in si.iter() if _xml_local(t.tag) == "t"]))
         rows = []
-        for row_el in _xlsx_part(z, part).iter():
+        for row_el in z.root(part).iter():
             if _xml_local(row_el.tag) != "row":
                 continue
             cells = {}
@@ -1365,10 +1466,9 @@ def read_xlsx_rows(path, sheet_index=0):
 
 
 def xlsx_sheet_names(path):
-    import zipfile
-    z = zipfile.ZipFile(path)
+    z = _XlsxArchive(path)
     try:
-        wb = _xlsx_part(z, "xl/workbook.xml")
+        wb = z.root("xl/workbook.xml")
         return [el.get("name", "Sheet") for el in wb.iter() if _xml_local(el.tag) == "sheet"]
     finally:
         z.close()
