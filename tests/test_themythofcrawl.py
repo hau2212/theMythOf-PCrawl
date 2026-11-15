@@ -1334,7 +1334,7 @@ class RolesOptionalTests(unittest.TestCase):
         self.assertEqual(len(groups), 2)                     # nothing skipped
         g = groups[0]
         self.assertEqual(g.results, [])
-        self.assertEqual(tm.evaluate_group_audit(g), (tm.AUDIT_OK, "Chỉ API gốc (200) - 0 role"))
+        self.assertEqual(tm.evaluate_group_audit(g), (tm.AUDIT_OK, "API gốc (200)"))
         self.assertEqual(self.ext.default_targets(g), [g.orig_result])
         self.assertEqual(len(self.cb.sent), 0)               # auto-send has no role to send
         self.ext.replay(g, self.ext.default_targets(g))      # "Gửi API" on a role-less API
@@ -1592,6 +1592,72 @@ class RoleScopeTests(unittest.TestCase):
         g1, g2, g3 = self.setup_groups()
         self.assertEqual(tm.branch_prefix_counts([g1, g2, g3]),
                          [("/", 3), ("/ > contact", 2), ("/ > contact > button", 1), ("/ > shop", 1)])
+
+
+class ExcelHitTests(unittest.TestCase):
+    """Every pass over a listed API is counted and audited; deleted APIs are captured again."""
+    setUp = EngineTests.setUp
+    capture = EngineTests.capture
+
+    def groups(self):
+        out = []
+        orig = self.ext._clone_for_roles
+        self.ext._clone_for_roles = lambda g, i, r, c: (out.append(g), orig(g, i, r, c))[1]
+        cfg = self.ext.get_config()
+        cfg.update({"auto_repeater": False, "auto_send": False})
+        self.ext.apply_config(cfg)
+        return out
+
+    def test_hits_are_counted_with_result_and_position(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [200, "POST", "/v1/transfer"], [201, "GET", "/x"]])
+        self.ext.set_targets(tl)
+        groups = self.groups()
+        self.capture()
+        self.capture()
+        self.capture(BASE_REQ.replace(b"/v1/transfer?x=1", b"/v1/transfer?x=2"))
+        hits = self.ext.target_hits
+        self.assertEqual(hits.stats(tl.entries[0]), (3, 1, 2, 0))
+        self.assertEqual(hits.count(tl.entries[1]), 0)
+        ev = hits.events(tl.entries[0])
+        self.assertEqual([e["result"] for e in ev], ["new", "dup", "dup"])
+        self.assertEqual([e["gid"] for e in ev], [groups[0].gid] * 3)
+        self.assertEqual(ev[2]["path"], "/v1/transfer?x=2")
+        self.assertEqual(ev[0]["branch"], groups[0].feature_name)
+        self.assertEqual(tm.hit_cell(hits, tl.entries[0]), u"3 lần (1 mới · 2 gặp lại)")
+        # kept across reloads of the extension, dropped when another file is loaded
+        self.ext._save_hits(True)
+        log = tm.TargetHitLog()
+        log.load_json(self.cb.settings[tm.SETTINGS_KEY_TARGET_HITS], tm.targets_signature(tl))
+        self.assertEqual(log.count(tl.entries[0]), 3)
+        log.load_json(self.cb.settings[tm.SETTINGS_KEY_TARGET_HITS], "other.xlsx|APIs|2")
+        self.assertEqual(log.count(tl.entries[0]), 0)
+        rows = tm.hits_export_rows(tl, hits)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[1][5], u"Gặp lại (đã bắt)")
+
+    def test_deleted_api_is_captured_again(self):
+        groups = self.groups()
+        self.capture()
+        self.capture()
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(self.ext.forget_dedup(groups[:1]), 1)
+        self.capture()
+        self.assertEqual(len(groups), 2)
+        self.capture()
+        self.assertEqual(len(groups), 2)           # the new one is deduplicated again
+
+    def test_labels_for_role_less_api_and_excel_badge(self):
+        tl = tm.build_target_list([["STT", "METHOD", "PATH"], [200, "POST", "/v1/transfer"]])
+        self.ext.set_targets(tl)
+        self.ext.roles.set_all_enabled(False)
+        groups = self.groups()
+        self.capture()
+        g = groups[0]
+        self.assertEqual(tm.roles_label(g), u"API gốc")
+        label = tm.group_tree_label(g, tm.evaluate_group_audit(g)[1])
+        self.assertIn(u"POST [Excel #200] /v1/transfer", label)
+        self.assertIn(u"API gốc", label)
+        self.assertNotIn(u"Chỉ", label)
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,7 @@ from burp import IMessageEditorController
 from burp import IHttpRequestResponse
 
 from java.awt import (BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, GridLayout,
-                      Insets, Dimension, Color, Font, Toolkit, RenderingHints)
+                      Insets, Dimension, Color, Font, Toolkit, RenderingHints, Cursor)
 from java.awt.datatransfer import StringSelection
 from java.awt.event import MouseAdapter, ActionListener, FocusAdapter, WindowAdapter
 from java.lang import Runnable, Boolean, Integer, String, Throwable
@@ -116,6 +116,7 @@ EXT_VERSION = "1.10.0"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_ORIGINAL = "tmoc.original_profile.v1"
 SETTINGS_KEY_ROLE_SCOPES = "tmoc.role_scopes.v1"
+SETTINGS_KEY_TARGET_HITS = "tmoc.target_hits.v1"
 ORIGINAL_PROFILE_NAME = "00_API GỐC (Acc Crawl)"
 ORIGINAL_LABEL = "[API GỐC] 00_Original (Acc Crawl)"
 SETTINGS_KEY_CONFIG = "tmoc.config.v2"
@@ -810,7 +811,7 @@ def evaluate_group_audit(group):
         orig = getattr(group, "orig_result", None)
         status = orig.status if orig is not None else None
         if status is None:
-            lvl, summary = AUDIT_NONE, "Chỉ API gốc (chưa có response)"
+            lvl, summary = AUDIT_NONE, "API gốc (chưa có response)"
         else:
             code = int(status)
             if 200 <= code < 300:
@@ -819,7 +820,7 @@ def evaluate_group_audit(group):
                 lvl = AUDIT_REDIRECT
             else:
                 lvl = AUDIT_INFO
-            summary = "Chỉ API gốc (%d) - 0 role" % code
+            summary = "API gốc (%d)" % code
         group._audit_level = lvl
         group._audit_summary = summary
         return lvl, summary
@@ -963,9 +964,30 @@ class HierarchyStats(object):
         return self.by_fid.get(fid, [])
 
 
+EXCEL_TOKEN = u"[Excel #%s]"
+
+
+def excel_badge(group):
+    """'[Excel #200]' when the API matches a row of the imported file, else ''."""
+    e = getattr(group, "target", None)
+    if e is None or e.stt is None or u_text(e.stt).strip() == "":
+        return u""
+    return EXCEL_TOKEN % u_text(e.stt)
+
+
+def roles_label(group):
+    return u"API gốc" if not group.results else u"1 gốc + %d role" % len(group.results)
+
+
 def group_tree_label(g, audit_summary):
-    return "%s   ·   %s %s   ·   1 gốc + %d role   ·   %s" % (
-        format_api_label(g.gid), g.method, short_path(g.path, 48), len(g.results), audit_summary)
+    badge = excel_badge(g)
+    text = u"%s   ·   %s %s%s   ·   %s" % (format_api_label(g.gid), g.method, (badge + u" ") if badge else u"",
+                                         short_path(g.path, 48), roles_label(g))
+    if audit_summary and not audit_summary.startswith(u"API gốc"):
+        text += u"   ·   %s" % audit_summary
+    elif audit_summary and not g.results and u"(" in audit_summary:
+        text += u"   ·   %s" % audit_summary[audit_summary.index(u"("):]
+    return text
 
 
 def result_tree_label(r, badge):
@@ -1425,6 +1447,124 @@ class TargetList(object):
                                d.get("position", ""), d.get("row", i + 1))
                    for i, d in enumerate(data.get("entries", []))]
         return TargetList(entries, data.get("source", ""), data.get("sheet", ""), data.get("headers"))
+
+
+HIT_NEW, HIT_DUP, HIT_FILTERED = "new", "dup", "filtered"
+HIT_LABELS = {HIT_NEW: u"Bắt mới", HIT_DUP: u"Gặp lại (đã bắt)", HIT_FILTERED: u"Bị lọc"}
+
+
+def targets_signature(targets):
+    if not targets:
+        return None
+    return u"%s|%s|%d" % (targets.source, targets.sheet, len(targets))
+
+
+class TargetHitLog(object):
+    """
+    Every time a request matching a row of the Excel list goes through the proxy: when, which real
+    path, which branch you were on, and whether it was captured, already captured (duplicate) or
+    filtered. Counted per Excel row; the last MAX_EVENTS events of each row are kept.
+    """
+    MAX_EVENTS = 300
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.signature = None
+        self._rows = {}
+        self.dirty = False
+
+    def reset(self, signature=None):
+        with self._lock:
+            self.signature = signature
+            self._rows = {}
+            self.dirty = True
+
+    def record(self, entry, event):
+        with self._lock:
+            rec = self._rows.get(entry.row_no)
+            if rec is None:
+                rec = {"count": 0, "new": 0, "dup": 0, "filtered": 0, "events": []}
+                self._rows[entry.row_no] = rec
+            rec["count"] += 1
+            kind = event.get("result", HIT_NEW)
+            rec[kind] = rec.get(kind, 0) + 1
+            ev = dict(event)
+            ev["n"] = rec["count"]
+            rec["events"].append(ev)
+            if len(rec["events"]) > self.MAX_EVENTS:
+                del rec["events"][0]
+            self.dirty = True
+            return rec["count"]
+
+    def count(self, entry):
+        rec = self._rows.get(getattr(entry, "row_no", None))
+        return rec["count"] if rec else 0
+
+    def stats(self, entry):
+        """(count, new, dup, filtered)"""
+        rec = self._rows.get(getattr(entry, "row_no", None))
+        if not rec:
+            return 0, 0, 0, 0
+        return rec["count"], rec.get("new", 0), rec.get("dup", 0), rec.get("filtered", 0)
+
+    def events(self, entry):
+        with self._lock:
+            rec = self._rows.get(getattr(entry, "row_no", None))
+            return [dict(e) for e in rec["events"]] if rec else []
+
+    def positions(self, entry):
+        """Branches the row was met on, most recent first, each once."""
+        out = []
+        for ev in reversed(self.events(entry)):
+            b = ev.get("branch") or u""
+            if b and b not in out:
+                out.append(b)
+        return out
+
+    def total(self):
+        return sum([r["count"] for r in self._rows.values()])
+
+    def rows_seen(self):
+        return len([1 for r in self._rows.values() if r["count"]])
+
+    def to_json(self):
+        with self._lock:
+            self.dirty = False
+            return json.dumps({"signature": self.signature,
+                               "rows": dict([(u_text(k), v) for k, v in self._rows.items()])})
+
+    def load_json(self, raw, signature):
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        with self._lock:
+            self.signature = signature
+            self._rows = {}
+            if data.get("signature") == signature and signature is not None:
+                for k, v in (data.get("rows") or {}).items():
+                    try:
+                        self._rows[int(k)] = v
+                    except (ValueError, TypeError):
+                        pass
+            self.dirty = False
+
+
+def hit_cell(hits, entry):
+    """'5 lần (1 mới · 4 gặp lại)' for the coverage table."""
+    if hits is None:
+        return u""
+    n, new, dup, filtered = hits.stats(entry)
+    if not n:
+        return u"0"
+    parts = []
+    if new:
+        parts.append(u"%d mới" % new)
+    if dup:
+        parts.append(u"%d gặp lại" % dup)
+    if filtered:
+        parts.append(u"%d bị lọc" % filtered)
+    return u"%d lần (%s)" % (n, u" · ".join(parts))
 
 
 class NearMissIndex(object):
@@ -1890,13 +2030,30 @@ def build_xlsx(sheets):
 
 
 COVERAGE_EXTRA_HEADER = ["Trạng thái", "Số lần bắt", "API #", "Path thực tế", "Vị trí tìm thấy", "Đánh giá",
-                         "Path để copy", "Đã copy", "Gợi ý gần đúng (dòng chưa bắt)"]
-COVERAGE_WIDTHS = [6, 12, 48, 44, 12, 11, 10, 48, 44, 40, 50, 9, 60]
+                         "Path để copy", "Đã copy", "Gợi ý gần đúng (dòng chưa bắt)", "Lượt gặp",
+                         "Các vị trí đã gặp"]
+COVERAGE_WIDTHS = [6, 12, 48, 44, 12, 11, 10, 48, 44, 40, 50, 9, 60, 26, 60]
+HITS_HEADER = ["STT (file)", "Method (file)", "Path (trong file)", "Lần", "Thời gian", "Kết quả", "API #",
+               "Method", "Path thực tế", "Host", "Vị trí đang đứng", "Lưu vào nhánh", "Nguồn", "Ghi chú"]
+HITS_WIDTHS = [8, 10, 44, 6, 17, 16, 8, 9, 48, 24, 44, 44, 9, 30]
+
+
+def hits_export_rows(targets, hits):
+    rows = []
+    if not targets or hits is None:
+        return rows
+    for e in targets.entries:
+        for ev in hits.events(e):
+            rows.append([e.stt, e.method_label(), e.path, ev.get("n"), ev.get("time"),
+                         HIT_LABELS.get(ev.get("result"), ev.get("result")),
+                         format_api_label(ev["gid"]) if ev.get("gid") else None, ev.get("method"), ev.get("path"),
+                         ev.get("host"), ev.get("branch"), ev.get("filed"), ev.get("source"), ev.get("note") or None])
+    return rows
 OUTSIDE_HEADER = ["STT", "API #", "Method", "Path", "Vị trí tìm thấy", "Host", "Status gốc", "Path để copy"]
 OUTSIDE_WIDTHS = [6, 8, 9, 48, 44, 26, 11, 50]
 
 
-def coverage_export_rows(targets, groups, copy_format=None, position_as_copy=False):
+def coverage_export_rows(targets, groups, copy_format=None, position_as_copy=False, hits=None):
     """
     Rows mirroring the user's file (STT, method, path, position) + what was found for each row.
     POSITION keeps what the user wrote; when empty it is filled with where the API was found,
@@ -1930,7 +2087,8 @@ def coverage_export_rows(targets, groups, copy_format=None, position_as_copy=Fal
                     u"; ".join(found_positions) or None,
                     (getattr(first, "_audit_summary", None) or evaluate_group_audit(first)[1]) if first else None,
                     copy_line, u"Có" if any([getattr(g, "copied_label", None) for g in found]) else None,
-                    hint or None])
+                    hint or None, hit_cell(hits, e) or None,
+                    u"; ".join(hits.positions(e)) if hits is not None else None])
     return out
 
 
@@ -1944,12 +2102,14 @@ def outside_list_rows(groups, label_fn=None):
     return rows
 
 
-def build_api_workbook(groups, targets=None, copy_format=None, position_as_copy=False, label_fn=None):
+def build_api_workbook(groups, targets=None, copy_format=None, position_as_copy=False, label_fn=None, hits=None):
     api_rows, role_rows = api_export_rows(groups, label_fn)
     sheets = []
     if targets is not None and len(targets):
         sheets.append((u"Độ phủ", list(targets.headers) + COVERAGE_EXTRA_HEADER,
-                       coverage_export_rows(targets, groups, copy_format, position_as_copy), COVERAGE_WIDTHS))
+                       coverage_export_rows(targets, groups, copy_format, position_as_copy, hits), COVERAGE_WIDTHS))
+        if hits is not None:
+            sheets.append((u"Nhật ký lượt gặp", HITS_HEADER, hits_export_rows(targets, hits), HITS_WIDTHS))
         sheets.append((u"API ngoài danh sách", OUTSIDE_HEADER, outside_list_rows(groups, label_fn), OUTSIDE_WIDTHS))
     sheets.append((u"API", EXPORT_API_HEADER, api_rows, EXPORT_API_WIDTHS))
     sheets.append((u"Kết quả Role", EXPORT_ROLE_HEADER, role_rows, EXPORT_ROLE_WIDTHS))
@@ -2764,7 +2924,9 @@ class FeatureTableModel(AbstractTableModel):
 
 class GroupTableModel(AbstractTableModel):
     COLS = ["API #", "Group", "Group Path (Click đúp để chọn/đổi)", "Đánh giá / Màu (Info)", "Method", "Host", "Path",
-            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time", "📋 Đã copy"]
+            "Orig", "Orig Len", "1 Gốc + Roles", "Đã gửi", "Source", "Time", "📋 Đã copy", "Copy", "Excel"]
+    COPY_COL = 14
+    EXCEL_COL = 15
 
     def __init__(self, ext=None):
         self._ext = ext
@@ -2963,7 +3125,7 @@ class GroupTableModel(AbstractTableModel):
         if c == 8:
             return None if g.orig_length is None else Integer(g.orig_length)
         if c == 9:
-            return "1 Gốc + %d Role" % len(g.results)
+            return roles_label(g)
         if c == 10:
             done = len([x for x in g.results if x.state in (STATE_DONE, STATE_ERROR)])
             return "%d/%d" % (done, len(g.results))
@@ -2973,6 +3135,15 @@ class GroupTableModel(AbstractTableModel):
             return g.created
         if c == 13:
             return getattr(g, "copied_label", None) or ""
+        if c == 14:
+            return ""
+        if c == 15:
+            e = getattr(g, "target", None)
+            if e is None:
+                return ""
+            hits = getattr(self._ext, "target_hits", None)
+            n = hits.count(e) if hits is not None else 0
+            return (u"#%s · gặp %d" % (u_text(e.stt), n)) if n else (u"#%s" % u_text(e.stt))
         return ""
 
 
@@ -3084,20 +3255,35 @@ class ResultTableModel(AbstractTableModel):
 class CoverageTableModel(AbstractTableModel):
     """One row per line of the imported Excel list, with what was captured for it."""
     COLS = ["STT", "Method", "Path (trong file)", "POSITION", "Trạng thái", "API #", "Path thực tế",
-            "Vị trí tìm thấy", "Đánh giá", "📋 Đã copy", "Gợi ý gần đúng (dòng chưa bắt)"]
-    FILTERS = ["Tất cả dòng", "Chưa bắt", "Đã bắt"]
+            "Vị trí tìm thấy", "Đánh giá", "📋 Đã copy", "Gợi ý gần đúng (dòng chưa bắt)", "Lượt gặp",
+            "Các vị trí đã gặp (mới nhất trước)"]
+    HITS_COL = 11
+    PLACES_COL = 12
+    FILTERS = ["Tất cả dòng", "Chưa bắt", "Đã bắt", "Đã gặp", "Chưa gặp lần nào"]
 
     def __init__(self):
         self._rows = []
         self._filter = 0
 
-    def reload(self, targets, groups, filter_idx=None):
+    def entry_at(self, r):
+        return self._rows[r][3] if 0 <= r < len(self._rows) else None
+
+    def row_of_entry(self, entry):
+        for i, row in enumerate(self._rows):
+            if row[3] is entry:
+                return i
+        return -1
+
+    def reload(self, targets, groups, filter_idx=None, hits=None):
         if filter_idx is not None:
             self._filter = filter_idx
         rows = []
         near = NearMissIndex(groups or [])
         for e, found in coverage_rows(targets, groups):
             if (self._filter == 1 and found) or (self._filter == 2 and not found):
+                continue
+            met = hits.count(e) if hits is not None else 0
+            if (self._filter == 3 and not met) or (self._filter == 4 and met):
                 continue
             found = sorted(found, key=lambda g: g.gid)
             first = found[0] if found else None
@@ -3128,7 +3314,9 @@ class CoverageTableModel(AbstractTableModel):
                 if g is not None:
                     hint = u"%s %s %s  (%s)" % (format_api_label(g.gid), g.method, strip_query(g.path), note)
             cells.append(hint)
-            rows.append((cells, level, found))
+            cells.append(hit_cell(hits, e))
+            cells.append(u"; ".join(hits.positions(e)[:6]) if hits is not None else u"")
+            rows.append((cells, level, found, e))
         self._rows = rows
         self.fireTableDataChanged()
 
@@ -3369,6 +3557,125 @@ class AuditTableRenderer(DefaultTableCellRenderer):
             fg = pal.orig_fg
         comp.setForeground(fg)
         return comp
+
+
+class _ActionCellRenderer(AuditTableRenderer):
+    """'copy' cell: a copy glyph; 'link' cell: the Excel STT drawn as a link."""
+
+    def __init__(self, model, mode, tooltip_fn=None):
+        AuditTableRenderer.__init__(self, model)
+        self._mode = mode
+        self._tooltip_fn = tooltip_fn
+
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+        comp = AuditTableRenderer.getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column)
+        pal = RowPalette.of(table.getBackground(), table.getForeground())
+        if self._mode == "copy":
+            comp.setIcon(_CopyIcon.of(comp.getForeground() if isSelected else pal.muted))
+            comp.setText(u"")
+            comp.setHorizontalAlignment(JLabel.CENTER)
+        else:
+            comp.setIcon(None)
+            comp.setHorizontalAlignment(JLabel.LEFT)
+            if value and not isSelected:
+                comp.setForeground(pal.orig_fg)
+            comp.setFont(comp.getFont().deriveFont(Font.BOLD))
+        tip = None
+        if self._tooltip_fn is not None:
+            try:
+                tip = self._tooltip_fn(table.convertRowIndexToModel(row))
+            except (Exception, Throwable):
+                tip = None
+        comp.setToolTipText(tip)
+        return comp
+
+
+class _TableCellClick(MouseAdapter):
+    """Single left click on one of `cols` (model indexes) -> fn(model_row, model_col); hand cursor over them."""
+
+    def __init__(self, table, cols, fn):
+        self._table = table
+        self._cols = set(cols)
+        self._fn = fn
+
+    def _cell(self, event):
+        t = self._table
+        vr = t.rowAtPoint(event.getPoint())
+        vc = t.columnAtPoint(event.getPoint())
+        if vr < 0 or vc < 0:
+            return None
+        mc = t.convertColumnIndexToModel(vc)
+        if mc not in self._cols:
+            return None
+        return t.convertRowIndexToModel(vr), mc
+
+    def mouseClicked(self, event):
+        if event.getClickCount() != 1 or not SwingUtilities.isLeftMouseButton(event):
+            return
+        cell = self._cell(event)
+        if cell is not None:
+            self._fn(cell[0], cell[1])
+
+    def mouseMoved(self, event):
+        cell = self._cell(event)
+        self._table.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR if cell else Cursor.DEFAULT_CURSOR))
+
+
+class _TreeChipClick(MouseAdapter):
+    """Copy glyph / '[Excel #STT]' badge on an API row of a tree: click to copy / open the Excel row."""
+
+    def __init__(self, tree, ext):
+        self._tree = tree
+        self._ext = ext
+
+    def mouseClicked(self, event):
+        if event.getClickCount() != 1 or not SwingUtilities.isLeftMouseButton(event):
+            return
+        zone = self._ext.tree_chip_at(self._tree, event.getX(), event.getY())
+        if zone is not None:
+            self._ext.on_chip(zone[0], zone[1])
+
+    def mouseMoved(self, event):
+        zone = self._ext.tree_chip_at(self._tree, event.getX(), event.getY())
+        self._tree.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR if zone else Cursor.DEFAULT_CURSOR))
+
+
+class HitTableModel(AbstractTableModel):
+    """Every time the selected Excel row was met while crawling (newest first)."""
+    COLS = ["Lần", "Thời gian", "Kết quả", "API #", "Method", "Path thực tế", "Host", "Vị trí đang đứng",
+            "Lưu vào nhánh", "Nguồn", "Ghi chú"]
+    LEVELS = {HIT_NEW: AUDIT_OK, HIT_DUP: AUDIT_REDIRECT, HIT_FILTERED: AUDIT_INFO}
+
+    def __init__(self):
+        self._events = []
+
+    def set_events(self, events):
+        self._events = list(reversed(events or []))
+        self.fireTableDataChanged()
+
+    def gid_at(self, r):
+        return self._events[r].get("gid") if 0 <= r < len(self._events) else None
+
+    def audit_level_at(self, r):
+        return self.LEVELS.get(self._events[r].get("result"), AUDIT_NONE) if 0 <= r < len(self._events) else AUDIT_NONE
+
+    def accent_key_at(self, r):
+        return None
+
+    def getRowCount(self):
+        return len(self._events)
+
+    def getColumnCount(self):
+        return len(self.COLS)
+
+    def getColumnName(self, c):
+        return self.COLS[c]
+
+    def getValueAt(self, r, c):
+        ev = self._events[r]
+        return [ev.get("n"), ev.get("time"), HIT_LABELS.get(ev.get("result"), ev.get("result")),
+                format_api_label(ev["gid"]) if ev.get("gid") else u"", ev.get("method"), ev.get("path"),
+                ev.get("host"), ev.get("branch"), ev.get("filed"), ev.get("source"), ev.get("note") or u""][c]
 
 
 def style_data_table(table):
@@ -3657,6 +3964,73 @@ class _DotIcon(Icon):
             g2.dispose()
 
 
+class _CopyIcon(Icon):
+    """Small 'two sheets' copy glyph, drawn (no emoji font needed)."""
+    _cache = {}
+
+    @classmethod
+    def of(cls, color):
+        icon = cls._cache.get(color.getRGB())
+        if icon is None:
+            icon = cls(color)
+            cls._cache[color.getRGB()] = icon
+        return icon
+
+    def __init__(self, color):
+        self._color = color
+
+    def getIconWidth(self):
+        return 14
+
+    def getIconHeight(self):
+        return 14
+
+    def paintIcon(self, c, g, x, y):
+        g2 = g.create()
+        try:
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            g2.setColor(self._color)
+            g2.drawRoundRect(x + 1, y + 1, 8, 9, 3, 3)
+            bg = c.getBackground() if c is not None else None
+            g2.setColor(bg or Color(255, 255, 255))
+            g2.fillRoundRect(x + 4, y + 4, 8, 9, 3, 3)
+            g2.setColor(self._color)
+            g2.drawRoundRect(x + 4, y + 4, 8, 9, 3, 3)
+            g2.drawLine(x + 6, y + 7, x + 10, y + 7)
+            g2.drawLine(x + 6, y + 10, x + 10, y + 10)
+        finally:
+            g2.dispose()
+
+
+class _GroupIcon(Icon):
+    """API row marker: audit dot + a copy glyph (click it to copy 'STT. path')."""
+    _cache = {}
+    COPY_X = 14
+
+    @classmethod
+    def of(cls, dot, glyph):
+        key = (id(dot), id(glyph))
+        icon = cls._cache.get(key)
+        if icon is None:
+            icon = cls(dot, glyph)
+            cls._cache[key] = icon
+        return icon
+
+    def __init__(self, dot, glyph):
+        self._dot = dot
+        self._glyph = glyph
+
+    def getIconWidth(self):
+        return self.COPY_X + 16
+
+    def getIconHeight(self):
+        return 14
+
+    def paintIcon(self, c, g, x, y):
+        self._dot.paintIcon(c, g, x, y + 2)
+        self._glyph.paintIcon(c, g, x + self.COPY_X + 1, y)
+
+
 class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
     """
     Tree rows drawn as rounded "chips":
@@ -3740,6 +4114,8 @@ class HierarchyTreeRenderer(JLabel, TreeCellRenderer):
         elif kind in ("GROUP", "LOGAPI"):
             fill = pal.row_bg.get(lvl, pal.zebra)[0] if lvl in pal.row_bg else pal.zebra[1]
             icon = _DotIcon.of(pal.dot(lvl))
+            if kind == "GROUP":
+                icon = _GroupIcon.of(icon, _CopyIcon.of(pal.muted))
         elif kind in ("ORIG", "ROLE", "LOGRES"):
             if lvl in pal.row_bg:
                 fill = pal.row_bg[lvl][0]
@@ -5137,10 +5513,15 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.role_branch_rules = self._load_role_scopes()
         self.targets = None
         self._stale_coverage = True
+        self.target_hits = TargetHitLog()
+        self._hits_saved_at = 0.0
+        self._seen_gid = {}
         try:
             raw_targets = callbacks.loadExtensionSetting(SETTINGS_KEY_TARGETS)
             if raw_targets:
                 self.targets = TargetList.from_json(raw_targets)
+                self.target_hits.load_json(callbacks.loadExtensionSetting(SETTINGS_KEY_TARGET_HITS),
+                                           targets_signature(self.targets))
         except Exception as e:
             callbacks.printError("Could not load the stored Excel API list: %s" % u_text(e))
         regex_err = self._recompile_filters(self.config)
@@ -5241,6 +5622,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def extensionUnloaded(self):
         self._unloaded = True
+        try:
+            self._save_hits(True)
+        except (Throwable, Exception):
+            pass
         for win in (self._tree_window, self._main_window):
             try:
                 if win is not None:
@@ -5392,8 +5777,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             lines, self._p_log = self._p_log, []
         if lines:
             self._flush_log(lines)
+        self._save_hits()
         if self.group_model is None or self.group_table is None:
             return
+        total = self.target_hits.total()
+        if total != getattr(self, "_hits_seen_total", 0):
+            self._hits_seen_total = total
+            self.group_table.repaint()
         self._ensure_tree_renderers()
         if new_groups:
             self.group_model.add_many(new_groups)
@@ -5637,6 +6027,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                            if hierarchy_matches_prefix(g.feature_name, clean_prefix)]
                 if delete_apis and matched:
                     self.group_model.remove_groups(matched)
+                    self.forget_dedup(matched)
                 elif matched:
                     self.move_groups_to_feature(matched, fallback_feat.fid)
             self._refresh_feature_views()
@@ -6060,17 +6451,29 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         method = ("%s" % (info.getMethod() or "GET")).upper()
         path = url.getFile() or "/"
         feat = self.get_feature(target_fid) or self.active_feature()
+        standing = feat.name
         targets = self.targets
         target = self._target_match(method, path, service.getHost(), cfg) if targets else None
         if target is not None and target.position and cfg.get("target_use_position", True):
             feat = self.find_or_create_feature_by_path(target.position)
 
+        def hit(result, gid=None, note=u""):
+            if target is not None:
+                self.target_hits.record(target, {
+                    "time": time.strftime("%d/%m %H:%M:%S"), "result": result, "gid": gid, "method": method,
+                    "path": u_text(path)[:400], "host": service.getHost(), "branch": standing,
+                    "filed": feat.name, "source": source, "note": note})
+                self._stale_coverage = True
+                self._mark(status=True)
+
+        key = None
         if apply_filters:
             reason = self._filter_reason(cfg, url, method, path, target)
             if reason:
                 with self._state_lock:
                     self._skipped_count += 1
                     self._last_skip_reason = reason
+                hit(HIT_FILTERED, note=reason)
                 if source == "Manual":
                     self.log("Skipped %s %s (%s)" % (method, url, reason))
                 self.update_status()
@@ -6080,14 +6483,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                      path, cfg["dedup_normalize_ids"])
                 key = ("F%d|%s" % (feat.fid, base_key)) if cfg.get("dedup_per_feature") else base_key
                 with self._state_lock:
-                    if key in self._seen_keys:
+                    seen = key in self._seen_keys
+                    if seen:
                         self._skipped_count += 1
                         self._last_skip_reason = "dedup"
-                        if source == "Manual":
-                            self.log("Skipped %s %s (duplicate endpoint)" % (method, url))
-                        self.update_status()
-                        return
-                    self._seen_keys.add(key)
+                    else:
+                        self._seen_keys.add(key)
+                    earlier = self._seen_gid.get(key)
+                if seen:
+                    hit(HIT_DUP, earlier)
+                    if source == "Manual":
+                        self.log("Skipped %s %s (duplicate endpoint)" % (method, url))
+                    self.update_status()
+                    return
 
         # Roles are optional: with none enabled the API is still captured, stored and shown
         # ("1 API gốc + 0 role") and every send / Repeater action falls back to the original.
@@ -6101,6 +6509,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                          feat.fid, feat.name)
         group.message_builder = self._build_message
         group.target = target
+        if key is not None:
+            group.dedup_key = key
+            with self._state_lock:
+                self._seen_gid[key] = gid
+        hit(HIT_NEW, gid)
         if resp is not None:
             try:
                 rinfo = self.helpers.analyzeResponse(resp)
@@ -6570,6 +6983,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.left_hierarchy_tree.addMouseListener(
             _TreePopupListener(self.left_hierarchy_tree,
                                lambda e: self._tree_popup_from(self.left_hierarchy_tree, e)))
+        chips = _TreeChipClick(self.left_hierarchy_tree, self)
+        self.left_hierarchy_tree.addMouseListener(chips)
+        self.left_hierarchy_tree.addMouseMotionListener(chips)
 
         self.feature_model = FeatureTableModel(self)
         self.feature_table = JTable(self.feature_model)
@@ -6631,6 +7047,23 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             column = self.group_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(grp_renderer)
+        cm = self.group_table.getColumnModel()
+        copy_col = cm.getColumn(GroupTableModel.COPY_COL)
+        copy_col.setPreferredWidth(34)
+        copy_col.setMaxWidth(40)
+        copy_col.setCellRenderer(_ActionCellRenderer(
+            self.group_model, "copy", lambda r: u"Bấm để copy: " + self.copy_label_for(self.group_model.group_at(r), False)))
+        excel_col = cm.getColumn(GroupTableModel.EXCEL_COL)
+        excel_col.setPreferredWidth(100)
+        excel_col.setCellRenderer(_ActionCellRenderer(
+            self.group_model, "link", lambda r: self._excel_tooltip(self.group_model.group_at(r))))
+        # 'Copy' first, 'Excel' right after Method (the other columns keep their model index)
+        cm.moveColumn(GroupTableModel.COPY_COL, 0)
+        cm.moveColumn(GroupTableModel.EXCEL_COL, 6)
+        cell_click = _TableCellClick(self.group_table, (GroupTableModel.COPY_COL, GroupTableModel.EXCEL_COL),
+                                     self._on_group_cell_click)
+        self.group_table.addMouseListener(cell_click)
+        self.group_table.addMouseMotionListener(cell_click)
         self.group_path_editor_combo = JComboBox([DEFAULT_HIERARCHY_PATH])
         self.group_path_editor_combo.setEditable(True)
         self.group_table.getColumnModel().getColumn(2).setCellEditor(
@@ -6744,6 +7177,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.full_tree.addTreeWillExpandListener(_LazyTreeLoader(
             lambda node: self._lazy_load_tree_node("full", self.full_tree_model, node)))
         self.full_tree.addMouseListener(_TreePopupListener(self.full_tree, lambda e: self._tree_popup_from(self.full_tree, e)))
+        chips = _TreeChipClick(self.full_tree, self)
+        self.full_tree.addMouseListener(chips)
+        self.full_tree.addMouseMotionListener(chips)
 
         bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
         self.btn_tree_window = JButton("🗗 Mở cửa sổ riêng", actionPerformed=self._on_toggle_tree_window)
@@ -6970,6 +7406,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
                                                self.config.get("target_only", False))
         self.cb_target_only_mirror.addActionListener(_Action(self._on_target_only_mirror))
         bar.add(self.cb_target_only_mirror)
+        bar.add(JButton("Đặt lại bộ đếm lượt gặp", actionPerformed=self._on_reset_hits))
         bar.add(JLabel("   Xem:"))
         self.cb_coverage_filter = JComboBox(CoverageTableModel.FILTERS)
         self.cb_coverage_filter.addActionListener(_Action(lambda e: self._reload_coverage()))
@@ -6989,12 +7426,38 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.coverage_table.setAutoCreateRowSorter(True)
         self.coverage_table.addMouseListener(_DoubleClick(self._on_coverage_jump))
         renderer = AuditTableRenderer(self.coverage_model, audit_col=8, method_col=1, bold_cols=(0, 4))
-        for col, width in ((0, 50), (1, 80), (2, 300), (3, 220), (4, 150), (5, 110), (6, 260), (7, 220), (8, 240),
-                           (9, 230), (10, 380)):
+        for col, width in ((0, 64), (1, 80), (2, 300), (3, 220), (4, 150), (5, 110), (6, 260), (7, 220), (8, 240),
+                           (9, 230), (10, 380), (11, 170), (12, 300)):
             column = self.coverage_table.getColumnModel().getColumn(col)
             column.setPreferredWidth(width)
             column.setCellRenderer(renderer)
-        panel.add(JScrollPane(self.coverage_table), BorderLayout.CENTER)
+        cm = self.coverage_table.getColumnModel()
+        cm.moveColumn(CoverageTableModel.HITS_COL, 5)
+        cm.moveColumn(CoverageTableModel.PLACES_COL, 6)
+        self.coverage_table.getSelectionModel().addListSelectionListener(
+            _SelectionListener(self._on_coverage_selected))
+
+        # Below: every time the selected row was met (audit of real paths and positions)
+        self.hit_model = HitTableModel()
+        self.hit_table = JTable(self.hit_model)
+        style_data_table(self.hit_table)
+        self.hit_table.addMouseListener(_DoubleClick(self._on_hit_jump))
+        hit_renderer = AuditTableRenderer(self.hit_model, audit_col=2, method_col=4, bold_cols=(0,))
+        for col, width in ((0, 45), (1, 120), (2, 130), (3, 70), (4, 70), (5, 320), (6, 160), (7, 260),
+                           (8, 260), (9, 70), (10, 200)):
+            column = self.hit_table.getColumnModel().getColumn(col)
+            column.setPreferredWidth(width)
+            column.setCellRenderer(hit_renderer)
+        self.lbl_hits = JLabel(" Chọn 1 dòng Excel để xem các lần đã gặp (path thực tế, vị trí, kết quả).")
+        self.lbl_hits.setFont(self.lbl_hits.getFont().deriveFont(Font.BOLD))
+        self.lbl_hits.setBorder(BorderFactory.createEmptyBorder(3, 6, 3, 6))
+        hits_panel = JPanel(BorderLayout())
+        hits_panel.add(self.lbl_hits, BorderLayout.NORTH)
+        hits_panel.add(JScrollPane(self.hit_table), BorderLayout.CENTER)
+        split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(self.coverage_table), hits_panel)
+        split.setResizeWeight(0.62)
+        split.setOneTouchExpandable(True)
+        panel.add(split, BorderLayout.CENTER)
         self.coverage_panel = panel
         self._refresh_target_controls()
         return panel
@@ -7003,9 +7466,135 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         model = getattr(self, "coverage_model", None)
         if model is None:
             return
+        keep = self._selected_coverage_entry()
         groups = self.group_model.all_groups() if self.group_model is not None else []
-        model.reload(self.targets, groups, self.cb_coverage_filter.getSelectedIndex())
+        model.reload(self.targets, groups, self.cb_coverage_filter.getSelectedIndex(), self.target_hits)
+        if keep is not None:
+            self._select_coverage_entry(keep, scroll=False)
+        else:
+            self._on_coverage_selected()
         self._refresh_target_controls(groups)
+
+    def _selected_coverage_entry(self):
+        table = getattr(self, "coverage_table", None)
+        if table is None:
+            return None
+        vr = table.getSelectedRow()
+        return self.coverage_model.entry_at(table.convertRowIndexToModel(vr)) if vr >= 0 else None
+
+    def _select_coverage_entry(self, entry, scroll=True):
+        table = self.coverage_table
+        r = self.coverage_model.row_of_entry(entry)
+        if r < 0:
+            return False
+        vr = table.convertRowIndexToView(r)
+        if vr < 0:
+            return False
+        table.setRowSelectionInterval(vr, vr)
+        if scroll:
+            table.scrollRectToVisible(table.getCellRect(vr, 0, True))
+        return True
+
+    def _on_coverage_selected(self):
+        label = getattr(self, "lbl_hits", None)
+        if label is None:
+            return
+        e = self._selected_coverage_entry()
+        if e is None:
+            self.hit_model.set_events([])
+            label.setText(" Chọn 1 dòng Excel để xem các lần đã gặp (path thực tế, vị trí, kết quả).")
+            return
+        events = self.target_hits.events(e)
+        self.hit_model.set_events(events)
+        places = self.target_hits.positions(e)
+        label.setText(u" Dòng STT %s · %s %s · gặp %s%s%s" % (
+            u_text(e.stt), e.method_label(), e.path, hit_cell(self.target_hits, e) or u"0",
+            (u" · ở %d vị trí: %s" % (len(places), u"; ".join(places[:4]))) if places else u"",
+            u"   (click đúp 1 dòng bên dưới để mở API)" if events else u""))
+
+    def _on_hit_jump(self):
+        vr = self.hit_table.getSelectedRow()
+        if vr < 0:
+            return
+        gid = self.hit_model.gid_at(self.hit_table.convertRowIndexToModel(vr))
+        g = self._group_by_gid(gid)
+        if g is None:
+            self._flash_status(u"API #%s không còn (đã xóa)" % gid if gid else u"Lượt gặp này không tạo API")
+            return
+        self.group_model.set_feature_filter(None)
+        self.group_model.set_hierarchy_filter(None)
+        self.tabs.setSelectedIndex(0)
+        self._select_group_in_table(g)
+
+    def _group_by_gid(self, gid):
+        if gid is None or self.group_model is None:
+            return None
+        for g in self.group_model.all_groups():
+            if g.gid == gid:
+                return g
+        return None
+
+    def jump_to_target(self, entry):
+        """Open the 'Độ phủ Excel' tab on this row of the file (and its hit audit below)."""
+        if entry is None or getattr(self, "coverage_panel", None) is None:
+            return
+        self.tabs.setSelectedComponent(self.coverage_panel)
+        self._reload_coverage()
+        if self.coverage_model.row_of_entry(entry) < 0 and self.cb_coverage_filter.getSelectedIndex() != 0:
+            self.cb_coverage_filter.setSelectedIndex(0)
+            self._reload_coverage()
+        if self._select_coverage_entry(entry):
+            self.coverage_table.requestFocusInWindow()
+            self._flash_status(u"Excel: dòng STT %s · %s %s" % (u_text(entry.stt), entry.method_label(), entry.path))
+
+    def _excel_tooltip(self, g):
+        e = getattr(g, "target", None) if g is not None else None
+        if e is None:
+            return u"API không có trong file Excel" if self.targets else None
+        n, new, dup, filtered = self.target_hits.stats(e)
+        return u"Bấm để mở dòng STT %s trong tab Độ phủ Excel (%s %s) · đã gặp %d lần" % (
+            u_text(e.stt), e.method_label(), e.path, n)
+
+    def _on_group_cell_click(self, model_row, model_col):
+        g = self.group_model.group_at(model_row)
+        if g is None:
+            return
+        self.on_chip("copy" if model_col == GroupTableModel.COPY_COL else "excel", g)
+
+    def on_chip(self, kind, g):
+        if kind == "copy":
+            line = self.copy_groups([g])
+            self._flash_status(u"📋 Đã copy: %s" % line)
+        elif getattr(g, "target", None) is not None:
+            self.jump_to_target(g.target)
+
+    def tree_chip_at(self, tree, x, y):
+        """('copy' | 'excel', group) under the mouse on an API row of a tree, else None."""
+        path = tree.getPathForLocation(x, y)
+        if path is None:
+            return None
+        node = path.getLastPathComponent()
+        kind, g = self._extract_node_kind_payload(node)
+        if kind != "GROUP" or g is None:
+            return None
+        renderer = tree.getCellRenderer()
+        if not isinstance(renderer, HierarchyTreeRenderer):
+            return None
+        bounds = tree.getPathBounds(path)
+        comp = renderer.getTreeCellRendererComponent(tree, node, False, False, True, tree.getRowForPath(path), False)
+        icon = comp.getIcon()
+        rel = x - bounds.x - comp.getInsets().left
+        if isinstance(icon, _GroupIcon) and _GroupIcon.COPY_X - 1 <= rel <= icon.getIconWidth() + 1:
+            return "copy", g
+        badge = excel_badge(g)
+        text = u_text(comp.getText())
+        if badge and badge in text:
+            fm = comp.getFontMetrics(comp.getFont())
+            start = (icon.getIconWidth() if icon is not None else 0) + comp.getIconTextGap() + \
+                fm.stringWidth(text[:text.index(badge)])
+            if start - 2 <= rel <= start + fm.stringWidth(badge) + 2:
+                return "excel", g
+        return None
 
     def _refresh_target_controls(self, groups=None):
         targets = self.targets
@@ -7049,11 +7638,37 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
 
     def set_targets(self, targets):
         self.targets = targets if targets else None
+        sig = targets_signature(self.targets)
+        if sig != self.target_hits.signature:
+            self.target_hits.reset(sig)
+            self._save_hits(True)
         try:
             self.callbacks.saveExtensionSetting(SETTINGS_KEY_TARGETS, targets.to_json() if targets else "")
         except (Throwable, Exception):
             self._print_error("Could not save the Excel API list:\n%s" % u_text(traceback.format_exc()))
         self._retag_groups()
+
+    def _save_hits(self, force=False):
+        hits = self.target_hits
+        if not (hits.dirty or force):
+            return
+        now = time.time()
+        if not force and now - self._hits_saved_at < 3.0:
+            return
+        self._hits_saved_at = now
+        try:
+            self.callbacks.saveExtensionSetting(SETTINGS_KEY_TARGET_HITS, hits.to_json())
+        except (Throwable, Exception):
+            self._print_error("Could not save the Excel hit counters:\n%s" % u_text(traceback.format_exc()))
+
+    def _on_reset_hits(self, event):
+        if JOptionPane.showConfirmDialog(self.main_panel, "Đặt lại bộ đếm lượt gặp của mọi dòng Excel về 0?",
+                                         EXT_NAME, JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION:
+            return
+        self.target_hits.reset(targets_signature(self.targets))
+        self._save_hits(True)
+        self._stale_coverage = True
+        self._ui_tick(None)
 
     def _target_match(self, method, path, host=None, cfg=None):
         targets = self.targets
@@ -7252,7 +7867,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
             cfg = self.get_config()
             data = build_api_workbook(groups, self.targets, cfg.get("copy_format"),
                                       cfg.get("excel_position_copy_format", True),
-                                      lambda g: self.copy_label_for(g, assign=False))
+                                      lambda g: self.copy_label_for(g, assign=False), self.target_hits)
             out = open(f.getAbsolutePath(), "wb")
             try:
                 out.write(data)
@@ -9559,6 +10174,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         if not groups:
             return
         self.group_model.remove_groups(groups)
+        self.forget_dedup(groups)
         if self.result_model.group() in groups:
             self.result_model.set_group(None)
             self._show_result(None)
@@ -9575,6 +10191,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self._show_result(None)
         with self._state_lock:
             self._seen_keys.clear()
+            self._seen_gid.clear()
             self._skipped_count = 0
             self._last_skip_reason = ""
             self._next_gid = 1
@@ -9595,10 +10212,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory, IExt
         self.log("All captured APIs, hierarchy history, and dedup cache reset.")
         self.update_status()
 
+    def forget_dedup(self, groups):
+        """Deleted APIs are captured again the next time you pass by them (their dedup keys are dropped)."""
+        n = 0
+        with self._state_lock:
+            for g in groups:
+                key = getattr(g, "dedup_key", None)
+                if key is not None and self._seen_gid.get(key) == g.gid:
+                    self._seen_keys.discard(key)
+                    del self._seen_gid[key]
+                    n += 1
+        if n:
+            self.log("Đã xóa %d API: lần sau đi qua chúng sẽ được bắt lại." % n)
+        return n
+
     def _on_reset_dedup(self, event):
         with self._state_lock:
             n = len(self._seen_keys)
             self._seen_keys.clear()
+            self._seen_gid.clear()
             self._skipped_count = 0
             self._last_skip_reason = ""
         self.log("Dedup cache reset (%d endpoint key(s) forgotten)." % n)
