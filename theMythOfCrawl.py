@@ -3301,7 +3301,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
             self._open_tree_window()
 
     def _open_tree_window(self):
-        frame = JFrame("theMythOfCrawl - Cây Sub-folder")
+        frame = JFrame("%s - Cây Sub-folder" % EXT_NAME)
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE)
         frame.addWindowListener(_WindowClosing(lambda: self._close_tree_window()))
         self.full_tree_tab.remove(self.full_tree_content)
@@ -3665,7 +3665,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                                           JOptionPane.INFORMATION_MESSAGE)
             return
         chooser = JFileChooser()
-        chooser.setSelectedFile(File("theMythOfCrawl_API_%s.xlsx" % time.strftime("%Y%m%d_%H%M")))
+        chooser.setSelectedFile(File("%s_API_%s.xlsx" % (EXT_NAME, time.strftime("%Y%m%d_%H%M"))))
         chooser.setFileFilter(FileNameExtensionFilter("Excel (.xlsx)", "xlsx"))
         if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
             return
@@ -5749,7 +5749,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                                           EXT_NAME, JOptionPane.INFORMATION_MESSAGE)
             return
         chooser = JFileChooser()
-        chooser.setSelectedFile(File("theMythOfCrawl_history_report.txt"))
+        chooser.setSelectedFile(File("%s_history_report.txt" % EXT_NAME))
         if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
             return
         f = chooser.getSelectedFile()
@@ -6025,7 +6025,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
                                           JOptionPane.INFORMATION_MESSAGE)
             return
         chooser = JFileChooser()
-        chooser.setSelectedFile(File("theMythOfCrawl_matrix.json"))
+        chooser.setSelectedFile(File("%s_matrix.json" % EXT_NAME))
         chooser.setFileFilter(FileNameExtensionFilter("JSON files", "json"))
         if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
             return
@@ -6233,7 +6233,7 @@ class BurpExtender(_PlacementMixin, _WorkbenchMixin, IBurpExtender, ITab, IHttpL
 
     def _on_export_roles(self, event):
         chooser = JFileChooser()
-        chooser.setSelectedFile(File("theMythOfCrawl_roles.json"))
+        chooser.setSelectedFile(File("%s_roles.json" % EXT_NAME))
         chooser.setFileFilter(FileNameExtensionFilter("JSON files", "json"))
         if chooser.showSaveDialog(self.main_panel) != JFileChooser.APPROVE_OPTION:
             return

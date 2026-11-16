@@ -94,8 +94,8 @@ def u_text(val):
 # Constants
 # =============================================================================
 
-EXT_NAME = "theMythOfCrawl"
-EXT_VERSION = "1.12.0"
+EXT_NAME = "theMythOf-PCrawl"
+EXT_VERSION = "1.12.1"
 SETTINGS_KEY_ROLES = "tmoc.roles.v1"
 SETTINGS_KEY_ORIGINAL = "tmoc.original_profile.v1"
 SETTINGS_KEY_ROLE_SCOPES = "tmoc.role_scopes.v1"
