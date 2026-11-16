@@ -1,4 +1,10 @@
-# theMythOfCrawl
+# theMythOf-PCrawl (theMythOfCrawl, Python / Jython)
+
+> Bản Java (nhanh hơn, lưu workspace ra đĩa, không cần Jython, chỉ 1 file `.jar`) là
+> **theMythOf-JCrawl**: https://github.com/hau2212/theMythOfCrawl_java
+>
+> Bản Python này hiện tên **theMythOf-PCrawl** trong Burp; file nạp vẫn là `theMythOfCrawl.py`
+> (cần `tmoc_core.py` cùng thư mục).
 
 A Burp Suite Professional extension for **multi-role API request cloning** and **grouped Repeater dispatching**. It's built for authorization and access-control testing (BOLA/IDOR, privilege escalation, tenant isolation) on applications you are authorized to test.
 

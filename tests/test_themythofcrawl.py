@@ -887,7 +887,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIs(getattr(self.cb, "tab", None), self.ext)
         self.assertIsNotNone(self.ext.getUiComponent())
-        self.assertEqual(self.ext.getTabCaption(), "theMythOfCrawl")
+        self.assertEqual(self.ext.getTabCaption(), "theMythOf-PCrawl")
 
     def test_init_ui_registers_fallback_tab_when_build_ui_fails(self):
         def broken_build():
